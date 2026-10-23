@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .llm_providers import DEFAULT_FALLBACKS, DEFAULT_PROVIDER, get_preset
@@ -210,9 +210,21 @@ class Secrets(BaseSettings):
     llm_api_key: str | None = None
     #: provider id -> permanent key (Groq, Gemini, OpenRouter, …)
     llm_keys: dict[str, str] = Field(default_factory=dict)
-    parscoders_cookie: str | None = None
-    parscoders_username: str | None = None
-    parscoders_password: str | None = None
+    # NOTE: .env.example historically documented "PARSOCODERS_COOKIE"
+    # (an extra "O"); the field is "parscoders_*". Both spellings are accepted
+    # so an old .env, a typo or the docs never silently drop the credentials.
+    parscoders_cookie: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PARSOCODERS_COOKIE", "PARSCODERS_COOKIE"),
+    )
+    parscoders_username: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PARSOCODERS_USERNAME", "PARSCODERS_USERNAME"),
+    )
+    parscoders_password: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PARSOCODERS_PASSWORD", "PARSCODERS_PASSWORD"),
+    )
     database_url: str | None = None
 
     def chat_ids_list(self) -> list[str]:

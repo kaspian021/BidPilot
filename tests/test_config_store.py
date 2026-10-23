@@ -137,3 +137,24 @@ def test_switching_provider_ignores_the_previous_preset_endpoint(tmp_path):
     assert chain[0].id == "gemini"
     assert chain[0].base_url == PRESETS["gemini"].base_url
     assert chain[0].model == PRESETS["gemini"].model
+
+
+def test_env_aliases_for_parscoders_accept_both_spellings(monkeypatch):
+    """Both "PARSOCODERS_COOKIE" and "PARSCODERS_COOKIE" must reach the secrets model."""
+    from bidpilot.config import Secrets
+
+    monkeypatch.setenv("PARSOCODERS_COOKIE", "PHPSESSID=documented")
+    monkeypatch.setenv("PARSOCODERS_USERNAME", "ali")
+    monkeypatch.delenv("PARSCODERS_COOKIE", raising=False)
+    monkeypatch.delenv("PARSCODERS_USERNAME", raising=False)
+    documented = Secrets(_env_file=None)
+    assert documented.parscoders_cookie == "PHPSESSID=documented"
+    assert documented.parscoders_username == "ali"
+
+    monkeypatch.delenv("PARSOCODERS_COOKIE")
+    monkeypatch.delenv("PARSOCODERS_USERNAME")
+    monkeypatch.setenv("PARSCODERS_COOKIE", "PHPSESSID=field-name")
+    monkeypatch.setenv("PARSCODERS_PASSWORD", "pw")
+    typed = Secrets(_env_file=None)
+    assert typed.parscoders_cookie == "PHPSESSID=field-name"
+    assert typed.parscoders_password == "pw"

@@ -115,7 +115,7 @@ async def test_submit_bid_without_credentials_fails_fast():
     project = Project(source="parscoders", external_id="1", title="تست")
     result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
     assert result.status.value == "failed"
-    assert "PARSOCODERS_COOKIE" in result.message
+    assert "اعتبارنامه" in result.message
     await source.aclose()
 
 

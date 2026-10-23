@@ -67,7 +67,7 @@ class ParscodersSource(Source):
 
     # ------------------------------------------------------------------ http
     def cookies(self) -> dict[str, str]:
-        """Config cookies + the session cookie from PARSOCODERS_COOKIE."""
+        """Config cookies + the session cookie (PARSOCODERS_COOKIE or the settings store)."""
         cookies = super().cookies()
         cookies.update(getattr(self, "_session_cookies", {}) or {})
         return cookies
@@ -171,7 +171,9 @@ class ParscodersSource(Source):
         if not self.credentials_present():
             await self.login()
         if not self.credentials_present():
-            return self.fail("اعتبارنامه پارسکدرز تنظیم نشده است. PARSOCODERS_COOKIE را در .env قرار دهید.")
+            return self.fail(
+                "اعتبارنامه پارسکدرز تنظیم نشده است. با «bidpilot setup» یا /market در تلگرام وارد کنید."
+            )
 
         bid_cfg = self.settings.get("bid") or {}
         detail_path = (self.settings.get("detail") or {}).get("path", "/project/{external_id}")

@@ -40,7 +40,7 @@
 | 🆓 هوش مصنوعی رایگان و ماندگار | Groq / Gemini / OpenRouter / Mistral / Ollama — توکن رایگان، بدون انقضا، با fallback خودکار |
 | 🎭 لحن و سبک دلخواه | از داخل تلگرام (`/style`) بگو چگونه و با چه لحنی پیشنهاد بنویسد؛ همان لحظه اعمال می‌شود |
 | 🤖 مدیریت کامل از تلگرام | راه‌اندازی، تغییر پروفایل، تست کلید، وضعیت، پیش‌نمایش و حالت ارسال، همه در چت |
-| 🧪 تست‌شده | ۱۲۶ تست واحد و یکپارچه، همه با HTTP شبیه‌سازی‌شده (بدون نیاز به حساب واقعی) |
+| 🧪 تست‌شده | ۱۲۷ تست واحد و یکپارچه، همه با HTTP شبیه‌سازی‌شده (بدون نیاز به حساب واقعی) |
 
 ---
 
@@ -84,6 +84,24 @@ BidPilot با هر API سازگار با OpenAI کار می‌کند، اما پ
 
 کلید در `bidpilot setup` یا با `/llm` در تلگرام گرفته و ذخیره می‌شود؛
 `bidpilot doctor` و `/test` سالم بودنش را چک می‌کنند.
+
+### اگر ترجیح می‌دهی از `.env` استفاده کنی (اختیاری)
+
+`setup` را دوست نداری؟ همان کار با `.env` هم انجام می‌شود (فقط آن را `chmod 600` کن و
+کامیت نکن). این‌ها کافی است:
+
+```env
+TELEGRAM_BOT_TOKEN="123456789:AA…"     # از @BotFather
+TELEGRAM_CHAT_IDS="111222333"           # یا بعداً /start بده تا خودکار پر شود
+LLM_API_KEY="gsk_…"                     # کلید رایگان Groq (provider پیش‌فرض همین است)
+PARSOCODERS_COOKIE="PHPSESSID=…"        # یا PARSOCODERS_USERNAME/PASSWORD
+```
+
+> نکته: اگر هم `.env` و هم `data/settings.json` مقدار داشته باشند، **settings.json برنده
+> است** (چون آخرین تنظیم کاربر است). برای پاک‌کردن یک مقدار ذخیره‌شده:
+> `bidpilot settings unset llm.api_key`.
+> مقدار `LLM_PROVIDER` در `.env` خوانده نمی‌شود؛ برای عوض‌کردن سرویس از
+> `bidpilot settings set llm.provider -v gemini` یا `/llm` استفاده کن.
 
 ### ۲) اتصال تلگرام
 
@@ -320,7 +338,7 @@ bidpilot/
 │   ├── proposals/           # LLM client، پرامپت‌ها، اعتبارسنجی، قالب، playbook
 │   ├── notifications/       # تلگرام / کنسول / dispatcher
 │   └── sources/             # آداپتورها: parscoders، mock (نمونه)
-├── tests/                   # ۱۲۶ تست (unit + integration با respx)
+├── tests/                   # ۱۲۷ تست (unit + integration با respx)
 ├── deploy/                  # systemd + docker
 └── docs/                    # معماری، افزودن منبع، دیپلوی
 ```

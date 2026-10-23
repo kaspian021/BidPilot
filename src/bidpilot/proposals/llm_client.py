@@ -12,7 +12,11 @@ log = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
-    pass
+    """Provider failure. ``retryable=False`` means "try another provider now"."""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass
@@ -89,8 +93,10 @@ class LLMClient:
                 if response.status_code >= 500 or response.status_code == 429:
                     raise LLMError(f"LLM HTTP {response.status_code}: {response.text[:200]}")
                 if response.status_code >= 400:
+                    # bad key / unknown model: retrying the same provider is pointless
                     raise LLMError(
-                        f"LLM rejected the request (HTTP {response.status_code}): {response.text[:300]}"
+                        f"LLM rejected the request (HTTP {response.status_code}): {response.text[:300]}",
+                        retryable=False,
                     )
 
                 data = response.json()
@@ -105,6 +111,8 @@ class LLMClient:
                 )
             except (httpx.HTTPError, LLMError, ValueError) as exc:
                 last_error = exc
+                if not getattr(exc, "retryable", True):
+                    break
                 if attempt < self.max_retries:
                     sleep_for = 1.5 * (2**attempt)
                     log.warning("LLM call failed (%s); retrying in %.1fs", exc, sleep_for)

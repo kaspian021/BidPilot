@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format check demo docker clean
+.PHONY: install dev test lint format check setup bot selftest demo docker clean
 
 install:
 	pip install -e .
@@ -19,6 +19,15 @@ check: lint test
 
 fmt-check:
 	ruff format --check src tests
+
+setup:
+	bidpilot setup
+
+bot:
+	bidpilot bot --run
+
+selftest:
+	bidpilot selftest
 
 demo:
 	bidpilot demo

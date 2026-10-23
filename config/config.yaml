@@ -67,6 +67,10 @@ proposal:
   min_chars: 320
   max_chars: 1500
   max_emoji: 2
+  greeting: "سلام و وقت بخیر"
+  # لحن و دستورهای سبک را کاربر در «bidpilot setup» یا با /style در تلگرام تعیین می‌کند
+  tone: ""
+  style_instructions: ""
   # if the LLM text fails validation: "skip" (no bid) or "template" (use the built-in template)
   on_generation_failure: "template"
   banned_phrases:
@@ -76,22 +80,23 @@ proposal:
     - "بهترین در ایران"
 
 # ---------------------------------------------------------------------------
-# LLM (any OpenAI-compatible endpoint: OpenAI, OpenRouter, Groq, vLLM, Ollama)
-# If no LLM_API_KEY is set, BidPilot falls back to its deterministic template.
+# LLM — a FREE provider with a permanent token (no .env needed)
+# Keys are stored by the wizard / Telegram bot in data/settings.json.
+# Free presets: groq (default), gemini, openrouter, mistral, ollama
+# If no key is configured, BidPilot falls back to its deterministic template.
 # ---------------------------------------------------------------------------
 llm:
   enabled: true
-  provider: "openai_compatible"
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4o-mini"
+  provider: "groq"
+  # خالی = آدرس/مدل از preset همان provider انتخاب می‌شود
+  base_url: ""
+  model: ""
+  # tried in order when the primary is rate-limited or down (only if a key exists)
+  fallbacks: ["gemini", "openrouter"]
   temperature: 0.6
   max_tokens: 900
   timeout_seconds: 45.0
   extra_headers: {}
-  # examples for other providers:
-  #   OpenRouter: base_url: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini"
-  #   Groq:       base_url: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile"
-  #   Ollama:     base_url: "http://localhost:11434/v1",  model: "qwen2.5:14b"
 
 # ---------------------------------------------------------------------------
 # Notifications

@@ -3,14 +3,16 @@ services:
     build: .
     container_name: bidpilot
     restart: unless-stopped
-    env_file: .env
     environment:
       DATABASE_URL: "postgresql+asyncpg://bidpilot:bidpilot@db:5432/bidpilot"
       # "dry_run" (default) or "live"
       BIDPILOT_MODE: "dry_run"
+      # همه‌ی تنظیمات (توکن تلگرام، کلید AI رایگان، حساب سایت، لحن) در
+      # volume «./data/settings.json» ذخیره می‌شوند — نیازی به .env نیست.
+      # یک‌بار: docker compose run --rm bidpilot setup
     volumes:
       - ./config:/app/config:ro
-      - ./data:/app/data
+      - ./data:/app/data          # settings.json + دیتابیس + بکاپ
     depends_on:
       db:
         condition: service_healthy

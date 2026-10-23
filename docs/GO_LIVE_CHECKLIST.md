@@ -4,22 +4,35 @@
 
 ## ۰) پیش‌نیازها
 
+همه‌ی این‌ها را `bidpilot setup` یا خود ربات تلگرام (`/setup`) می‌پرسد؛ فایل `.env` لازم نیست.
+بعداً هم از تلگرام قابل تغییرند (`/status`).
+
 | مورد | از کجا |
 |---|---|
-| توکن ربات تلگرام | `@BotFather` → `/newbot` → `TELEGRAM_BOT_TOKEN` |
-| `chat_id` | به ربات پیام بدهید → `bidpilot telegram-whoami` → `TELEGRAM_CHAT_IDS` |
-| کوکی پارس‌کدرز | لاگین در مرورگر → DevTools → Cookies → `PHPSESSID` → `PARSOCODERS_COOKIE` |
-| پروفایل واقعی | `config/profile.yaml` (نام، تخصص، نمونه‌کارها، امضا) |
-| کلید LLM (اختیاری) | `LLM_API_KEY` — بدون آن هم قالب فارسی کار می‌کند |
+| توکن ربات تلگرام | `@BotFather` → `/newbot` (در `bidpilot setup` بفرستید) |
+| `chat_id` | به ربات `/start` بدهید؛ خودکار ثبت می‌شود |
+| حساب سایت | کوکی `PHPSESSID` (DevTools → Cookies) یا نام کاربری/رمز — در setup یا `/market` |
+| پروفایل واقعی | در setup یا `/profile` (نام، سابقه، مهارت‌ها، نمونه‌کارها، امضا) |
+| لحن و سبک | در setup یا `/style` — بگویید چطور و با چه لحنی پیشنهاد بنویسد |
+| کلید LLM رایگان | Groq / Gemini / OpenRouter / … — در setup یا `/llm`؛ بدون آن هم قالب فارسی کار می‌کند |
+
+```bash
+bidpilot setup --status   # آماده است؟ چه چیزی مانده؟
+```
 
 ## ۱) اجرای آزمایشی
 
 ```bash
+bidpilot selftest                # تست واقعی: تلگرام + کلید AI + سایت + یک پیشنهاد نمونه (بدون ارسال)
 bidpilot doctor                  # همه‌ی ردیف‌ها OK؟ (منبع parscoders باید پروژه پیدا کند)
 bidpilot telegram-test           # پیام تست رسید؟
 bidpilot preview -s parscoders --limit 2    # متن‌ها را بخوانید؛ لحن و قیمت درست است؟
 bidpilot once --dry-run --limit 3           # چرخه‌ی کامل بدون ارسال
 ```
+
+اگر لحن متن‌ها هنوز شبیه شما نیست، در تلگرام `/style` را بزنید و دستور سبک خودتان را
+بنویسید؛ دوباره `/preview` بگیرید. (لحن آزاد با مدل زبانی اعمال می‌شود؛ بدون کلید،
+قالب ثابت فارسی استفاده می‌شود.)
 
 ## ۲) فعال‌سازی
 
@@ -27,6 +40,9 @@ bidpilot once --dry-run --limit 3           # چرخه‌ی کامل بدون ا
 bidpilot go-live      # چک‌لیست را اجرا و config/config.local.yaml را می‌سازد
 bidpilot once --limit 1        # فقط یک پیشنهاد واقعی
 ```
+
+یا بدون ترمینال: در تلگرام `/mode` → «واقعی». رصدکننده‌ی در حال اجرا، تغییر را
+در دور بعدی خودکار می‌گیرد.
 
 بعد از دیدن نتیجه در تلگرام و روی سایت:
 

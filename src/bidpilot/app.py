@@ -34,7 +34,11 @@ class Application:
     def build(cls, config: AppConfig, secrets: Secrets | None = None) -> Application:
         secrets = secrets or get_secrets()
         app = cls(config=config, secrets=secrets, db=Database(config.database_url))
-        app.generator = ProposalGenerator(config, llm_api_key=secrets.llm_api_key)
+        app.generator = ProposalGenerator(
+            config,
+            llm_api_key=secrets.llm_api_key,
+            llm_keys=secrets.llm_keys,
+        )
         app.notifiers = app._build_notifiers()
         for source_cfg in config.sources:
             if not source_cfg.enabled:

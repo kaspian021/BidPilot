@@ -8,8 +8,10 @@ Type=simple
 User=bidpilot
 Group=bidpilot
 WorkingDirectory=/home/bidpilot/bidpilot
-EnvironmentFile=/home/bidpilot/bidpilot/.env
+# .env اختیاری است؛ تنظیمات اصلی در data/settings.json ذخیره می‌شوند
+EnvironmentFile=-/home/bidpilot/bidpilot/.env
 ExecStartPre=/home/bidpilot/bidpilot/.venv/bin/bidpilot initdb
+# برای مدیریت کامل از تلگرام در کنار رصد: bot --run
 ExecStart=/home/bidpilot/bidpilot/.venv/bin/bidpilot run --config config/config.yaml
 Restart=always
 RestartSec=10

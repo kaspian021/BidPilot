@@ -137,3 +137,53 @@ async def test_llm_client_raises_without_key_and_endpoint():
     with pytest.raises(LLMError):
         await client.complete("sys", "user")
     await client.aclose()
+
+
+@respx.mock
+async def test_llm_chain_falls_back_to_the_next_free_provider():
+    """A dead/blocked primary provider must not kill the bid: try the next key."""
+    config = make_config()
+    config.llm.fallbacks = ["gemini"]
+    primary = respx.post("https://llm.test/v1/chat/completions").mock(
+        return_value=httpx.Response(401, text="invalid key")
+    )
+    fallback = respx.post("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "model": "gemini-2.0-flash",
+                "choices": [{"message": {"content": VALID_LLM_TEXT}}],
+            },
+        )
+    )
+
+    generator = ProposalGenerator(config, llm_api_key="groq-key", llm_keys={"gemini": "gem-key"})
+    proposal = await generator.generate(make_project(), 1_000_000, 14)
+
+    assert primary.called and fallback.called
+    assert proposal.generated_by == "llm:gemini-2.0-flash"
+    await generator.aclose()
+
+
+def test_user_style_and_tone_reach_the_prompt():
+    from bidpilot.proposals.prompts import build_prompts
+
+    config = make_config()
+    config.proposal.tone = "خودمانی و گرم"
+    config.proposal.style_instructions = "همیشه روی تحویل مرحله‌ای تأکید کن و از تعریف از کارفرما پرهیز کن."
+    config.profile.tone = "لحن پیش‌فرض پروفایل"
+
+    system, user = build_prompts(make_project(), config.profile, config.proposal, 1_000_000, 14)
+
+    assert "خودمانی و گرم" in user
+    assert "تحویل مرحله‌ای" in user
+    assert "لحن پیش‌فرض پروفایل" not in user  # user's choice wins over the profile default
+    assert "سبک نگارش" in system
+
+
+def test_greeting_is_configurable_in_the_template():
+    config = make_config()
+    config.proposal.greeting = "درود و وقت بخیر"
+    generator = ProposalGenerator(config)
+    text = generator.generate_from_template(make_project(), 1_000_000, 14).text
+    assert text.startswith("درود و وقت بخیر")

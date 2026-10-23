@@ -10,6 +10,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 from ..config import AppConfig, LLMConfig, Profile, ProposalConfig
+from ..llm_providers import LLMProvider, build_client, resolve_chain
 from ..models import Project, Proposal
 from ..pricing.budget import format_toman
 from ..text import count_emoji, persian_ratio, to_persian_digits, truncate
@@ -89,6 +90,7 @@ class ProposalGenerator:
         *,
         llm: LLMClient | None = None,
         llm_api_key: str | None = None,
+        llm_keys: dict[str, str] | None = None,
     ) -> None:
         self.app = config
         self.settings: ProposalConfig = config.proposal
@@ -96,6 +98,8 @@ class ProposalGenerator:
         self.llm_config: LLMConfig = config.llm
         self._llm = llm
         self._llm_api_key = llm_api_key
+        self._llm_keys = dict(llm_keys or {})
+        self._clients: dict[str, LLMClient] = {}
         self._env = Environment(
             loader=FileSystemLoader(str(_TEMPLATE_DIR)),
             autoescape=select_autoescape(enabled_extensions=()),
@@ -106,23 +110,38 @@ class ProposalGenerator:
 
     # ------------------------------------------------------------------ llm
     @property
-    def llm_ready(self) -> bool:
-        return bool(self.llm_config.enabled and (self._llm or self._llm_api_key))
+    def providers(self) -> list[LLMProvider]:
+        """Primary free provider first, then the configured fallbacks (keys only)."""
+        if self._llm is not None:
+            return [
+                LLMProvider(
+                    id="injected",
+                    base_url=self.llm_config.base_url,
+                    model=self.llm_config.model,
+                )
+            ]
+        return resolve_chain(self.llm_config, self._llm_keys, self._llm_api_key)
 
-    def _client(self) -> LLMClient:
-        if self._llm is None:
-            self._llm = LLMClient(
-                base_url=self.llm_config.base_url,
-                api_key=self._llm_api_key,
-                model=self.llm_config.model,
-                temperature=self.llm_config.temperature,
-                max_tokens=self.llm_config.max_tokens,
-                timeout=self.llm_config.timeout_seconds,
-                extra_headers=self.llm_config.extra_headers,
-            )
-        return self._llm
+    @property
+    def llm_ready(self) -> bool:
+        return bool(self.llm_config.enabled and self.providers)
+
+    def _clients_ready(self) -> list[tuple[LLMProvider, LLMClient]]:
+        if self._llm is not None:
+            return [(self.providers[0], self._llm)]
+        ready: list[tuple[LLMProvider, LLMClient]] = []
+        for provider in self.providers:
+            client = self._clients.get(provider.id)
+            if client is None:
+                client = build_client(provider, self.llm_config)
+                self._clients[provider.id] = client
+            ready.append((provider, client))
+        return ready
 
     async def aclose(self) -> None:
+        for client in self._clients.values():
+            await client.aclose()
+        self._clients.clear()
         if self._llm is not None:
             await self._llm.aclose()
 
@@ -145,35 +164,52 @@ class ProposalGenerator:
         return self.generate_from_template(project, amount, delivery_days)
 
     async def _generate_with_llm(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
-        system, user = build_prompts(project, self.profile, self.settings, amount, delivery_days)
-        response = await self._client().complete(system, user)
-        text = response.text.strip()
-
-        report = validate_proposal(text, self.settings, amount)
-        if not report.ok:
-            log.info("Proposal validation issues: %s — asking for a repair pass", report.issues)
-            try:
-                repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
-                fixed = await self._client().complete(system, repair)
-                if validate_proposal(fixed.text.strip(), self.settings, amount).ok:
-                    text = fixed.text.strip()
-                    response = fixed
-            except LLMError as exc:
-                log.warning("Repair pass failed: %s", exc)
-
-        final_report = validate_proposal(text, self.settings, amount)
-        if not final_report.ok:
-            if self.settings.on_generation_failure == "template":
-                log.warning("LLM text still invalid (%s) — using template", final_report.issues)
-                return self.generate_from_template(project, amount, delivery_days)
-            raise ProposalError("متن تولیدشده اعتبارسنجی را رد کرد: " + "؛ ".join(final_report.issues))
-
-        return Proposal(
-            text=text,
-            generated_by=f"llm:{response.model}",
-            latency_ms=response.latency_ms,
-            usage=response.usage,
+        """Try the free providers in order; the first valid text wins."""
+        system, user = build_prompts(
+            project,
+            self.profile,
+            self.settings,
+            amount,
+            delivery_days,
         )
+        failures: list[str] = []
+        for provider, client in self._clients_ready():
+            try:
+                response = await client.complete(system, user)
+            except LLMError as exc:
+                log.warning("Provider %s failed: %s", provider.id, exc)
+                failures.append(f"{provider.id}: {exc}")
+                continue
+
+            text = response.text.strip()
+            report = validate_proposal(text, self.settings, amount)
+            if not report.ok:
+                log.info(
+                    "Proposal validation issues from %s: %s — asking for a repair pass",
+                    provider.id,
+                    report.issues,
+                )
+                try:
+                    repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
+                    fixed = await client.complete(system, repair)
+                    if validate_proposal(fixed.text.strip(), self.settings, amount).ok:
+                        text = fixed.text.strip()
+                        response = fixed
+                except LLMError as exc:
+                    log.warning("Repair pass failed (%s): %s", provider.id, exc)
+
+            final_report = validate_proposal(text, self.settings, amount)
+            if final_report.ok:
+                return Proposal(
+                    text=text,
+                    generated_by=f"llm:{response.model or provider.model}",
+                    latency_ms=response.latency_ms,
+                    usage=response.usage,
+                )
+            failures.append(f"{provider.id}: " + "؛ ".join(final_report.issues))
+
+        detail = "؛ ".join(failures) if failures else "هیچ ارائه‌دهنده‌ای تنظیم نشده است."
+        raise LLMError(f"تولید متن با مدل زبانی ناموفق بود — {detail}")
 
     def generate_from_template(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
         insights = insights_for(project, limit=3)
@@ -192,6 +228,7 @@ class ProposalGenerator:
 
         template = self._env.get_template("default_fa.j2")
         text = template.render(
+            greeting=self.settings.greeting or "سلام و وقت بخیر",
             profile=self.profile,
             project=project,
             years_fa=to_persian_digits(str(self.profile.years_experience)),

@@ -13,10 +13,11 @@ from rich.table import Table
 
 from . import __version__
 from .app import Application, build_application, configure_logging
-from .config import AppConfig, load_config
+from .config import AppConfig, get_secrets, load_config, reset_secret_cache
 from .notifications.telegram import TelegramNotifier
 from .pricing.strategy import PricingConfig
 from .proposals.generator import ProposalGenerator
+from .settings_store import SettingsStore, get_store
 from .sources import available_sources
 from .text import to_persian_digits
 
@@ -46,6 +47,183 @@ def _run(coro):
 def version() -> None:
     """نمایش نسخه."""
     console.print(f"BidPilot [bold cyan]{__version__}[/bold cyan]")
+
+
+# ----------------------------------------------------------------- setup / bot
+@app.command()
+def setup(
+    config: str = CONFIG_OPTION,
+    stage: str | None = typer.Option(
+        None,
+        "--stage",
+        help="فقط یک بخش: telegram | llm | market | profile | style | mode",
+    ),
+    status_only: bool = typer.Option(False, "--status", help="فقط نمایش وضعیت فعلی"),
+) -> None:
+    """راه‌اندازی گام‌به‌گام — بدون نیاز به .env و بدون دست‌زدن به فایل‌ها.
+
+    همه‌ی پاسخ‌ها (توکن تلگرام، کلید هوش مصنوعی رایگان، حساب سایت، پروفایل، لحن)
+    امن در data/settings.json ذخیره می‌شوند و بعداً از داخل تلگرام هم قابل تغییرند.
+    """
+    from .onboarding import STAGE_TITLES, run_terminal_wizard
+
+    configure_logging("WARNING")
+    store = get_store()
+    if status_only:
+        _print_settings_status(store)
+        return
+    if stage and stage not in STAGE_TITLES:
+        raise typer.BadParameter(f"بخش نامعتبر است. یکی از: {', '.join(STAGE_TITLES)}")
+    run_terminal_wizard(store, console, stages=[stage] if stage else None)
+    console.print(f"\n[dim]محل ذخیره: {store.path}[/dim]")
+
+
+@app.command()
+def settings(
+    action: str = typer.Argument("show", help="show | set | unset | path"),
+    key: str | None = typer.Argument(None, help="کلید نقطه‌ای، مثل proposal.tone"),
+    value: str | None = typer.Option(None, "--value", "-v", help="مقدار برای set"),
+    reveal: bool = typer.Option(False, "--reveal", help="نمایش کامل مقادیر حساس"),
+    as_json: bool = typer.Option(False, "--json", help="تفسیر مقدار به‌عنوان JSON"),
+) -> None:
+    """مدیریت تنظیمات ذخیره‌شده (بدون .env)."""
+    import json as _json
+
+    store = get_store()
+    action = action.strip().lower()
+    if action == "path":
+        console.print(str(store.path))
+        return
+    if action == "show":
+        _print_settings_status(store, reveal=reveal)
+        return
+    if action in {"set", "unset"} and not key:
+        raise typer.BadParameter('کلید را بده: bidpilot settings set proposal.tone -v "رسمی"')
+    if action == "unset":
+        removed = store.delete(key)  # type: ignore[arg-type]
+        reset_secret_cache()
+        console.print("[green]حذف شد.[/green]" if removed else "[yellow]کلیدی با این نام نبود.[/yellow]")
+        return
+    if action == "set":
+        if value is None:
+            raise typer.BadParameter("مقدار را با --value بده.")
+        if as_json:
+            try:
+                parsed = _json.loads(value)
+            except ValueError as exc:
+                raise typer.BadParameter(f"مقدار JSON معتبر نیست: {exc}") from exc
+        else:
+            parsed = value
+        store.set(key, parsed)  # type: ignore[arg-type]
+        reset_secret_cache()
+        console.print(f"[green]ذخیره شد:[/green] {key}")
+        return
+    raise typer.BadParameter("دستور نامعتبر. یکی از: show | set | unset | path")
+
+
+def _print_settings_status(store: SettingsStore, *, reveal: bool = False) -> None:
+    from .onboarding import readiness
+
+    state = readiness(store)
+    table = Table(title="وضعیت راه‌اندازی")
+    table.add_column("بخش")
+    table.add_column("وضعیت")
+    table.add_row("تلگرام", "✅ متصل" if state["telegram"] else "❌ توکن/chat_id ثبت نشده")
+    table.add_row(
+        "هوش مصنوعی",
+        f"{'✅' if state['llm'] else '❌'} {state['llm_title']} — {state['llm_model']}",
+    )
+    table.add_row(
+        "سایت فریلنسری",
+        f"{'✅' if state['credentials'] else '❌'} {state['marketplace']}",
+    )
+    table.add_row("لحن", state["tone"] or "—")
+    table.add_row("دستورهای سبک", "ثبت شده" if state["style"] else "—")
+    table.add_row("حالت ارسال", "واقعی" if state["mode"] == "live" else "آزمایشی")
+    table.add_row("راه‌اندازی", "کامل" if state["setup_completed"] else "ناتمام")
+    console.print(table)
+
+    rows = store.masked_items()
+    if rows:
+        details = Table(title=f"تنظیمات ذخیره‌شده — {store.path}")
+        details.add_column("کلید")
+        details.add_column("مقدار")
+        for name, shown in rows:
+            if reveal:
+                raw = store.get(name)
+                shown = str(raw)
+            details.add_row(escape(name), escape(shown))
+        console.print(details)
+
+
+@app.command()
+def bot(
+    config: str = CONFIG_OPTION,
+    with_runner: bool = typer.Option(False, "--run", help="همراه با رصد و ارسال خودکار در همین فرآیند"),
+    interval: int | None = typer.Option(None, "--interval", help="فاصله بین دورها (ثانیه)"),
+    source: list[str] | None = typer.Option(None, "--source", "-s", help="فقط این منابع"),
+) -> None:
+    """کنترل کامل ربات از تلگرام: راه‌اندازی، لحن، وضعیت و پیش‌نمایش.
+
+    اگر توکن هنوز ذخیره نشده باشد، اول «bidpilot setup» را اجرا کن.
+    """
+
+    async def main() -> None:
+        from .bot import BotAPIError, build_bot
+
+        store = get_store()
+        cfg = _load(config)
+        token = get_secrets().telegram_bot_token or store.get("telegram.bot_token")
+        if not token:
+            console.print(
+                "[red]توکن ربات تلگرام تنظیم نشده است.[/red]\n"
+                "  [bold]bidpilot setup[/bold]  → سؤال‌ها را جواب بده\n"
+                "  یا: [bold]bidpilot settings set telegram.bot_token -v <TOKEN>[/bold]"
+            )
+            raise typer.Exit(code=1)
+
+        service = build_bot(str(token), store=store, config_path=config)
+        application = None
+        scheduler = None
+        tasks = [asyncio.create_task(service.run_forever(), name="telegram-bot")]
+        if with_runner:
+            application = build_application(cfg)
+            await application.setup()
+            from .scheduler import Scheduler
+
+            def make_app():
+                return build_application(load_config(config))
+
+            scheduler = Scheduler(application, interval=interval, sources=source, app_factory=make_app)
+            tasks.append(asyncio.create_task(scheduler.run_forever(), name="scheduler"))
+            console.print("[green]ربات و رصد خودکار هر دو فعال شدند.[/green]")
+        else:
+            console.print(
+                "[green]ربات فعال شد.[/green] در تلگرام /start را بزن. "
+                "برای رصد خودکار: [bold]bidpilot run[/bold] یا [bold]bidpilot bot --run[/bold]"
+            )
+
+        try:
+            await asyncio.gather(*tasks)
+        except BotAPIError as exc:
+            console.print(
+                f"[red]اتصال به تلگرام برقرار نشد:[/red] {exc}\n"
+                "توکن را بررسی کن: [bold]bidpilot settings set telegram.bot_token -v <TOKEN>[/bold]"
+            )
+            raise typer.Exit(code=1) from exc
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            if scheduler is not None:
+                scheduler.request_stop()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await service.api.aclose()
+            if application is not None:
+                await application.close()
+
+    _run(main())
 
 
 @app.command("sources")
@@ -95,14 +273,44 @@ def doctor(config: str = CONFIG_OPTION) -> None:
             table.add_row(name, "[green]OK[/green]" if ok else "[red]FAIL[/red]", detail)
 
         profile = cfg.profile
-        profile_ok = bool(profile.first_name and profile.full_name and profile.stack)
-        row("پروفایل", profile_ok, f"{profile.full_name} | {profile.stack_short}")
+        profile_issues = profile.problems()
+        profile_ok = not profile_issues
+        row(
+            "پروفایل",
+            profile_ok,
+            f"{profile.full_name} | {profile.stack_short}" if profile_ok else "؛ ".join(profile_issues),
+        )
 
         tg_ok = bool(application.secrets.telegram_bot_token and cfg.notifications.chat_ids)
         row("تلگرام", tg_ok, f"{len(cfg.notifications.chat_ids)} chat id")
 
-        llm_ok = bool(cfg.llm.enabled and application.secrets.llm_api_key)
-        row("مدل زبانی", llm_ok, cfg.llm.model if llm_ok else "کلید نیست → از قالب استفاده می‌شود")
+        provider_key = application.secrets.llm_keys.get(cfg.llm.provider) or (application.secrets.llm_api_key)
+        llm_ok = bool(cfg.llm.enabled and provider_key)
+        row(
+            "مدل زبانی",
+            llm_ok,
+            f"{cfg.llm.provider_title} — {cfg.llm.model}"
+            if llm_ok
+            else "کلید رایگان ثبت نشده → متن با قالب نوشته می‌شود (bidpilot setup)",
+        )
+
+        store = get_store()
+        creds_ok = bool(
+            application.secrets.parscoders_cookie
+            or (application.secrets.parscoders_username and application.secrets.parscoders_password)
+            or (store.get("marketplace.name") == "mock")
+        )
+        row(
+            "حساب سایت",
+            creds_ok,
+            f"{store.get('marketplace.name') or 'parscoders'} — "
+            + ("اعتبارنامه ثبت شده" if creds_ok else "در bidpilot setup وارد کن"),
+        )
+        row(
+            "تنظیمات ذخیره‌شده",
+            store.exists,
+            str(store.path) if store.exists else "هنوز چیزی ذخیره نشده (bidpilot setup)",
+        )
 
         row("حالت ارسال", True, "LIVE" if cfg.runtime.live else "DRY-RUN (پیشنهاد ارسال نمی‌شود)")
 
@@ -215,7 +423,13 @@ def run(
         await application.setup()
         from .scheduler import Scheduler
 
-        scheduler = Scheduler(application, interval=interval, sources=source)
+        def make_app():
+            fresh = load_config(config)
+            if live:
+                fresh.runtime.submit_mode = "live"
+            return build_application(fresh)
+
+        scheduler = Scheduler(application, interval=interval, sources=source, app_factory=make_app)
         try:
             await scheduler.run_forever()
         finally:
@@ -424,7 +638,8 @@ def go_live(
 ) -> None:
     """آماده‌سازی و فعال‌سازی ارسال واقعی (با چک‌لیست ایمنی).
 
-    این دستور فایل gitignored «config/config.local.yaml» را می‌نویسد و تنظیمات اصلی را دست نمی‌زند.
+    این دستور فایل gitignored «config/config.local.yaml» و مقدار runtime.submit_mode را در
+    data/settings.json می‌نویسد؛ تنظیمات اصلی (config.yaml) دست نمی‌خورد.
     """
     import yaml as _yaml
 
@@ -436,6 +651,7 @@ def go_live(
     if local_path.exists():
         local_raw = _yaml.safe_load(local_path.read_text(encoding="utf-8")) or {}
 
+    store = get_store()
     if off:
         runtime = local_raw.setdefault("runtime", {}) or {}
         runtime["submit_mode"] = "dry_run"
@@ -443,6 +659,7 @@ def go_live(
         local_path.write_text(
             _yaml.safe_dump(local_raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
         )
+        store.set("runtime.submit_mode", "dry_run")
         console.print(f"[yellow]حالت آزمایشی فعال شد.[/yellow] ({local_path})")
         return
 
@@ -467,23 +684,28 @@ def go_live(
             True,
         )
     )
-    cookie_ok = bool(secrets.parscoders_cookie)
+    cookie_ok = bool(
+        secrets.parscoders_cookie
+        or (secrets.parscoders_username and secrets.parscoders_password)
+        or store.get("marketplace.name") == "mock"
+    )
     checks.append(
         (
-            "کوکی پارس‌کدرز",
+            "حساب سایت",
             cookie_ok,
-            "تنظیم شده." if cookie_ok else "PARSOCODERS_COOKIE در .env خالی است.",
+            "تنظیم شده." if cookie_ok else "در bidpilot setup نام کاربری/رمز یا کوکی سایت را وارد کنید.",
             True,
         )
     )
-    llm_ok = bool(cfg.llm.enabled and secrets.llm_api_key)
+    provider_key = secrets.llm_keys.get(cfg.llm.provider) or secrets.llm_api_key
+    llm_ok = bool(cfg.llm.enabled and provider_key)
     checks.append(
         (
             "مدل زبانی",
             llm_ok,
-            cfg.llm.model
+            f"{cfg.llm.provider_title} — {cfg.llm.model}"
             if llm_ok
-            else "کلید نیست؛ متن‌ها با قالب نوشته می‌شوند (کار می‌کند ولی کمتر شخصی‌سازی‌شده).",
+            else "کلید رایگان ثبت نشده؛ متن‌ها با قالب نوشته می‌شوند (کار می‌کند ولی کمتر شخصی‌سازی‌شده).",
             False,
         )
     )
@@ -527,6 +749,8 @@ def go_live(
     runtime["submit_mode"] = "live"
     local_raw["runtime"] = runtime
     local_path.write_text(_yaml.safe_dump(local_raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # the persisted settings store wins over config.local.yaml
+    store.set("runtime.submit_mode", "live")
 
     console.print(f"[green]حالت live فعال شد.[/green] ({local_path})")
     console.print(

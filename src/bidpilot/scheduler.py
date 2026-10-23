@@ -6,10 +6,13 @@ import asyncio
 import logging
 import random
 import signal
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .app import Application
+from .config import reset_secret_cache
 from .models import Event, EventKind
+from .settings_store import SettingsStore, get_store
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +25,8 @@ class Scheduler:
         interval: int | None = None,
         jitter: int | None = None,
         sources: list[str] | None = None,
+        app_factory: Callable[[], Application] | None = None,
+        store: SettingsStore | None = None,
     ) -> None:
         self.app = app
         self.interval = interval or app.config.runtime.poll_interval_seconds
@@ -29,6 +34,11 @@ class Scheduler:
         self.sources = sources
         self._stop = asyncio.Event()
         self.consecutive_errors = 0
+        # When the user changes something in the Telegram bot (tone, key, live mode,
+        # credentials) the running daemon picks it up on the next cycle — no restart.
+        self._app_factory = app_factory
+        self._store = store or get_store()
+        self._settings_stamp = self._store.stamp()
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -40,6 +50,31 @@ class Scheduler:
                 loop.add_signal_handler(sig, self.request_stop)
             except NotImplementedError:  # pragma: no cover - Windows
                 pass
+
+    async def reload_if_settings_changed(self) -> bool:
+        """Rebuild the Application when data/settings.json changed underneath us."""
+        if self._app_factory is None:
+            return False
+        stamp = self._store.stamp()
+        if stamp == self._settings_stamp:
+            return False
+        try:
+            # the process-wide secrets cache predates this change
+            reset_secret_cache()
+            new_app = self._app_factory()
+            await new_app.setup()
+        except Exception as exc:  # keep the old, working app
+            log.error("Could not apply new settings: %s", exc)
+            return False
+        old_app = self.app
+        self.app = new_app
+        self._settings_stamp = stamp
+        log.info("Settings changed — reloaded configuration and sources.")
+        try:
+            await old_app.close()
+        except Exception:  # pragma: no cover
+            pass
+        return True
 
     async def run_forever(self) -> None:
         self._install_signal_handlers()
@@ -57,6 +92,7 @@ class Scheduler:
         while not self._stop.is_set():
             started = datetime.now(timezone.utc)
             try:
+                await self.reload_if_settings_changed()
                 reports = await self.app.cycle(self.sources)
                 self.consecutive_errors = 0
                 for report in reports:

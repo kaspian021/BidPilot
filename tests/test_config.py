@@ -103,3 +103,8 @@ def test_go_live_writes_local_override(tmp_path, monkeypatch):
 
     local = yaml.safe_load((config_dir / "config.local.yaml").read_text(encoding="utf-8"))
     assert local["runtime"]["submit_mode"] == "dry_run"
+
+    from bidpilot.settings_store import SettingsStore
+
+    store = SettingsStore(tmp_path / "data" / "settings.json")
+    assert store.get("runtime.submit_mode") == "dry_run"

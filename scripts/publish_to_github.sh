@@ -109,5 +109,5 @@ cat <<EOF
 Next steps:
   • add repository secrets if you plan to deploy from CI
   • edit config/profile.yaml with your real profile
-  • copy .env.example to .env and fill in your Telegram token / Parscoders cookie
+  • run: bidpilot setup   (no .env needed — answers are stored in data/settings.json)
 EOF

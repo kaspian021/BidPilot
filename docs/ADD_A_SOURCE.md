@@ -101,10 +101,12 @@ sources:
       list_path: "/jobs"
       card_selector: "article.job"
       headers: { "X-Requested-With": "XMLHttpRequest" }
-      cookies: { "session": "..." }   # یا از .env با متغیر خودتان
+      cookies: { "session": "..." }   # یا از SettingsStore / محیط با متغیر خودتان
 ```
 
-کلیدهای امنیتی (کوکی/توکن) را در `.env` بگذارید و در `config.Secrets` فیلد اضافه کنید، نه در YAML.
+کلیدهای امنیتی (کوکی/توکن) را در `config.Secrets` فیلد اضافه کنید — مقدارش از
+`data/settings.json` (کلیدهایی مثل `credentials.<source>.cookie`) یا `.env` می‌آید، نه YAML.
+برای اینکه ویزارد/ربات هم آن را بپرسند، یک `Question` در `onboarding.py` اضافه کنید.
 
 ## ۳) بررسی بدون ارسال
 

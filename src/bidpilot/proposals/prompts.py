@@ -30,7 +30,8 @@ SYSTEM_PROMPT = """تو یک برنامه‌نویس حرفه‌ای ایران�
   ۲) معرفی یک‌خطی برنامه‌نویس + ارتباط تجربه با همین پروژه
   ۳) ۳ تا ۵ چالش/نکته کلیدی که در همین پروژه دیده‌ای و راه‌حل پیشنهادی تو برای هر کدام
   ۴) جمع‌بندی: قیمت پیشنهادی، زمان تحویل، اینکه آماده‌ای جزئیات را در چت روشن کنی و شروع کنی
-- در پایان پیام، امضا را همان‌طور که در پروفایل آمده قرار بده."""
+- در پایان پیام، امضا را همان‌طور که در پروفایل آمده قرار بده.
+- بخش «لحن و سبک نگارش» را دقیقاً رعایت کن؛ اگر با قوانین بالا تضاد داشت، قوانین بالا اولویت دارند."""
 
 USER_PROMPT_TEMPLATE = """# پروفایل برنامه‌نویس (تنها منبع مجاز برای ادعاها)
 نام: {full_name}
@@ -39,7 +40,8 @@ USER_PROMPT_TEMPLATE = """# پروفایل برنامه‌نویس (تنها م�
 تکنولوژی‌ها: {stack}
 نمونه‌کار/دستاوردهای قابل ذکر: {highlights}
 پورتال: {portfolio}
-لحن: {tone}
+لحن پیشنهادی: {tone}
+دستورهای سبک نگارش کاربر (الزامی): {style}
 ممنوع (به هیچ شکل): {forbidden}
 
 # پروژه کارفرما
@@ -65,6 +67,10 @@ def build_prompts(
     delivery = f"{delivery_days} روز" if delivery_days else "توافقی"
     project_text = truncate(project.text_for_llm, 4_000)
     system = SYSTEM_PROMPT.format(max_emoji=config.max_emoji)
+    # The user's own voice always beats the generic profile tone.
+    effective_tone = (config.tone or profile.tone or "حرفه‌ای، صمیمی، بدون اغراق").strip()
+    style = (config.style_instructions or "").strip()
+    style = truncate(style, 1_000) if style else "خاصی تعیین نشده؛ طبیعی و انسانی بنویس."
     user = USER_PROMPT_TEMPLATE.format(
         full_name=profile.full_name,
         role=profile.role,
@@ -72,7 +78,8 @@ def build_prompts(
         stack="، ".join(profile.stack),
         highlights="؛ ".join(profile.highlights) or "ذکر نشده (هیچ ادعایی نکن)",
         portfolio=profile.portfolio_url or "ذکر نشده (لینک نساز)",
-        tone=profile.tone,
+        tone=effective_tone,
+        style=style,
         forbidden="؛ ".join(profile.forbidden_claims) or "—",
         project_text=project_text,
         amount=to_persian_digits(f"{amount:,}"),

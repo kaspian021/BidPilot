@@ -1,0 +1,40 @@
+services:
+  bidpilot:
+    build: .
+    container_name: bidpilot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://bidpilot:bidpilot@db:5432/bidpilot"
+      # "dry_run" (default) or "live"
+      BIDPILOT_MODE: "dry_run"
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    image: postgres:16-alpine
+    container_name: bidpilot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bidpilot
+      POSTGRES_PASSWORD: bidpilot
+      POSTGRES_DB: bidpilot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bidpilot -d bidpilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

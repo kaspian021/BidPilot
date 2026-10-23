@@ -1,0 +1,183 @@
+import pytest
+
+from bidpilot.app import Application
+from bidpilot.config import AppConfig, FiltersConfig, Profile, RuntimeConfig, Secrets, SourceConfig
+from bidpilot.models import Event, EventKind
+from bidpilot.notifications.base import Notifier
+from bidpilot.repositories import Repository
+
+PROJECTS = [
+    {
+        "external_id": "1",
+        "title": "ساخت ربات تلگرام فروشگاهی",
+        "description": "ربات تلگرام با کالای فروشگاهی، سبد خرید و درگاه پرداخت زرین‌پال",
+        "budget": {"min": 500_000, "max": 1_500_000},
+        "skills": ["Python", "Telegram Bot API"],
+    },
+    {
+        "external_id": "2",
+        "title": "سایت شرکتی وردپرس",
+        "description": "سایت شش صفحه‌ای با قالب ریسپانسیو",
+        "budget": {"min": 300_000, "max": 700_000},
+        "skills": ["WordPress"],
+    },
+    {
+        "external_id": "3",
+        "title": "هک اکانت اینستاگرام",
+        "description": "بازیابی اکانت",
+        "budget": {"min": 100_000, "max": 200_000},
+        "skills": [],
+    },
+]
+
+
+class MemoryNotifier(Notifier):
+    name = "memory"
+
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+
+    async def send(self, event: Event) -> bool:
+        self.events.append(event)
+        return True
+
+    def kinds(self, kind: EventKind) -> list[Event]:
+        return [e for e in self.events if e.kind == kind]
+
+
+def make_config(tmp_path, **runtime_overrides) -> AppConfig:
+    runtime = dict(
+        submit_mode="live",
+        max_bids_per_hour=50,
+        max_bids_per_day=100,
+        min_seconds_between_bids=0,
+        notify_on_skip=False,
+        poll_interval_seconds=1,
+        jitter_seconds=0,
+    )
+    runtime.update(runtime_overrides)
+    return AppConfig(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.sqlite3'}",
+        profile=Profile(first_name="محمد", full_name="محمد رضایی"),
+        runtime=RuntimeConfig(**runtime),
+        filters=FiltersConfig(exclude_keywords=["هک", "کپی سایت"]),
+        sources=[SourceConfig(type="mock", settings={"projects": PROJECTS, "latency": 0})],
+        llm={"enabled": False},
+    )
+
+
+async def build_app(config: AppConfig) -> tuple[Application, MemoryNotifier]:
+    application = Application.build(config, Secrets())
+    notifier = MemoryNotifier()
+    application.notifiers.notifiers = [notifier]
+    await application.setup()
+    return application, notifier
+
+
+async def test_full_cycle_submits_bids_and_skips_blacklisted(tmp_path):
+    application, notifier = await build_app(make_config(tmp_path))
+    reports = await application.cycle()
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.fetched == 3
+    assert report.submitted == 2
+    assert report.skipped == 1  # the "هک" project
+
+    submitted = notifier.kinds(EventKind.BID_SUBMITTED)
+    assert len(submitted) == 2
+    amounts = {event.bid.amount for event in submitted}
+    assert amounts == {1_000_000, 500_000}
+
+    await application.close()
+
+
+async def test_second_cycle_does_not_rebid(tmp_path):
+    application, _ = await build_app(make_config(tmp_path))
+    first = (await application.cycle())[0]
+    second = (await application.cycle())[0]
+
+    assert first.submitted == 2
+    assert second.submitted == 0
+    assert second.new == 0
+    await application.close()
+
+
+async def test_dry_run_mode_sends_nothing(tmp_path):
+    application, notifier = await build_app(make_config(tmp_path, submit_mode="dry_run"))
+    report = (await application.cycle())[0]
+
+    assert report.dry_run == 2
+    assert report.submitted == 0
+    assert len(notifier.kinds(EventKind.BID_DRY_RUN)) == 2
+    await application.close()
+
+
+async def test_rate_limit_caps_bids(tmp_path):
+    application, _ = await build_app(make_config(tmp_path, max_bids_per_hour=1))
+    report = (await application.cycle())[0]
+
+    assert report.submitted == 1
+    assert report.skipped == 2  # second project hits the hourly cap, third is filtered
+    await application.close()
+
+
+async def test_projects_and_bids_persisted(tmp_path):
+    application, _ = await build_app(make_config(tmp_path))
+    await application.cycle()
+
+    session = application.db.session()
+    repo = Repository(session)
+    stats = await repo.stats()
+    rows = await repo.recent_bids(limit=10)
+
+    assert stats["projects"] == 3
+    assert stats["submitted"] == 2
+    filled = [row for row in rows if row.proposal_text]
+    assert filled and filled[0].proposal_text.startswith("سلام")
+    assert filled[0].pricing_rationale
+    await session.close()
+    await application.close()
+
+
+async def test_source_failure_is_reported_without_crash(tmp_path):
+    config = make_config(tmp_path)
+    config.sources = [SourceConfig(type="mock", settings={"fixture_path": "/does/not/exist.json"})]
+    application, notifier = await build_app(config)
+
+    reports = await application.cycle()
+    assert reports[0].errors
+    assert notifier.kinds(EventKind.ERROR)
+    await application.close()
+
+
+@pytest.mark.parametrize("live", [True, False])
+async def test_live_flag_override(tmp_path, live):
+    application, _ = await build_app(make_config(tmp_path, submit_mode="live" if not live else "dry_run"))
+    report = (await application.cycle(live=live))[0]
+    assert (report.submitted > 0) is live
+    await application.close()
+
+
+async def test_duplicate_projects_are_not_counted_as_skipped(tmp_path):
+    application, notifier = await build_app(make_config(tmp_path))
+    await application.cycle()
+    second = (await application.cycle())[0]
+
+    assert second.duplicates == 3
+    assert second.skipped == 0
+    assert second.dry_run == 0
+    await application.close()
+
+
+async def test_error_notifications_are_throttled(tmp_path):
+    config = make_config(tmp_path)
+    config.sources = [SourceConfig(type="mock", settings={"fixture_path": "/nope.json"})]
+    application, notifier = await build_app(config)
+
+    await application.cycle()
+    await application.cycle()
+
+    # DB logs the error both times, Telegram only once per cooldown window
+    assert len(notifier.kinds(EventKind.ERROR)) == 1
+    await application.close()

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bidpilot"
+version = "0.1.0"
+description = "Scalable, pluggable bid-automation agent for freelance marketplaces (Parscoders first)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "BidPilot" }]
+keywords = ["freelance", "automation", "parscoders", "telegram", "llm", "bidding"]
+dependencies = [
+  "httpx[http2]>=0.27",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "sqlalchemy[asyncio]>=2.0",
+  "aiosqlite>=0.20",
+  "jinja2>=3.1",
+  "typer>=0.12",
+  "rich>=13.7",
+  "tenacity>=8.3",
+  "beautifulsoup4>=4.12",
+  "lxml>=5.2",
+  "python-dateutil>=2.9",
+  "jdatetime>=5.0",
+  "orjson>=3.10",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.29"]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "respx>=0.21",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+bidpilot = "bidpilot.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+bidpilot = ["proposals/templates/*.j2", "sources/mock/fixtures/*.json", "sources/parscoders/*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false

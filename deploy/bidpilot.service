@@ -1,0 +1,27 @@
+[Unit]
+Description=BidPilot — automated freelance bidding agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bidpilot
+Group=bidpilot
+WorkingDirectory=/home/bidpilot/bidpilot
+EnvironmentFile=/home/bidpilot/bidpilot/.env
+ExecStartPre=/home/bidpilot/bidpilot/.venv/bin/bidpilot initdb
+ExecStart=/home/bidpilot/bidpilot/.venv/bin/bidpilot run --config config/config.yaml
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/bidpilot/bidpilot/data
+
+[Install]
+WantedBy=multi-user.target

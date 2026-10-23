@@ -1,0 +1,117 @@
+# ============================================================================
+# BidPilot — main configuration
+# Secrets live in .env (see .env.example). Everything here is safe to commit.
+# Optional machine-specific overrides: config/config.local.yaml (gitignored)
+# ============================================================================
+
+log_level: "INFO"
+database_url: "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+# For production scale-out:  postgresql+asyncpg://user:pass@localhost:5432/bidpilot
+data_dir: "data"
+
+# Profile is loaded from config/profile.yaml (kept separate so it's easy to edit)
+profile_path: "config/profile.yaml"
+
+# ---------------------------------------------------------------------------
+# Runtime / safety
+# ---------------------------------------------------------------------------
+runtime:
+  # "dry_run" = only log/notify what would be sent. "live" = really POST the bid.
+  submit_mode: "dry_run"
+  poll_interval_seconds: 120      # how often to check for new projects
+  jitter_seconds: 30              # random ± to look less robotic
+  # conservative defaults for the first days of live mode — raise them later
+  max_bids_per_hour: 5
+  max_bids_per_day: 25
+  min_seconds_between_bids: 180
+  max_projects_per_poll: 30
+  notify_on_skip: true
+  request_timeout_seconds: 25.0
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+# ---------------------------------------------------------------------------
+# Pricing — the bid always lands inside the employer's range
+# ---------------------------------------------------------------------------
+pricing:
+  # midpoint_round | aggressive_low | premium_high | fixed
+  strategy: "midpoint_round"
+  # where inside the employer's range to sit: 0.0 = min, 0.5 = middle, 1.0 = max
+  # (for 500,000–1,500,000 @ 0.5  ->  1,000,000)
+  ratio: 0.5
+  min_step: 5000                  # round to a human-friendly number
+  default_amount: 2000000         # used only when the employer gives no budget
+  delivery_days: 14
+  min_project_budget: 300000
+  max_project_budget: null
+
+# ---------------------------------------------------------------------------
+# Which projects to bid on
+# ---------------------------------------------------------------------------
+filters:
+  include_keywords: []            # e.g. ["ربات", "پایتون", "api"] — empty = everything
+  exclude_keywords:               # never bid on these
+    - "داده کاوی تلگرام"
+    - "هک"
+    - "کپی سایت"
+    - "پروژه دانشجویی"
+  min_budget: null
+  max_budget: null
+  categories_allow: []
+  skip_negotiable: false
+
+# ---------------------------------------------------------------------------
+# Proposal text
+# ---------------------------------------------------------------------------
+proposal:
+  language: "fa"
+  min_chars: 320
+  max_chars: 1500
+  max_emoji: 2
+  # if the LLM text fails validation: "skip" (no bid) or "template" (use the built-in template)
+  on_generation_failure: "template"
+  banned_phrases:
+    - "تضمین رتبه"
+    - "ارزان‌ترین قیمت"
+    - "۱۰۰٪ تضمینی"
+    - "بهترین در ایران"
+
+# ---------------------------------------------------------------------------
+# LLM (any OpenAI-compatible endpoint: OpenAI, OpenRouter, Groq, vLLM, Ollama)
+# If no LLM_API_KEY is set, BidPilot falls back to its deterministic template.
+# ---------------------------------------------------------------------------
+llm:
+  enabled: true
+  provider: "openai_compatible"
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  temperature: 0.6
+  max_tokens: 900
+  timeout_seconds: 45.0
+  extra_headers: {}
+  # examples for other providers:
+  #   OpenRouter: base_url: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini"
+  #   Groq:       base_url: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile"
+  #   Ollama:     base_url: "http://localhost:11434/v1",  model: "qwen2.5:14b"
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+notifications:
+  enabled: true
+  chat_ids: []        # get yours with: bidpilot telegram-whoami   (or set TELEGRAM_CHAT_IDS in .env)
+  send_full_proposal: true
+
+# ---------------------------------------------------------------------------
+# Sources — add a marketplace by adding an entry here
+# ---------------------------------------------------------------------------
+sources:
+  - type: "parscoders"
+    enabled: true
+    settings: {}      # defaults come from src/bidpilot/sources/parscoders/config.yaml
+
+  # Example: enable the mock source to test the whole flow without any network
+  - type: "mock"
+    enabled: false
+    settings:
+      latency: 0
+      failure_rate: 0.0

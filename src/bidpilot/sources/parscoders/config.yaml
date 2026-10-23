@@ -1,0 +1,144 @@
+# ============================================================================
+# Parscoders adapter configuration
+# ----------------------------------------------------------------------------
+# If Parscoders changes its markup, edit THIS file (not Python code):
+#   1. open https://parscoders.com/project in a browser
+#   2. inspect one project card -> copy the CSS selector of the card container
+#   3. do the same for title / link / budget / description / skills
+#   4. repeat on a project page for the bid form selectors
+# Selector lists are tried in order, the first match wins.
+# ============================================================================
+
+base_url: "https://parscoders.com"
+
+# --- listing page -----------------------------------------------------------
+list:
+  path: "/project"
+  # query string appended to the list URL, e.g. {page: 2} -> ?page=2
+  page_param: "page"
+  max_pages: 1
+  # card containers on the listing page
+  card_selectors:
+    - "div.project-list-item"
+    - "div.project-row"
+    - "div.card.project"
+    - "article.project"
+    - "li.project-item"
+    - "table.project-list tr"
+  fields:
+    title:
+      - "h2 a"
+      - ".project-title a"
+      - "a.project-title"
+      - "a[href*='/project/']"
+    link:
+      - "h2 a"
+      - ".project-title a"
+      - "a.project-title"
+      - "a[href*='/project/']"
+    description:
+      - ".project-description"
+      - "div.description"
+      - "p.description"
+      - ".summary"
+    budget:
+      - ".project-budget"
+      - ".budget"
+      - "[class*='budget']"
+      - "[class*='price']"
+    skills:
+      - ".project-skills .tag"
+      - ".tags .tag"
+      - ".skills li"
+      - ".skill"
+    category:
+      - ".project-category"
+      - ".category"
+    employer:
+      - ".employer"
+      - ".project-owner"
+      - ".user-name"
+    published_at:
+      - ".project-date"
+      - "time"
+      - ".date"
+  id_regex: "/projects?/(\\d+)"
+  # fetch each project page for the full description & exact budget
+  fetch_details: true
+  detail_concurrency: 3
+
+detail:
+  path: "/project/{external_id}"
+  detail_fields:
+    description:
+      - "#project-description"
+      - ".project-description"
+      - ".project-detail .description"
+      - "div.description"
+    budget:
+      - ".project-budget"
+      - ".budget"
+      - "[class*='budget']"
+    skills:
+      - ".project-skills .tag"
+      - ".skills .tag"
+      - "li.skill"
+    category:
+      - ".project-category"
+    employer:
+      - ".project-owner"
+      - ".employer"
+
+# --- bidding ----------------------------------------------------------------
+bid:
+  mode: "form"           # "form" = parse & POST the real HTML form
+  # form on the project page that submits a proposal
+  form_selectors:
+    - "form#bid-form"
+    - "form#proposal-form"
+    - "form[action*='bid']"
+    - "form[action*='proposal']"
+    - "form[action*='offer']"
+    - ".bid-form form"
+  # where each value goes inside that form
+  fields:
+    amount:
+      - "input[name*='amount']"
+      - "input[name*='price']"
+      - "input[name*='budget']"
+      - "input[name*='offer']"
+    description:
+      - "textarea[name*='description']"
+      - "textarea[name*='proposal']"
+      - "textarea[name*='content']"
+      - "textarea[name*='message']"
+      - "textarea"
+    days:
+      - "input[name*='day']"
+      - "input[name*='delivery']"
+      - "input[name*='duration']"
+      - "select[name*='day']"
+  include_hidden: true
+  success_text_contains:
+    - "با موفقیت"
+    - "ثبت شد"
+    - "درخواست شما"
+    - "پیشنهاد شما"
+  failure_text_contains:
+    - "قبلاً پیشنهاد"
+    - "قبلا پیشنهاد"
+    - "اعتبار کافی"
+    - "امکان ارسال"
+    - "خطا"
+    - "مجاز نیست"
+    - "وارد شوید"
+  # optional: a URL to GET before submitting (e.g. a CSRF-refresh endpoint)
+  pre_submit_get: ""
+
+# --- auth -------------------------------------------------------------------
+auth:
+  mode: "cookie"           # "cookie" (use PARSOCODERS_COOKIE) or "credentials"
+  login_path: "/login"
+  username_field: "username"
+  password_field: "password"
+  cookie_name: "PHPSESSID"

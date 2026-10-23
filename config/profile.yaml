@@ -1,0 +1,35 @@
+# ============================================================================
+# Your profile — the ONLY source of claims the bid is allowed to make.
+# Keep it truthful; everything here can end up in a proposal.
+# ============================================================================
+
+first_name: "محمد"                       # change me
+full_name: "محمد رضایی"                  # change me
+role: "برنامه‌نویس فول‌استک"
+years_experience: 5
+stack:
+  - "Python"
+  - "Django"
+  - "FastAPI"
+  - "React"
+  - "PostgreSQL"
+  - "Redis"
+  - "Docker"
+  - "Telegram Bot API"
+
+highlights:
+  - "چند ربات تلگرامی فروشگاهی با درگاه پرداخت و پنل مدیریت"
+  - "بک‌اند FastAPI برای دو اپلیکیشن موبایل"
+  - "سایت‌های وردپرسی با تمرکز روی سرعت و سئو"
+
+portfolio_url: ""                        # e.g. "https://github.com/username"
+signature: |
+  با احترام،
+  محمد رضایی
+
+tone: "حرفه‌ای، صمیمی، بدون اغراق"
+
+forbidden_claims:
+  - "تضمین رتبه یک گوگل"
+  - "پشتیبانی ۲۴ ساعته رایگان"
+  - "تخفیف ویژه"

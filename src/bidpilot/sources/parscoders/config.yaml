@@ -137,7 +137,7 @@ bid:
 
 # --- auth -------------------------------------------------------------------
 auth:
-  mode: "cookie"           # "cookie" (use PARSOCODERS_COOKIE) or "credentials"
+  mode: "cookie"           # "cookie" (PARSOCODERS_COOKIE / settings store) or "credentials"
   login_path: "/login"
   username_field: "username"
   password_field: "password"

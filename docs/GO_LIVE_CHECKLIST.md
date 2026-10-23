@@ -23,6 +23,7 @@ bidpilot setup --status   # آماده است؟ چه چیزی مانده؟
 ## ۱) اجرای آزمایشی
 
 ```bash
+bidpilot selftest                # تست واقعی: تلگرام + کلید AI + سایت + یک پیشنهاد نمونه (بدون ارسال)
 bidpilot doctor                  # همه‌ی ردیف‌ها OK؟ (منبع parscoders باید پروژه پیدا کند)
 bidpilot telegram-test           # پیام تست رسید؟
 bidpilot preview -s parscoders --limit 2    # متن‌ها را بخوانید؛ لحن و قیمت درست است؟

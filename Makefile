@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format check setup bot demo docker clean
+.PHONY: install dev test lint format check setup bot selftest demo docker clean
 
 install:
 	pip install -e .
@@ -25,6 +25,9 @@ setup:
 
 bot:
 	bidpilot bot --run
+
+selftest:
+	bidpilot selftest
 
 demo:
 	bidpilot demo

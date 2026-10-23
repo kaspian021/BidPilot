@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -321,6 +322,225 @@ def doctor(config: str = CONFIG_OPTION) -> None:
         console.print(table)
 
     _run(main())
+
+
+@app.command()
+def selftest(
+    config: str = CONFIG_OPTION,
+    source: str | None = typer.Option(None, "--source", "-s", help="فقط این منبع را تست کن"),
+    limit: int = typer.Option(2, "--limit", help="حداکثر چند پروژه بررسی شود"),
+    offline: bool = typer.Option(False, "--offline", help="بدون شبکه و بدون حساب: منبع آزمایشی + متن قالبی"),
+    telegram_message: bool = typer.Option(
+        True, "--telegram-message/--no-telegram-message", help="ارسال پیام تست به تلگرام"
+    ),
+    ai: bool = typer.Option(True, "--ai/--no-ai", help="فراخوانی واقعی مدل برای تست کلید"),
+) -> None:
+    """تست واقعی end-to-end: تلگرام، کلید هوش مصنوعی، دسترسی سایت و تولید یک پیشنهاد.
+
+    هیچ پیشنهادی روی سایت ثبت نمی‌شود. برای تست بدون هیچ حساب واقعی از --offline استفاده کن.
+
+    مثال‌ها:
+      bidpilot selftest --offline          # فقط سلامت خود برنامه (بدون شبکه)
+      bidpilot selftest                    # تست واقعی با همان تنظیمات ذخیره‌شده
+      bidpilot selftest -s parscoders      # فقط پارس‌کدرز
+    """
+    from .bot import BotAPIError, TelegramAPI
+    from .config import Secrets, SourceConfig
+    from .llm_providers import resolve_chain, verify_provider
+
+    OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
+    results: list[tuple[str, str, str]] = []
+
+    def add(label: str, status: str, detail: str = "") -> None:
+        results.append((label, status, detail))
+
+    async def main() -> None:
+        cfg = _load(config)
+        store = get_store()
+        secrets = get_secrets()
+
+        if offline:
+            cfg.sources = [SourceConfig(type="mock", settings={})]
+            cfg.llm.enabled = False
+            cfg.notifications.enabled = False
+
+        add(
+            "تنظیمات ذخیره‌شده",
+            OK if store.exists else WARN,
+            str(store.path) if store.exists else "خالی — با bidpilot setup پر کن",
+        )
+
+        # ---------------------------------------------------------- telegram
+        if offline:
+            add("تلگرام", SKIP, "در حالت offline بررسی نمی‌شود")
+        elif not secrets.telegram_bot_token:
+            add("تلگرام", FAIL, "توکن ربات ثبت نشده — bidpilot setup")
+        elif not cfg.notifications.chat_ids:
+            add("تلگرام", WARN, "توکن هست ولی chat_id ثبت نشده — در ربات /start بزن")
+        else:
+            api = TelegramAPI(str(secrets.telegram_bot_token))
+            try:
+                me = await api.get_me()
+                add("تلگرام (توکن)", OK, f"@{me.get('username', '?')}")
+                if telegram_message:
+                    sent = 0
+                    for chat_id in cfg.notifications.chat_ids:
+                        try:
+                            await api.send_message(
+                                chat_id,
+                                "✅ <b>BidPilot</b> — تست اتصال موفق بود. "
+                                "این پیام فقط برای اطمینان از تنظیمات است.",
+                            )
+                            sent += 1
+                        except BotAPIError as exc:
+                            add("تلگرام (ارسال)", FAIL, f"{chat_id}: {exc}")
+                    if sent:
+                        add("تلگرام (ارسال)", OK, f"پیام تست به {sent} چت رسید")
+            except BotAPIError as exc:
+                add("تلگرام", FAIL, f"توکن نامعتبر است یا دسترسی به API نیست: {exc}")
+            finally:
+                await api.aclose()
+
+        # ---------------------------------------------------------------- ai
+        chain = resolve_chain(cfg.llm, secrets.llm_keys, secrets.llm_api_key)
+        if offline or not ai:
+            add("هوش مصنوعی", SKIP, "در این حالت فراخوانی نمی‌شود")
+        elif not chain:
+            add(
+                "هوش مصنوعی",
+                WARN,
+                "کلید رایگان ثبت نشده — متن‌ها با قالب نوشته می‌شوند (bidpilot setup)",
+            )
+        else:
+            working = False
+            for provider in chain:
+                try:
+                    ok, message = await verify_provider(provider)
+                except Exception as exc:  # network / DNS
+                    ok, message = False, f"خطای شبکه: {exc}"
+                add(f"هوش مصنوعی: {provider.id}", OK if ok else FAIL, message)
+                if ok:
+                    working = True
+                    break
+            if not working:
+                add(
+                    "هوش مصنوعی",
+                    WARN,
+                    "هیچ کلیدی در دسترس نبود؛ برنامه با قالب فارسی ادامه می‌دهد.",
+                )
+
+        # --------------------------------------------------------- marketplace
+        application = build_application(cfg)
+        generated: tuple[Any, Any, Any] | None = None
+        delivery = int(cfg.pricing.get("delivery_days", 14))
+        try:
+            name = source or next(iter(application.sources), None)
+            if not name:
+                add("سایت", FAIL, "هیچ منبعی فعال نیست — /market یا bidpilot setup")
+            else:
+                src = application.sources.get(name)
+                if src is None:
+                    from .sources import create_source
+
+                    entry = cfg.source(name)
+                    src = create_source(
+                        name,
+                        (entry.settings if entry else {}),
+                        cfg,
+                        Secrets() if offline else secrets,
+                    )
+                    application.sources[name] = src
+                try:
+                    ok, detail = await src.healthcheck()
+                except Exception as exc:
+                    ok, detail = False, f"خطا: {exc}"
+                add(f"سایت: {name}", OK if ok else FAIL, detail)
+
+                projects = await src.fetch_projects() if ok else []
+                add(
+                    "دریافت پروژه",
+                    OK if projects else WARN,
+                    f"{len(projects)} پروژه در صفحه اول" if projects else "پروژه‌ای پیدا نشد",
+                )
+
+                if projects:
+                    flt = application.filter_preview()
+                    pricing = PricingConfig(**cfg.pricing).build()
+                    for project in projects[: max(1, limit * 5)]:
+                        if not flt.evaluate(project):
+                            continue
+                        price = pricing.price(project, project.budget)
+                        if price is None:
+                            continue
+                        proposal = await application.generator.generate(  # type: ignore[union-attr]
+                            project, price.amount, delivery
+                        )
+                        generated = (project, price, proposal)
+                        break
+                    if generated is None:
+                        add("تولید پیشنهاد", WARN, "هیچ پروژه‌ای از فیلترها/قیمت‌گذاری عبور نکرد")
+        finally:
+            await application.close()
+
+        if generated is not None:
+            project, price, proposal = generated
+            source_name = proposal.generated_by
+            add(
+                "تولید پیشنهاد",
+                OK,
+                f"{price.amount:,} تومان · {delivery_days_label(cfg)} · منبع متن: {source_name}",
+            )
+
+        table = Table(title="Self-test — BidPilot")
+        table.add_column("بررسی")
+        table.add_column("وضعیت")
+        table.add_column("توضیح")
+        icon = {
+            OK: "[green]✅ OK[/green]",
+            WARN: "[yellow]⚠️ هشدار[/yellow]",
+            FAIL: "[red]❌ خطا[/red]",
+            SKIP: "[dim]⏭ رد شد[/dim]",
+        }
+        for label, status, detail in results:
+            table.add_row(escape(label), icon[status], escape(detail))
+        console.print(table)
+
+        if generated is not None:
+            project, price, proposal = generated
+            console.print(
+                Panel(
+                    escape(proposal.text),
+                    title=f"نمونه پیشنهاد | {escape(project.title)} | {price.amount:,} تومان",
+                    subtitle=f"{proposal.generated_by} — {project.url}",
+                    border_style="cyan",
+                )
+            )
+
+        failures = [r for r in results if r[1] == FAIL]
+        if failures:
+            console.print(
+                "\n[bold red]چند مورد ناموفق بود.[/bold red] "
+                "پیام هر ردیف را بخوان یا [bold]bidpilot setup[/bold] را دوباره اجرا کن."
+            )
+            raise typer.Exit(code=1)
+        if offline:
+            console.print(
+                "\n[bold green]خود برنامه سالم است.[/bold green] "
+                "حالا برای تست واقعی (تلگرام + کلید AI + حساب سایت):\n"
+                "  [bold]bidpilot setup[/bold]  سپس  [bold]bidpilot selftest[/bold]"
+            )
+        else:
+            console.print(
+                "\n[bold green]آماده‌ی تست واقعی است.[/bold green]\n"
+                "  گام بعد: [bold]bidpilot once --dry-run --limit 2[/bold]  (بدون ارسال)\n"
+                "  بعد: [bold]bidpilot bot --run[/bold]  یا  [bold]bidpilot go-live[/bold]"
+            )
+
+    _run(main())
+
+
+def delivery_days_label(cfg: AppConfig) -> str:
+    return f"{int(cfg.pricing.get('delivery_days', 14))} روز"
 
 
 @app.command()

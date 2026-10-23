@@ -71,6 +71,7 @@ unique index روی `(source, external_id)` تضمین می‌کند حتی با
 
 ```bash
 bidpilot setup --status  # چه چیزی تنظیم شده؟
+bidpilot selftest        # تست واقعی تلگرام + کلید AI + سایت + یک پیشنهاد نمونه
 bidpilot doctor          # همه‌ی چراغ‌ها سبز؟
 bidpilot preview --limit 2   # متن نمونه را بخوانید
 bidpilot once --dry-run      # یک دور آزمایشی

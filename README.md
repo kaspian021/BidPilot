@@ -40,7 +40,7 @@
 | 🆓 هوش مصنوعی رایگان و ماندگار | Groq / Gemini / OpenRouter / Mistral / Ollama — توکن رایگان، بدون انقضا، با fallback خودکار |
 | 🎭 لحن و سبک دلخواه | از داخل تلگرام (`/style`) بگو چگونه و با چه لحنی پیشنهاد بنویسد؛ همان لحظه اعمال می‌شود |
 | 🤖 مدیریت کامل از تلگرام | راه‌اندازی، تغییر پروفایل، تست کلید، وضعیت، پیش‌نمایش و حالت ارسال، همه در چت |
-| 🧪 تست‌شده | ۱۲۷ تست واحد و یکپارچه، همه با HTTP شبیه‌سازی‌شده (بدون نیاز به حساب واقعی) |
+| 🧪 تست‌شده | ۱۲۸ تست واحد و یکپارچه، همه با HTTP شبیه‌سازی‌شده (بدون نیاز به حساب واقعی) |
 
 ---
 
@@ -206,6 +206,60 @@ bidpilot once --limit 1       # فقط یک پیشنهاد واقعی، بعد �
 (یا ربات را با `bidpilot bot --run` بالا بیاور تا خودش هر چند دقیقه یک دور بزند).
 بازگشت فوری: `bidpilot go-live --off` یا `/mode` → «آزمایشی».
 
+### ویندوز: خطای `pip` هنگام نصب
+
+اگر `pip install -e ".[dev]"` با این خطا متوقف شد:
+
+```
+Could not import runpy._run_module_as_main
+SyntaxError: source code string cannot contain null bytes
+```
+
+این خطا **از پروژه نیست**؛ یعنی نصب پایتونِ روی سیستم (فایل‌های stdlib مثل `runpy.py`)
+خراب است — معمولاً نسخه‌ی Microsoft Store، آنتی‌ویروس، یا نصب ناقص. سه راه، به ترتیب:
+
+**۱) اسکریپت آماده (پیشنهادی):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows-setup.ps1
+```
+
+خودش پایتون را چک می‌کند، venv می‌سازد، نصب می‌کند و `selftest --offline` می‌گیرد.
+
+**۲) دستی با `python -m pip` (هیچ‌وقت `pip` خالی را صدا نزن):**
+
+```powershell
+where python
+python -VV
+python -c "import runpy; print(runpy.__file__)"   # اگر خطا داد: پایتون خراب است
+$env:PYTHONHOME=""                                 # اگر ست شده بود
+$env:PYTHONPATH=""
+py -3.12 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[dev]"
+```
+
+اگر `python -c "import runpy"` خطا داد، پایتون را از
+[python.org](https://www.python.org/downloads/windows/) (نه Microsoft Store) دوباره نصب کن
+و «Add python.exe to PATH» را تیک بزن. مسیر پروژه را هم از `Downloads\Compressed\...`
+به یک مسیر ساده مثل `C:\dev\bidpilot` منتقل کن.
+
+**۳) اجرا بدون نصب (وقتی pip اصلاً کار نمی‌کند):**
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install httpx pydantic pydantic-settings sqlalchemy aiosqlite jinja2 typer rich `
+  tenacity beautifulsoup4 lxml python-dateutil jdatetime orjson PyYAML
+$env:PYTHONPATH="src"
+python -m bidpilot selftest --offline
+python -m bidpilot setup
+```
+
+`python -m bidpilot …` دقیقاً همان `bidpilot …` است؛ فقط به‌جای نصب editable از پوشه‌ی
+`src` import می‌کند.
+
 ### اگر چیزی سبز نشد
 
 | پیام | معنی و راه‌حل |
@@ -338,7 +392,7 @@ bidpilot/
 │   ├── proposals/           # LLM client، پرامپت‌ها، اعتبارسنجی، قالب، playbook
 │   ├── notifications/       # تلگرام / کنسول / dispatcher
 │   └── sources/             # آداپتورها: parscoders، mock (نمونه)
-├── tests/                   # ۱۲۷ تست (unit + integration با respx)
+├── tests/                   # ۱۲۸ تست (unit + integration با respx)
 ├── deploy/                  # systemd + docker
 └── docs/                    # معماری، افزودن منبع، دیپلوی
 ```

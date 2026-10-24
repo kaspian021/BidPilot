@@ -374,6 +374,18 @@ class BotService:
         if data == "cmd:profile":
             await self.handle_command(chat, "/profile", "")
             return
+        if data.startswith("dep:"):
+            await self._install_dep(chat, data.split(":", 1)[1])
+            return
+        if data == "profile:retry":
+            await self._retry_profile_import(chat)
+            return
+        if data == "profile:restart":
+            from .profile_import import clear_pending_import
+
+            clear_pending_import(self.store)
+            await self._start_flow(chat, "profile", profile_questions(self.store))
+            return
         if data == "cmd:check":
             await self._cmd_check(chat)
             return
@@ -417,7 +429,7 @@ class BotService:
                 chat_id, "style", [*style_questions(self.store), *pricing_questions(self.store)]
             )
         elif command == "/profile":
-            await self._start_flow(chat_id, "profile", profile_questions(self.store))
+            await self._cmd_profile(chat_id)
         elif command == "/llm":
             await self._start_flow(chat_id, "llm", llm_questions(self.store))
         elif command == "/market":
@@ -751,10 +763,15 @@ class BotService:
         if ok or has(module):
             await self.send(chat_id, "✅ نصب شد.")
         else:
+            from .deps import DEPENDENCIES, install_command
+
+            dep = next((item for item in DEPENDENCIES if item.module == module), None)
+            tail = f"\n<pre>{escape(detail[-300:])}</pre>" if detail else ""
             await self.send(
                 chat_id,
-                "❌ نصب خودکار نشد. این دستور را در پوشه‌ی BidPilot اجرا کن:\n"
-                f"<code>{escape(detail[-300:] if detail else '')}</code>",
+                "❌ نصب خودکار نشد (اینترنت یا دسترسی نوشتن محیط مجازی).\n"
+                "این دستور را در همان پوشه‌ی BidPilot اجرا کن:\n"
+                f"<code>{escape(install_command(dep.package if dep else module))}</code>" + tail,
             )
         await self.send(chat_id, self._deps_text(), self._deps_keyboard())
 
@@ -949,7 +966,72 @@ class BotService:
         if steps:
             text += "\n\n<b>باقی‌مانده:</b>\n" + "\n".join(f"• {escape(s)}" for s in steps)
         text += "\n\n" + tone_summary(self.store)
+
+        from .runtime_info import install_info
+
+        info = install_info()
+        text += "\n" + info.status_line()
+        if info.warning():
+            text += "\n⚠️ " + escape(info.warning()) + f"\n<code>{escape(info.fix_command())}</code>"
         await self.send(chat_id, text, self._menu_keyboard())
+
+    async def _cmd_profile(self, chat_id: str) -> None:
+        """A failed import keeps its queue: offer the retry before asking again."""
+        from .profile_import import pending_import
+
+        pending = pending_import(self.store)
+        error = str(self.store.get("profile.import_error") or "")
+        if pending and error:
+            kind = "فایل PDF" if pending["type"] == "file" else "همان لینک"
+            await self.send(
+                chat_id,
+                "⚠️ آخرین تلاش برای خواندن پروفایل ناموفق بود:\n"
+                f"<pre>{escape(error[:400])}</pre>\n"
+                f"{kind} هنوز ذخیره است — می‌توانم بدون اینکه دوباره بفرستی، از نو پردازشش کنم.",
+                {
+                    "inline_keyboard": [
+                        [{"text": "🔁 تلاش دوباره", "callback_data": "profile:retry"}],
+                        [{"text": "🆕 از نو (انتخاب منبع)", "callback_data": "profile:restart"}],
+                    ]
+                },
+            )
+            return
+        await self._start_flow(chat_id, "profile", profile_questions(self.store))
+
+    async def _retry_profile_import(self, chat_id: str) -> None:
+        from .deps import ensure, has
+        from .profile_import import pending_import
+
+        if pending_import(self.store) is None:
+            await self.send(
+                chat_id,
+                "چیزی در صف نیست (فایل/لینک قبلی پاک شده).\n/profile را بزن و از نو بفرست.",
+            )
+            return
+        if not has("pypdf"):
+            import asyncio
+
+            await self.send(chat_id, "📦 اول بسته‌ی pypdf را نصب می‌کنم…")
+            ok, _ = await asyncio.to_thread(ensure, "pypdf")
+            if not ok:
+                await self._send_pdf_install_help(chat_id)
+                return
+        await self.send(chat_id, "🔁 دوباره تلاش می‌کنم…")
+        await self._import_profile_from_pending(chat_id)
+
+    async def _send_pdf_install_help(self, chat_id: str, *, reason: str = "") -> None:
+        from .deps import install_command
+
+        head = "❌ نصب خودکار pypdf انجام نشد (اینترنت یا دسترسی نوشتن محیط مجازی)."
+        if reason:
+            head += f"\n<pre>{escape(reason[:300])}</pre>"
+        await self.send(
+            chat_id,
+            head + "\n\nاین دستور را در همان پوشه‌ی BidPilot اجرا کن:\n"
+            f"<code>{escape(install_command('pypdf'))}</code>\n\n"
+            "بعد دکمه‌ی «🔁 تلاش دوباره» را بزن — لازم نیست فایل را دوباره بفرستی.",
+            {"inline_keyboard": [[{"text": "🔁 تلاش دوباره", "callback_data": "profile:retry"}]]},
+        )
 
     async def _cmd_settings(self, chat_id: str) -> None:
         rows = self.store.masked_items()

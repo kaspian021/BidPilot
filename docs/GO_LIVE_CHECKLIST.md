@@ -22,6 +22,17 @@
 bidpilot setup --status   # آماده است؟ چه چیزی مانده؟
 ```
 
+## ۰٫۲) مطمئن شو همان نسخه‌ای را اجرا می‌کنی که pull کرده‌ای
+
+```powershell
+.venv\Scripts\python.exe -m bidpilot version
+.venv\Scripts\python.exe -m bidpilot doctor
+```
+
+اگر مسیر خروجی داخل `site-packages` بود (نه پوشه‌ی پروژه) یا `doctor` هشدار داد،
+`bidpilot doctor --fix` را بزن؛ همان پوشه را در همان پایتون نصب می‌کند. نشانه‌ی این
+مشکل: ترمینال نسخه‌ی جدید را نشان می‌دهد ولی ربات با جمله‌بندی قدیمی جواب می‌دهد.
+
 ## ۰٫۵) جست‌وجوی هوشمند
 
 اگر کلید AI ثبت شده باشد (و در `sources/<site>/config.yaml` مقدار `discovery.mode`

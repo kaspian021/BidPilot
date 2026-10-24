@@ -362,3 +362,128 @@ async def test_filters_command_shows_profile_skills_and_toggles_rules(tmp_path, 
     await service._toggle_filter("777", "derive")
     # an empty list is stored as "removed", which means "rebuild from /profile"
     assert not store.get("filters.skill_keywords")
+
+
+# ---------------------------------------------------------------------------
+# A failed resume import must never look like success, and must be retryable
+# ---------------------------------------------------------------------------
+def test_pdf_failure_keeps_the_queue_and_offers_a_retry(tmp_path, monkeypatch):
+    import asyncio
+
+    from bidpilot.profile_import import pending_import
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    store.update(
+        {
+            "profile.import_pending": {"type": "file", "value": str(tmp_path / "cv.pdf")},
+            "profile.import_error": "pypdf نصب نیست",
+        }
+    )
+
+    asyncio.run(service.handle_command("777", "/profile", ""))
+
+    text = api.last_text
+    assert "ناموفق" in text
+    assert "pypdf" in text
+    # the retry must not require re-uploading the file
+    buttons = [row[0]["callback_data"] for row in api.sent[-1][2]["inline_keyboard"]]
+    assert "profile:retry" in buttons
+    assert pending_import(store) is not None
+
+
+def test_profile_retry_runs_the_queued_import_without_a_new_upload(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    store.update(
+        {
+            "profile.import_pending": {"type": "file", "value": str(tmp_path / "cv.pdf")},
+            "profile.import_error": "همین حالا خطا داد",
+        }
+    )
+    called: list[str] = []
+
+    async def fake_import(chat_id: str) -> None:
+        called.append(chat_id)
+
+    monkeypatch.setattr(service, "_import_profile_from_pending", fake_import)
+    monkeypatch.setattr("bidpilot.deps.has", lambda module: True)
+
+    asyncio.run(
+        service.handle_update(
+            {
+                "update_id": 3,
+                "callback_query": {
+                    "id": "cb1",
+                    "data": "profile:retry",
+                    "message": {"chat": {"id": 777}},
+                },
+            }
+        )
+    )
+
+    assert called == ["777"]
+
+
+def test_a_failed_resume_import_does_not_finish_as_success(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    broken = tmp_path / "resume.pdf"
+    broken.write_bytes(b"this is definitely not a pdf")
+    monkeypatch.setattr("bidpilot.deps.has", lambda module: True)
+
+    asyncio.run(service.handle_command("777", "/profile", ""))
+    asyncio.run(service.handle_text("777", "1"))  # «رزومه PDF»
+    asyncio.run(service.handle_text("777", str(broken)))
+
+    joined = "\n".join(text for _, text, _ in api.sent)
+    assert "کامل نشد" in joined or "ناموفق" in joined
+    assert "✅ پروفایل به‌روز شد" not in joined
+    assert "✅ ذخیره شد" not in joined
+    assert store.get("profile.import_error")
+    assert store.get("profile.imported_at") is None
+
+
+def test_deps_screen_offers_the_running_interpreter(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    monkeypatch.setattr("bidpilot.deps.has", lambda module: False)
+
+    asyncio.run(service.handle_command("777", "/deps", ""))
+
+    text = api.last_text
+    assert "pypdf" in text
+    assert "python.exe" in text or "python" in text  # exact path, not a bare `pip`
+    assert any(row[0]["callback_data"] == "dep:pypdf" for row in api.sent[-1][2]["inline_keyboard"])
+
+
+def test_the_install_button_actually_installs(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    installed: list[str] = []
+
+    def fake_ensure(module: str, **_kwargs):
+        installed.append(module)
+        return True, "ok"
+
+    monkeypatch.setattr("bidpilot.deps.ensure", fake_ensure)
+    monkeypatch.setattr("bidpilot.deps.has", lambda module: True)
+
+    asyncio.run(
+        service.handle_update(
+            {
+                "update_id": 4,
+                "callback_query": {
+                    "id": "cb2",
+                    "data": "dep:pypdf",
+                    "message": {"chat": {"id": 777}},
+                },
+            }
+        )
+    )
+
+    assert installed == ["pypdf"]
+    assert any("نصب شد" in text for _, text, _ in api.sent)

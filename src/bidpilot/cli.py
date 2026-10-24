@@ -13,7 +13,6 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from . import __version__
 from . import deps as deps_mod
 from .app import Application, build_application, configure_logging
 from .config import AppConfig, get_secrets, load_config, reset_secret_cache
@@ -75,8 +74,15 @@ def _run(coro):
 # --------------------------------------------------------------------- basics
 @app.command()
 def version() -> None:
-    """نمایش نسخه."""
-    console.print(f"BidPilot [bold cyan]{__version__}[/bold cyan]")
+    """نمایش نسخه و مسیری که کد واقعاً از آن اجرا می‌شود."""
+    from .runtime_info import install_info, python_version
+
+    info = install_info()
+    console.print(f"BidPilot [bold cyan]{info.version}[/bold cyan]")
+    console.print(f"python {python_version()} — {escape(str(info.package_file.parent))}")
+    if info.warning():
+        console.print(f"[yellow]⚠️ {escape(info.warning())}[/yellow]")
+        console.print(f"   رفع: [bold]{escape(info.fix_command())}[/bold]")
 
 
 # ----------------------------------------------------------------- setup / bot
@@ -255,6 +261,14 @@ def bot(
             )
             raise typer.Exit(code=1)
 
+        from .runtime_info import environment_line, install_info
+
+        console.print(f"[dim]{escape(environment_line())}[/dim]")
+        info = install_info()
+        if info.warning():
+            console.print(f"[yellow]⚠️ {escape(info.warning())}[/yellow]")
+            console.print(f"   رفع: [bold]{escape(info.fix_command())}[/bold]")
+
         service = build_bot(str(token), store=store, config_path=config)
         automation = service.automation
         automation.interval = interval
@@ -359,7 +373,10 @@ def deps(
 
 
 @app.command()
-def doctor(config: str = CONFIG_OPTION) -> None:
+def doctor(
+    config: str = CONFIG_OPTION,
+    fix: bool = typer.Option(False, "--fix", help="نسخه‌ی نصب‌شده‌ی قدیمی را با همین پوشه‌ی پروژه جایگزین کن"),
+) -> None:
     """بررسی سلامت تنظیمات، کلیدها و دسترسی به منابع."""
 
     async def main() -> None:
@@ -414,6 +431,24 @@ def doctor(config: str = CONFIG_OPTION) -> None:
 
         row("حالت ارسال", True, "LIVE" if cfg.runtime.live else "DRY-RUN (پیشنهاد ارسال نمی‌شود)")
 
+        from .runtime_info import install_info
+
+        info = install_info()
+        row(
+            "نسخه‌ی در حال اجرا",
+            not info.warning(),
+            info.summary() + (f"\nراه‌حل: {info.fix_command()}" if info.warning() else ""),
+        )
+
+        has_pdf = deps_mod.has("pypdf")
+        row(
+            "خواندن PDF رزومه (pypdf)",
+            has_pdf,
+            "نصب است"
+            if has_pdf
+            else "نصب نیست → " + deps_mod.install_command("pypdf") + "  (یا bidpilot deps --install)",
+        )
+
         missing_deps = deps_mod.missing()
         row(
             "بسته‌های اختیاری",
@@ -428,6 +463,28 @@ def doctor(config: str = CONFIG_OPTION) -> None:
 
         await application.close()
         console.print(table)
+
+        if info.warning():
+            console.print(f"\n[yellow]⚠️ {escape(info.warning())}[/yellow]")
+            if fix and info.project_root is not None:
+                console.print("[dim]دارم همین پوشه را در پایتون فعلی نصب می‌کنم…[/dim]")
+                import subprocess
+                import sys
+
+                completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                    [sys.executable, "-m", "pip", "install", "-e", str(info.project_root)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if completed.returncode == 0:
+                    console.print("[green]✅ نصب شد. حالا برنامه را دوباره اجرا کن.[/green]")
+                else:
+                    tail = (completed.stderr or completed.stdout or "").strip()[-500:]
+                    console.print(f"[red]نصب انجام نشد:[/red] {escape(tail)}")
+            else:
+                console.print("   رفع خودکار: [bold]bidpilot doctor --fix[/bold]")
+                console.print(f"   یا دستی: [bold]{escape(info.fix_command())}[/bold]")
 
     _run(main())
 

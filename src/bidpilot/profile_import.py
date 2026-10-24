@@ -729,6 +729,7 @@ def summary_text(fields: dict[str, Any], *, title: str = "پروفایل است�
 
 
 __all__ = [
+    "clear_import_error",
     "ImportedProfile",
     "MAX_TEXT_CHARS",
     "PROFILE_FIELDS",
@@ -748,7 +749,6 @@ __all__ = [
     "parse_json_object",
     "pdf_text",
     "pending_import",
-    "clear_import_error",
     "clear_pending_import",
     "run_pending_import",
     "save_profile_fields",

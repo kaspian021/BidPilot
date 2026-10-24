@@ -182,7 +182,6 @@ class BidPipeline:
         return report
 
     # -------------------------------------------------------------- one item
-    async def process_project(self, project: Project, report: RunReport) -> BidPlan | None:
     def _existing_project_revisit_reason(self, existing, project: Project, latest_bid) -> str:
         """Revisit only records whose previous skip/failure is demonstrably recoverable."""
         if latest_bid is None:

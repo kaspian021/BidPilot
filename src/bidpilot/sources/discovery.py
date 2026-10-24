@@ -56,7 +56,7 @@ MAX_STEPS = 8
 MAX_DETAIL_PAGES = 4
 MAX_PROJECTS = 4
 MAX_TEXT_CHARS = 1_600
-MAX_DETAIL_CHARS = 2_600
+MAX_DETAIL_CHARS = 4_000
 MAX_LINKS = 45
 #: a page with this many project links is a list: its prose is noise for the model
 LIST_PAGE_MIN_LINKS = 3
@@ -164,12 +164,15 @@ EXTRACT_PROMPT = """# متن صفحه‌ی پروژه ({url})
 {{
   "is_project": true,
   "title": "عنوان دقیق پروژه",
-  "description": "توضیحات کارفرما، خلاصه‌ی وفادار به متن",
+  "description": "توضیحات کامل و دقیق کارفرما با حفظ تمامی جزئیات فنی و عملیاتی",
   "budget_text": "متن بودجه/حق‌الزحمه عیناً (مثلاً «بودجه: ۵۰۰,۰۰۰ تا ۱,۵۰۰,۰۰۰ تومان») یا \\"\\"",
   "deadline_text": "زمان تحویل/مهلت اعلامی کارفرما عیناً (مثلاً «۱۰ روز») یا \\"\\"",
   "skills": ["مهارت‌های ذکرشده"],
   "category": "دسته‌بندی یا \\"\\"",
-  "employer": "نام کارفرما یا \\"\\""
+  "employer": "نام کارفرما یا \\"\\"",
+  "key_requirements": ["الزامات، نکات فنی و شرایط ویژه‌ای که کارفرما در متن تاکید کرده"],
+  "employer_questions": ["سؤالات، پرسش‌ها یا مواردی که کارفرما خواسته فریلنسر به آن‌ها پاسخ دهد"],
+  "deliverables": ["خروجی‌ها، فایل‌ها یا قابلیت‌های تحویلی صریح"]
 }}
 
 اگر این صفحه پروژه نیست (فهرست، پروفایل، ورود)، فقط {{"is_project": false}} برگردان."""
@@ -549,6 +552,21 @@ class DiscoveryAgent:
         if budget is not None and not budget.is_known:
             budget = None
 
+        key_reqs = data.get("key_requirements") or []
+        if isinstance(key_reqs, str):
+            key_reqs = [key_reqs]
+        key_reqs = [clean_text(str(item))[:200] for item in key_reqs if clean_text(str(item))][:10]
+
+        emp_q = data.get("employer_questions") or []
+        if isinstance(emp_q, str):
+            emp_q = [emp_q]
+        emp_q = [clean_text(str(item))[:200] for item in emp_q if clean_text(str(item))][:10]
+
+        deliv = data.get("deliverables") or []
+        if isinstance(deliv, str):
+            deliv = [deliv]
+        deliv = [clean_text(str(item))[:200] for item in deliv if clean_text(str(item))][:10]
+
         return Project(
             source=self.source_name,
             external_id=_external_id(url, title),
@@ -560,6 +578,9 @@ class DiscoveryAgent:
             category=clean_text(str(data.get("category") or ""))[:120] or None,
             employer=clean_text(str(data.get("employer") or ""))[:120] or None,
             employer_deadline=deadline,
+            key_requirements=key_reqs,
+            employer_questions=emp_q,
+            deliverables=deliv,
             raw={
                 "budget_text": budget_text,
                 "deadline_text": deadline,

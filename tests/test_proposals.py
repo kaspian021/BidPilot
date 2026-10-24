@@ -278,7 +278,6 @@ async def test_a_truncated_answer_is_retried_with_more_room():
     assert client.budgets[0] is not None and client.budgets[1] > client.budgets[0]
 
 
-
 def test_project_instructions_are_untrusted_and_prompt_length_uses_config():
     from bidpilot.proposals.prompts import build_prompts
 

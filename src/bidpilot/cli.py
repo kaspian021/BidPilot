@@ -247,6 +247,14 @@ def bot(
 
     اگر توکن هنوز ذخیره نشده باشد، اول «bidpilot setup» را اجرا کن.
     """
+    # bot --run doesn't pass through _load(), so set the configured root logger
+    # here as well; otherwise the new INFO-level extraction traces may be hidden.
+    try:
+        logging_config = load_config(config, store=get_store())
+        configure_logging(logging_config.log_level)
+    except Exception as exc:
+        configure_logging("INFO")
+        log.warning("Could not load log-level setting (%s); using INFO", exc)
 
     async def main() -> None:
         from .bot import BotAPIError, build_bot

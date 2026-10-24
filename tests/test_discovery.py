@@ -618,3 +618,34 @@ def test_project_description_extractor_preserves_late_requirements():
 
     assert important in description
     assert len(description) > 2_600
+
+
+async def test_ai_discovery_logs_visited_pages_decisions_and_extracted_project(caplog, fetch):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="bidpilot.sources.discovery")
+    llm = ScriptedLLM()
+    agent = DiscoveryAgent(
+        source_name="ponisha",
+        base_url="https://ponisha.ir",
+        fetch=fetch,
+        llm=llm,
+        profile=PROFILE,
+        brief="پیدا کردن فهرست پروژه‌های مرتبط و خواندن صفحه جزئیات.",
+        seed_paths=["/"],
+        max_steps=5,
+        max_detail_pages=2,
+        max_projects=2,
+    )
+
+    result = await agent.discover()
+
+    assert result.projects
+    assert "[AI-DISCOVERY][PAGE]" in caplog.text
+    assert "[AI-DISCOVERY][PAGE-LINKS]" in caplog.text
+    assert "[AI-DISCOVERY][MODEL-OUTPUT]" in caplog.text
+    assert "[AI-EXTRACT][VISIBLE-TEXT]" in caplog.text
+    assert "[AI-EXTRACT][MODEL-OUTPUT]" in caplog.text
+    assert "[AI-EXTRACT][NORMALIZED]" in caplog.text
+    assert "بودجه: ۲۰ تا ۴۰ میلیون تومان" in caplog.text
+    assert "https://ponisha.ir/project/501/flutter-shop" in caplog.text

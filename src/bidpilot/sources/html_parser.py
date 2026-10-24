@@ -399,6 +399,7 @@ _BUDGET_SUFFIX_RE = re.compile(r"[\d\s:/\-–—آ-ی]*")
 def _normalized_marker(value: str) -> str:
     return clean_text(value).replace("\u200c", " ").replace("ي", "ی").replace("ك", "ک").casefold()
 
+
 _NON_PROJECT_BUDGET_MARKERS = (
     "عایدی شما",
     "مبلغ عایدی",
@@ -1005,7 +1006,9 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
         _text(scoped_root, detail.get("budget")) if scope is not None or not require_project_scope else ""
     )
     budget_text = budget_selector_text
-    skills = _unique_clean_values(s.get_text(" ", strip=True) for s in _all(scoped_root, detail.get("skills")))
+    skills = _unique_clean_values(
+        s.get_text(" ", strip=True) for s in _all(scoped_root, detail.get("skills"))
+    )
     category = _text(scoped_root, detail.get("category"))
     employer = _text(scoped_root, detail.get("employer"))
     page_text = clean_text(soup.get_text(" ", strip=True))[:20_000]

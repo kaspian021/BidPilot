@@ -439,9 +439,7 @@ class BidPipeline:
             )
         ):
             report.authentication_failed = True
-            report.errors.append(
-                "ورود به حساب کاربری تأیید نشد؛ جست‌وجو و ارسال پیشنهاد متوقف می‌شود."
-            )
+            report.errors.append("ورود به حساب کاربری تأیید نشد؛ جست‌وجو و ارسال پیشنهاد متوقف می‌شود.")
             log.error(
                 "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stopping after response indicated login/session failure",
                 project.source,

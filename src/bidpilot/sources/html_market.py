@@ -263,7 +263,24 @@ class HtmlMarketSource(Source):
             raise DiscoveryError("هوش مصنوعی برای جست‌وجو در سایت تنظیم نشده است.")
         cfg = self.discovery_settings()
         failures: list[str] = []
+        log.info(
+            "[DISCOVERY][START] source=%s providers=%s seeds=%s max_steps=%s "
+            "max_detail_pages=%s max_projects=%s log_extraction_details=%s",
+            self.name,
+            [provider.id for provider in providers],
+            cfg.get("seed_paths") or ["/"],
+            cfg.get("max_steps") or MAX_STEPS,
+            cfg.get("max_detail_pages") or MAX_DETAIL_PAGES,
+            cfg.get("max_projects") or MAX_PROJECTS,
+            bool(cfg.get("log_extraction_details")),
+        )
         for provider in providers:
+            log.info(
+                "[DISCOVERY][PROVIDER] source=%s provider=%s model=%s",
+                self.name,
+                provider.id,
+                getattr(provider, "model", None) or self.config.llm.model,
+            )
             client = build_client(provider, self.config.llm)
             budget = int(cfg.get("tokens_per_minute") or 0)
             if budget:
@@ -290,9 +307,42 @@ class HtmlMarketSource(Source):
                 continue
             self.last_discovery = result
             self._discovery_blocked_until = 0.0
+            log.info(
+                "[DISCOVERY][RESULT] source=%s provider=%s projects=%s pages_read=%s "
+                "llm_calls=%s visited=%r notes=%r",
+                self.name,
+                provider.id,
+                len(result.projects),
+                result.pages_read,
+                result.llm_calls,
+                result.visited,
+                result.notes,
+            )
+            for project in result.projects:
+                log.info(
+                    "[DISCOVERY][PROJECT] source=%s id=%s title=%r url=%s "
+                    "budget=%r raw_budget_text=%r skills=%r deadline=%r description_chars=%s",
+                    project.source,
+                    project.external_id,
+                    project.title,
+                    project.url,
+                    project.budget.model_dump() if project.budget else None,
+                    (project.raw or {}).get("budget_text", ""),
+                    project.skills,
+                    project.employer_deadline,
+                    len(project.description or ""),
+                )
             if result.projects:
                 self.last_discovery_error = ""
                 return result.projects
+            log.warning(
+                "[DISCOVERY][EMPTY] source=%s provider=%s visited=%r notes=%r "
+                "The model finished without extracting any projects.",
+                self.name,
+                provider.id,
+                result.visited,
+                result.notes,
+            )
             failures.append(f"{provider.id}: هیچ پروژه‌ای پیدا نشد")
         self.last_discovery_error = "؛ ".join(failures) or "جست‌وجوی هوشمند نتیجه نداد"
         cooldown = float(cfg.get("failure_cooldown_seconds", 900) or 0)
@@ -307,8 +357,19 @@ class HtmlMarketSource(Source):
 
     # ------------------------------------------------------------- fetching
     async def fetch_projects(self) -> list[Project]:
-        if self.ai_discovery_enabled():
-            cfg = self.discovery_settings()
+        mode = self.discovery_mode()
+        ai_enabled = self.ai_discovery_enabled()
+        cfg = self.discovery_settings()
+        log.info(
+            "[FETCH][START] source=%s base_url=%s mode=%s ai_enabled=%s "
+            "log_extraction_details=%s",
+            self.name,
+            self.base_url,
+            mode,
+            ai_enabled,
+            bool(cfg.get("log_extraction_details")),
+        )
+        if ai_enabled:
             reuse = float(cfg.get("reuse_seconds", 600) or 0)
             if self._last_projects and (time.monotonic() - self._last_fetch_at) < reuse:
                 log.debug("%s: reusing the last AI discovery (%ss old)", self.name, reuse)
@@ -323,25 +384,65 @@ class HtmlMarketSource(Source):
             except Exception as exc:
                 # the model is a helper, not a single point of failure
                 log.warning("%s: AI discovery failed (%s); using selectors", self.name, exc)
+                if self.last_discovery is not None:
+                    log.warning(
+                        "[DISCOVERY][FALLBACK] source=%s error=%r visited=%r notes=%r",
+                        self.name,
+                        str(exc),
+                        self.last_discovery.visited,
+                        self.last_discovery.notes,
+                    )
                 self.last_discovery_error = str(exc)
+        else:
+            log.info("[DISCOVERY][DISABLED] source=%s reason=mode_or_cooldown_or_missing_key", self.name)
 
-        list_cfg = self.settings.get("list") or {}
+        list_cfg = dict(self.settings.get("list") or {})
+        list_cfg["_diagnostics"] = bool(cfg.get("log_extraction_details"))
         path = list_cfg.get("path", "/")
         page_param = list_cfg.get("page_param", "page")
         max_pages = int(list_cfg.get("max_pages", 1))
 
         projects: list[Project] = []
         seen: set[str] = set()
+        log.info(
+            "[SELECTORS][START] source=%s base_url=%s list_path=%s max_pages=%s "
+            "card_selectors=%r detail_enabled=%s detail_path=%s",
+            self.name,
+            self.base_url,
+            path,
+            max_pages,
+            list_cfg.get("card_selectors") or [],
+            bool(list_cfg.get("fetch_details", True)),
+            (self.settings.get("detail") or {}).get("path", "{external_id}"),
+        )
         for page in range(1, max_pages + 1):
             params = {page_param: page} if page > 1 else None
             try:
+                log.info(
+                    "[SELECTORS][GET-LIST] source=%s requested=%s params=%r",
+                    self.name,
+                    urljoin(self.base_url + "/", str(path).lstrip("/")),
+                    params,
+                )
                 html = await self.get_html(path, params=params)
             except Exception as exc:
                 if page == 1:
                     raise SourceError(f"خطا در دریافت لیست پروژه‌ها: {exc}") from exc
                 log.warning("%s page %s failed: %s", self.name, page, exc)
                 break
+            log.info(
+                "[SELECTORS][LIST-RESPONSE] source=%s requested_path=%s html_chars=%s",
+                self.name,
+                path,
+                len(html or ""),
+            )
             page_projects = parser.parse_list_page(html, list_cfg, self.name, self.base_url)
+            log.info(
+                "[SELECTORS][LIST-PARSED] source=%s page=%s projects=%s",
+                self.name,
+                page,
+                len(page_projects),
+            )
             for project in page_projects:
                 if project.uid not in seen:
                     seen.add(project.uid)
@@ -353,26 +454,72 @@ class HtmlMarketSource(Source):
             projects = await self._attach_details(projects, int(list_cfg.get("detail_concurrency", 3)))
 
         projects.sort(key=lambda p: (p.published_at is not None, p.published_at), reverse=True)
-        log.info("%s: %s projects fetched", self.name, len(projects))
+        log.info("[FETCH][FINAL] source=%s projects=%s", self.name, len(projects))
+        for project in projects:
+            log.info(
+                "[FETCH][FINAL-PROJECT] source=%s id=%s title=%r url=%s "
+                "budget=%r raw_budget_text=%r skills=%r description_chars=%s",
+                project.source,
+                project.external_id,
+                project.title,
+                project.url,
+                project.budget.model_dump() if project.budget else None,
+                (project.raw or {}).get("budget_text", ""),
+                project.skills,
+                len(project.description or ""),
+            )
         return projects
 
     async def _attach_details(self, projects: list[Project], concurrency: int) -> list[Project]:
-        detail_cfg = self.settings.get("detail") or {}
+        detail_cfg = dict(self.settings.get("detail") or {})
+        detail_cfg["_diagnostics"] = bool(self.discovery_settings().get("log_extraction_details"))
         template = detail_cfg.get("path", "{external_id}")
         semaphore = asyncio.Semaphore(max(1, concurrency))
 
         async def enrich(project: Project) -> Project:
             path = template.format(external_id=project.external_id, url=project.url)
+            log.info(
+                "[SELECTORS][GET-DETAIL] source=%s id=%s title=%r project_url=%s "
+                "configured_detail_path=%s resolved_request=%s",
+                self.name,
+                project.external_id,
+                project.title,
+                project.url,
+                path,
+                urljoin(self.base_url + "/", path.lstrip("/")),
+            )
             async with semaphore:
                 try:
                     html = await self.get_html(path)
                 except Exception as exc:
-                    log.debug("detail fetch failed for %s: %s", project.uid, exc)
+                    log.warning(
+                        "[SELECTORS][DETAIL-FAILED] source=%s id=%s path=%s error=%r",
+                        self.name,
+                        project.external_id,
+                        path,
+                        str(exc),
+                    )
                     return project
             try:
-                return parser.enrich_from_detail(html, project, detail_cfg)
+                enriched = parser.enrich_from_detail(html, project, detail_cfg)
+                log.info(
+                    "[SELECTORS][DETAIL-RESULT] source=%s id=%s title=%r "
+                    "budget_before=%r budget_after=%r",
+                    self.name,
+                    project.external_id,
+                    project.title,
+                    project.budget.model_dump() if project.budget else None,
+                    enriched.budget.model_dump() if enriched.budget else None,
+                )
+                return enriched
             except Exception as exc:
-                log.debug("detail parse failed for %s: %s", project.uid, exc)
+                log.exception(
+                    "[SELECTORS][DETAIL-PARSE-FAILED] source=%s id=%s path=%s",
+                    self.name,
+                    project.external_id,
+                    path,
+                )
+                log.debug("detail parse error: %s", exc)
                 return project
 
         return list(await asyncio.gather(*(enrich(p) for p in projects)))

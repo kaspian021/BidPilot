@@ -549,3 +549,24 @@ def test_detail_page_extracts_explicit_employer_deadline():
         {"detail_fields": {"description": [], "budget": [], "skills": []}},
     )
     assert enriched.employer_deadline == "1 روز"
+
+
+def test_parscoders_skill_links_are_extracted_from_listing_cards():
+    html = """
+    <html><body>
+      <div class="project-list-item">
+        <h2><a href="/project/621317/robot">ربات سرخط زن</a></h2>
+        <p class="project-description">ساخت ابزار برنامه‌نویسی و مدیریت داده.</p>
+        <div class="project-budget">بودجه: ۲۵۰,۰۰۰ تا ۹۸,۰۰۰,۰۰۰ تومان</div>
+        <a href="/project/skills/dotnet">.NET</a>
+        <a href="/project/skills/c-sharp-programming">برنامه نویسی با C#</a>
+        <a href="/project/skills/gis">GIS</a>
+      </div>
+    </body></html>
+    """
+    projects = parser.parse_list_page(html, SETTINGS["list"], "parscoders", "https://parscoders.com")
+
+    assert len(projects) == 1
+    assert ".NET" in projects[0].skills
+    assert "برنامه نویسی با C#" in projects[0].skills
+    assert "GIS" in projects[0].skills

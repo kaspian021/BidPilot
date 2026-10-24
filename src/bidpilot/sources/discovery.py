@@ -602,7 +602,9 @@ class DiscoveryAgent:
                 html = await self.fetch(url)
             except Exception as exc:  # network/404: keep browsing, don't die
                 result.notes.append(f"{url}: {exc}")
-                log.warning("[AI-DISCOVERY][FETCH-FAILED] source=%s url=%s error=%r", self.source_name, url, str(exc))
+                log.warning(
+                    "[AI-DISCOVERY][FETCH-FAILED] source=%s url=%s error=%r", self.source_name, url, str(exc)
+                )
                 continue
 
             page = digest_html(html, url, base_url=self.base_url)
@@ -857,7 +859,9 @@ class DiscoveryAgent:
             )
         if page.is_login:
             self._login_seen = True
-            log.warning("[AI-EXTRACT][LOGIN-PAGE] source=%s url=%s; skipping extraction", self.source_name, url)
+            log.warning(
+                "[AI-EXTRACT][LOGIN-PAGE] source=%s url=%s; skipping extraction", self.source_name, url
+            )
             return None
         prompt = EXTRACT_PROMPT.format(url=url, text=_sanitize_page_text(page.text))
         log.info(
@@ -870,7 +874,9 @@ class DiscoveryAgent:
         try:
             answer = await self._complete_json(EXTRACT_SYSTEM, prompt, max_tokens=EXTRACT_MAX_TOKENS)
         except Exception as exc:
-            log.warning("[AI-EXTRACT][MODEL-FAILED] source=%s url=%s error=%r", self.source_name, url, str(exc))
+            log.warning(
+                "[AI-EXTRACT][MODEL-FAILED] source=%s url=%s error=%r", self.source_name, url, str(exc)
+            )
             return None
         raw_answer = getattr(answer, "text", answer)
         data = parse_json_object(raw_answer)
@@ -891,7 +897,11 @@ class DiscoveryAgent:
             return None
         project = self._to_project(url, data, page, source_description=source_description)
         if project is None:
-            log.warning("[AI-EXTRACT][REJECTED] source=%s url=%s reason=normalization_returned_none", self.source_name, url)
+            log.warning(
+                "[AI-EXTRACT][REJECTED] source=%s url=%s reason=normalization_returned_none",
+                self.source_name,
+                url,
+            )
         return project
 
     def _to_project(
@@ -1042,8 +1052,7 @@ class DiscoveryAgent:
                 if re.search(r"بودجه|مبلغ|قیمت|حق.?الزحمه|تومان|تومن|ریال|میلیون|هزار", line, re.I)
             ]
             log.warning(
-                "[AI-EXTRACT][BUDGET-NOT-FOUND] source=%s id=%s url=%s "
-                "model_budget_text=%r marker_lines=%r",
+                "[AI-EXTRACT][BUDGET-NOT-FOUND] source=%s id=%s url=%s model_budget_text=%r marker_lines=%r",
                 self.source_name,
                 project.external_id,
                 project.url,

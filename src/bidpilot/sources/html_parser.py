@@ -314,16 +314,38 @@ def parse_list_page(
 ) -> list[Project]:
     soup = BeautifulSoup(html, "lxml")
     cards: list[Tag] = []
+    matched_selector = ""
     for selector in settings.get("card_selectors", []) or []:
         try:
             cards = [c for c in soup.select(selector) if isinstance(c, Tag)]
-        except Exception:
+        except Exception as exc:
+            log.warning("[PARSER][LIST] invalid card selector=%r error=%s", selector, exc)
             cards = []
         if cards:
+            matched_selector = selector
             break
 
+    used_fallback = False
     if not cards:
         cards = fallback_cards(soup, settings)
+        used_fallback = bool(cards)
+
+    log.info(
+        "[PARSER][LIST] source=%s page_chars=%s card_count=%s selector=%r fallback_cards=%s",
+        source_name,
+        len(html or ""),
+        len(cards),
+        matched_selector or None,
+        used_fallback,
+    )
+    if settings.get("_diagnostics"):
+        page_text = clean_text(soup.get_text(" ", strip=True))
+        log.info(
+            "[PARSER][LIST-TEXT] source=%s chars=%s text=%s",
+            source_name,
+            len(page_text),
+            page_text[:20_000],
+        )
 
     projects: list[Project] = []
     seen: set[str] = set()

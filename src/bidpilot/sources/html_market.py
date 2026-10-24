@@ -786,9 +786,54 @@ class HtmlMarketSource(Source):
         except httpx.HTTPError as exc:
             return self.fail(f"خطای شبکه هنگام ارسال پیشنهاد: {exc}")
 
+        final_path = urlsplit(str(response.url)).path
+        location = str(response.headers.get("location") or "")
+        location_path = urlsplit(urljoin(str(response.url), location)).path if location else ""
+        redirect_history = [
+            {"status": item.status_code, "path": urlsplit(str(item.url)).path}
+            for item in response.history[:6]
+        ]
+        login_path_re = re.compile(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", re.I)
+        redirected_paths = [final_path, location_path, *(item["path"] for item in redirect_history)]
+        notices = parser.extract_response_notices(response.text)
+        if any(login_path_re.search(path) for path in redirected_paths if path):
+            message = "نشست منقضی شده است؛ ارسال متوقف شد. از /market ورود/کوکی را به‌روز کن و با /test بررسی کن."
+            log.warning(
+                "[BID][SUBMIT-RESPONSE] source=%s id=%s status=%s action_path=%s final_path=%s "
+                "location_path=%s redirects=%r response_chars=%s notices=%r outcome=auth_required",
+                self.name,
+                project.external_id,
+                response.status_code,
+                urlsplit(action).path,
+                final_path,
+                location_path,
+                redirect_history,
+                len(response.text or ""),
+                notices,
+            )
+            return self.fail(message, response.status_code)
+
         ok, message = parser.detect_success(response.status_code, response.text, bid_cfg)
-        if not ok and response.is_redirect:
-            ok, message = True, "درخواست ارسال شد (ریدایرکت موفق)."
+        log_method = log.info if ok else log.warning
+        log_method(
+            "[BID][SUBMIT-RESPONSE] source=%s id=%s status=%s method=%s action_path=%s "
+            "final_path=%s location_path=%s redirects=%r content_type=%r response_chars=%s "
+            "notices=%r outcome=%s message=%r",
+            self.name,
+            project.external_id,
+            response.status_code,
+            method,
+            urlsplit(action).path,
+            final_path,
+            location_path,
+            redirect_history,
+            response.headers.get("content-type", ""),
+            len(response.text or ""),
+            notices,
+            "confirmed_success" if ok else "not_confirmed",
+            message,
+        )
+        # An arbitrary redirect is not proof that the proposal was registered.
         return SubmissionResult(
             status=SubmissionStatus.SUBMITTED if ok else SubmissionStatus.FAILED,
             message=message,

@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 from bidpilot.scheduler import Scheduler

@@ -848,6 +848,7 @@ class DiscoveryAgent:
             },
         )
 
+
 def friendly_llm_error(message: str) -> str:
     """Turn a provider's JSON blob into a sentence the user can act on."""
     text = str(message or "")

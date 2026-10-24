@@ -93,6 +93,9 @@ class HtmlMarketSource(Source):
         #: no AI attempts until then (a blocked provider must not be hammered
         #: every poll interval: Groq's 403 for Iranian IPs is not transient)
         self._discovery_blocked_until: float = 0.0
+        #: Cache successful detail HTML across poll cycles to avoid hammering
+        #: the same 25 detail pages every two minutes.
+        self._detail_html_cache: dict[str, tuple[float, str]] = {}
         legacy = secrets.model_dump() if hasattr(secrets, "model_dump") else {}
         self.credentials: SiteCredentials = site_credentials(
             self.name,
@@ -123,7 +126,7 @@ class HtmlMarketSource(Source):
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
     async def get_html(self, path: str, **kwargs: Any) -> str:
-        """Fetch HTML and optionally log status, redirect chain, and response shape."""
+        """Fetch HTML with bounded retries for transient, idempotent GET failures."""
         diagnostics = bool(
             (self.settings.get("discovery") or {}).get("log_extraction_details")
             or (self.settings.get("discovery") or {}).get("log_http_details")
@@ -134,7 +137,6 @@ class HtmlMarketSource(Source):
         safe_requested = self._safe_diagnostic_url(requested)
         params = kwargs.get("params")
         param_keys = sorted(str(key) for key in params.keys()) if hasattr(params, "keys") else []
-
         if diagnostics:
             log.info(
                 "[HTTP][REQUEST] source=%s url=%s params_keys=%r",
@@ -144,18 +146,50 @@ class HtmlMarketSource(Source):
             )
 
         client = await self.client()
-        try:
-            response = await client.get(path, **kwargs)
-        except httpx.HTTPError as exc:
-            if diagnostics:
-                log.warning(
-                    "[HTTP][FAILED] source=%s requested=%s error_type=%s",
+        http_cfg = self.settings.get("http") or {}
+        attempts = max(1, min(4, int(http_cfg.get("get_attempts", 3))))
+        response: httpx.Response | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await client.get(path, **kwargs)
+            except httpx.HTTPError as exc:
+                if attempt < attempts:
+                    log.warning(
+                        "[HTTP][RETRY] source=%s url=%s attempt=%s/%s error_type=%s",
+                        self.name,
+                        safe_requested,
+                        attempt,
+                        attempts,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(min(1.5, 0.5 * attempt))
+                    continue
+                log.error(
+                    "[HTTP][FAILED] source=%s url=%s attempts=%s error_type=%s",
                     self.name,
                     safe_requested,
+                    attempts,
                     type(exc).__name__,
                 )
-            raise
+                raise SourceError(
+                    f"GET {safe_requested} failed after {attempts} attempts: {type(exc).__name__}"
+                ) from exc
 
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < attempts:
+                    log.warning(
+                        "[HTTP][RETRY] source=%s url=%s attempt=%s/%s status=%s",
+                        self.name,
+                        safe_requested,
+                        attempt,
+                        attempts,
+                        response.status_code,
+                    )
+                    await asyncio.sleep(min(1.5, 0.5 * attempt))
+                    continue
+            break
+
+        assert response is not None
         if diagnostics:
             redirects = [
                 (item.status_code, self._safe_diagnostic_url(str(item.url))) for item in response.history
@@ -173,14 +207,13 @@ class HtmlMarketSource(Source):
             )
 
         if response.status_code >= 400:
-            if diagnostics:
-                log.warning(
-                    "[HTTP][FAILED] source=%s requested=%s status=%s",
-                    self.name,
-                    safe_requested,
-                    response.status_code,
-                )
-            raise SourceError(f"GET {path} -> HTTP {response.status_code}")
+            log.warning(
+                "[HTTP][FAILED] source=%s requested=%s status=%s",
+                self.name,
+                safe_requested,
+                response.status_code,
+            )
+            raise SourceError(f"GET {safe_requested} -> HTTP {response.status_code}")
         return response.text
 
     def credentials_present(self) -> bool:
@@ -547,7 +580,8 @@ class HtmlMarketSource(Source):
                 html = await self.get_html(path, params=params)
             except Exception as exc:
                 if page == 1:
-                    raise SourceError(f"خطا در دریافت لیست پروژه‌ها: {exc}") from exc
+                    detail = str(exc).strip() or type(exc).__name__
+                    raise SourceError(f"خطا در دریافت لیست پروژه‌ها: {detail}") from exc
                 log.warning("%s page %s failed: %s", self.name, page, exc)
                 break
             log.info(
@@ -594,10 +628,19 @@ class HtmlMarketSource(Source):
         detail_cfg = dict(self.settings.get("detail") or {})
         detail_cfg["_diagnostics"] = bool(self.discovery_settings().get("log_extraction_details"))
         template = detail_cfg.get("path", "{external_id}")
+        cache_seconds = max(0.0, float(detail_cfg.get("cache_seconds", 900) or 0))
+        now = time.monotonic()
+        if cache_seconds:
+            for key, (cached_at, _) in list(self._detail_html_cache.items()):
+                if now - cached_at >= cache_seconds:
+                    self._detail_html_cache.pop(key, None)
+        else:
+            self._detail_html_cache.clear()
         semaphore = asyncio.Semaphore(max(1, concurrency))
 
         async def enrich(project: Project) -> Project:
             path = template.format(external_id=project.external_id, url=project.url)
+            cache_key = f"{project.external_id}:{path}"
             log.info(
                 "[SELECTORS][GET-DETAIL] source=%s id=%s title=%r project_url=%s "
                 "configured_detail_path=%s resolved_request=%s",
@@ -609,17 +652,31 @@ class HtmlMarketSource(Source):
                 urljoin(self.base_url + "/", path.lstrip("/")),
             )
             async with semaphore:
-                try:
-                    html = await self.get_html(path)
-                except Exception as exc:
-                    log.warning(
-                        "[SELECTORS][DETAIL-FAILED] source=%s id=%s path=%s error=%r",
+                cached = self._detail_html_cache.get(cache_key) if cache_seconds else None
+                if cached and time.monotonic() - cached[0] < cache_seconds:
+                    html = cached[1]
+                    log.info(
+                        "[SELECTORS][DETAIL-CACHE-HIT] source=%s id=%s age_seconds=%.1f",
                         self.name,
                         project.external_id,
-                        path,
-                        str(exc),
+                        time.monotonic() - cached[0],
                     )
-                    return project
+                else:
+                    try:
+                        html = await self.get_html(path)
+                    except Exception as exc:
+                        detail = str(exc).strip() or type(exc).__name__
+                        log.warning(
+                            "[SELECTORS][DETAIL-FAILED] source=%s id=%s path=%s error_type=%s detail=%r",
+                            self.name,
+                            project.external_id,
+                            self._safe_diagnostic_url(urljoin(self.base_url + "/", path.lstrip("/"))),
+                            type(exc).__name__,
+                            detail[:180],
+                        )
+                        return project
+                    if cache_seconds:
+                        self._detail_html_cache[cache_key] = (time.monotonic(), html)
             try:
                 enriched = parser.enrich_from_detail(html, project, detail_cfg)
                 log.info(

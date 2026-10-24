@@ -15,7 +15,7 @@ discovery:
   # ai        = مدل خودش داخل سایت می‌گردد و صفحه‌ی هر پروژه را می‌خواند
   # selectors = فقط سلکتورهای CSS همین فایل (سریع، بدون مصرف کلید AI)
   # auto      = اگر کلید هوش مصنوعی بود ai، وگرنه selectors
-  mode: "auto"
+  mode: "selectors"
   # فقط از صفحه‌ی اصلی شروع می‌کنیم؛ پیدا کردن فهرست‌ها کار خود مدل است
   seed_paths: ["/"]
   max_steps: 8               # حداکثر صفحه‌ای که در یک دور باز می‌شود
@@ -87,6 +87,7 @@ list:
       - ".tags .tag"
       - ".skills li"
       - ".skill"
+      - "a[href*='/project/skills/']"
     category:
       - ".project-category"
       - ".category"
@@ -105,6 +106,8 @@ list:
 
 detail:
   path: "/project/{external_id}"
+  # Reuse successful project detail HTML across poll cycles; submission pages are always fetched fresh.
+  cache_seconds: 900
   detail_fields:
     description:
       - "#project-description"
@@ -119,6 +122,7 @@ detail:
       - ".project-skills .tag"
       - ".skills .tag"
       - "li.skill"
+      - "a[href*='/project/skills/']"
     category:
       - ".project-category"
     employer:

@@ -6,6 +6,7 @@ one project never stops the batch and every decision can be explained later.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -27,7 +28,7 @@ from .pricing.strategy import PricingConfig, PricingStrategy
 from .proposals.generator import ProposalError, ProposalGenerator
 from .ratelimit import RateLimiter
 from .repositories import Repository
-from .sources.base import Source
+from .sources.base import Source, SourceError
 from .text import parse_days
 
 log = logging.getLogger(__name__)
@@ -135,6 +136,24 @@ class BidPipeline:
     async def run_source(self, source: Source) -> RunReport:
         report = RunReport(source=source.name)
         try:
+            # Never enter live project polling/submission with an unverified session.
+            if self.live:
+                try:
+                    session_ok, session_detail = await source.verify_session()
+                except Exception as exc:
+                    session_ok = False
+                    session_detail = f"بررسی نشست با خطای {type(exc).__name__} متوقف شد."
+                log.info(
+                    "[PIPELINE][SESSION-CHECK] source=%s live=%s ok=%s detail=%r",
+                    source.name,
+                    self.live,
+                    session_ok,
+                    session_detail,
+                )
+                if not session_ok:
+                    detail = session_detail or "وضعیت ورود تأیید نشد."
+                    raise SourceError(f"ارسال واقعی متوقف شد؛ احراز هویت «{source.name}» تأیید نشد: {detail}")
+
             projects = await source.fetch_projects()
             report.fetched = len(projects)
             discovery = getattr(source, "last_discovery", None)
@@ -146,22 +165,90 @@ class BidPipeline:
                     await self.process_project(project, report)
                 except Exception as exc:  # never let one project kill the batch
                     log.exception("Project %s failed", project.uid)
-                    report.errors.append(f"{project.uid}: {exc}")
-        except Exception as exc:  # fetch/parse failure for the whole source
-            report.errors.append(str(exc))
-            log.error("Fetch failed for %s: %s", source.name, exc, exc_info=log.isEnabledFor(logging.DEBUG))
-            await self._notify_error(source.name, f"دریافت لیست پروژه‌ها ناموفق بود: {exc}")
+                    report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
+        except Exception as exc:  # fetch/auth failure for the whole source
+            detail = str(exc).strip() or type(exc).__name__
+            report.errors.append(detail)
+            log.error(
+                "Source cycle failed for %s: %s",
+                source.name,
+                detail,
+                exc_info=log.isEnabledFor(logging.DEBUG),
+            )
+            await self._notify_error(source.name, f"اجرای منبع «{source.name}» ناموفق بود: {detail}")
         finally:
             await self.repo.commit()  # persist whatever happened (incl. error events)
         log.info(report.summary())
         return report
 
     # -------------------------------------------------------------- one item
+    def _existing_project_revisit_reason(self, existing, project: Project, latest_bid) -> str:
+        """Revisit only records whose previous skip/failure is demonstrably recoverable."""
+        if latest_bid is None:
+            return ""
+        status = str(latest_bid.status or "").casefold()
+        message = str(latest_bid.message or "")
+
+        if status == SubmissionStatus.SKIPPED.value:
+            try:
+                old_skills = set(json.loads(existing.skills or "[]"))
+            except (TypeError, ValueError):
+                old_skills = set()
+            new_skills = {str(skill).strip() for skill in (project.skills or []) if str(skill).strip()}
+            skills_improved = bool(new_skills - old_skills)
+            description_improved = len(project.description or "") > len(existing.description or "") + 40
+            budget_was_known = existing.budget_min is not None and existing.budget_max is not None
+            budget_is_known = bool(project.budget and project.budget.is_known)
+            if "مهارت" in message and (skills_improved or description_improved):
+                return "اطلاعات مهارت/شرح پروژه بهتر شده است"
+            if "بودجه" in message and not budget_was_known and budget_is_known:
+                return "بودجه‌ای که قبلاً پیدا نشده بود اکنون مشخص است"
+            return ""
+
+        # Retry only failures known to happen before a proposal POST. An ambiguous
+        # POST/network failure is intentionally excluded to avoid duplicate bids.
+        safe_pre_submit_failures = (
+            "فرم HTML ارسال پیشنهاد شناسایی نشد",
+            "فیلد متن پیشنهاد در فرم شناسایی نشد",
+            "مسیر ورود",
+            "نشست منقضی شده است",
+            "صفحه پروژه قابل دریافت نبود",
+            "صفحهٔ پروژه دریافت شد",
+            "خطای شبکه هنگام باز کردن صفحه پروژه",
+        )
+        if status != SubmissionStatus.FAILED.value or not self.live:
+            return ""
+        if not any(marker in message for marker in safe_pre_submit_failures):
+            return ""
+        failed_at = getattr(latest_bid, "updated_at", None) or getattr(latest_bid, "created_at", None)
+        if failed_at is not None:
+            if failed_at.tzinfo is None:
+                failed_at = failed_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - failed_at).total_seconds()
+            if age_seconds < 900:
+                return ""
+        return "تلاش دوباره پس از خطای قطعیِ قبل از ارسال"
+
     async def process_project(self, project: Project, report: RunReport) -> BidPlan | None:
-        # 1) dedupe on *scraped* projects (we store everything we saw, even if filtered)
-        if await self.repo.project_exists(project.source, project.external_id):
-            report.duplicates += 1
-            return None
+        # Duplicates normally stop here. Reconsider an old skip only when fresh
+        # evidence fixes the exact reason it was skipped; retry failed records
+        # only when the log proves the POST did not happen.
+        project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
+        if project_row is not None:
+            latest_bid = await self.repo.latest_bid_for_project(project_row.id)
+            revisit_reason = self._existing_project_revisit_reason(project_row, project, latest_bid)
+            if not revisit_reason:
+                report.duplicates += 1
+                return None
+            project_row = await self.repo.refresh_project_row(project_row, project)
+            log.info(
+                "[PIPELINE][REVISIT] source=%s id=%s title=%r reason=%r previous_status=%s",
+                project.source,
+                project.external_id,
+                project.title,
+                revisit_reason,
+                getattr(latest_bid, "status", None),
+            )
 
         # 2) filtering
         budget_debug = project.budget.model_dump() if project.budget else None
@@ -198,8 +285,9 @@ class BidPipeline:
             self.config.filters.require_skill_match,
             self.project_filter.skill_keywords,
         )
-        project_row = await self.repo.save_project(project)
-        report.new += 1
+        if project_row is None:
+            project_row = await self.repo.save_project(project)
+            report.new += 1
 
         if not decision.allowed:
             log.warning(
@@ -246,8 +334,16 @@ class BidPipeline:
                 raw,
             )
             report.skipped += 1
+            plan = BidPlan(
+                project=project,
+                result=SubmissionResult(
+                    status=SubmissionStatus.SKIPPED,
+                    message="قیمت‌گذاری امکان‌پذیر نبود.",
+                ),
+            )
+            await self.repo.save_bid(project_row.id, plan)
             await self._emit_skip(project, "قیمت‌گذاری امکان‌پذیر نبود.", report)
-            return None
+            return plan
 
         amount = pricing.amount
         delivery = self.delivery_days

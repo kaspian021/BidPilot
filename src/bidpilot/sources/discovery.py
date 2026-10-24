@@ -60,7 +60,7 @@ MAX_DETAIL_CHARS = 8_000
 MAX_LINKS = 45
 #: a page with this many project links is a list: its prose is noise for the model
 LIST_PAGE_MIN_LINKS = 3
-LIST_PAGE_TEXT_CHARS = 350
+LIST_PAGE_TEXT_CHARS = 200
 #: Reasoning models (Groq gpt-oss) think before answering: with a tiny output
 #: budget they return *empty* content with finish_reason=length. These are the
 #: floor values; the client doubles them automatically if it still runs out.
@@ -263,6 +263,7 @@ def _block_lines(root: Any) -> list[str]:
         "section",
         "article",
         "main",
+        "aside",
     )
     lines: list[str] = []
     for node in root.find_all(block_tags):

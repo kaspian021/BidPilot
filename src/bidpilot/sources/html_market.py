@@ -156,7 +156,9 @@ class HtmlMarketSource(Source):
             raise
 
         if diagnostics:
-            redirects = [(item.status_code, self._safe_diagnostic_url(str(item.url))) for item in response.history]
+            redirects = [
+                (item.status_code, self._safe_diagnostic_url(str(item.url))) for item in response.history
+            ]
             log.info(
                 "[HTTP][RESPONSE] source=%s status=%s requested=%s final_url=%s "
                 "content_type=%r html_chars=%s redirects=%r",

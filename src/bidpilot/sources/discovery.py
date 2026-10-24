@@ -572,6 +572,17 @@ class DiscoveryAgent:
         collected: dict[str, Project] = {}
         details_read = 0
         step = 0
+        log.info(
+            "[AI-DISCOVERY][START] source=%s base_url=%s seeds=%r profile_skills=%r "
+            "max_steps=%s max_detail_pages=%s max_projects=%s",
+            self.source_name,
+            self.base_url,
+            list(queue),
+            self.profile.stack,
+            self.max_steps,
+            self.max_detail_pages,
+            self.max_projects,
+        )
 
         while queue and step < self.max_steps and len(collected) < self.max_projects:
             url = queue.popleft()
@@ -579,16 +590,44 @@ class DiscoveryAgent:
                 continue
             visited.add(url)
             step += 1
+            log.info(
+                "[AI-DISCOVERY][FETCH] source=%s step=%s/%s url=%s queue_remaining=%s",
+                self.source_name,
+                step,
+                self.max_steps,
+                url,
+                len(queue),
+            )
             try:
                 html = await self.fetch(url)
             except Exception as exc:  # network/404: keep browsing, don't die
                 result.notes.append(f"{url}: {exc}")
-                log.debug("discovery: %s failed (%s)", url, exc)
+                log.warning("[AI-DISCOVERY][FETCH-FAILED] source=%s url=%s error=%r", self.source_name, url, str(exc))
                 continue
 
             page = digest_html(html, url, base_url=self.base_url)
             result.pages_read += 1
             result.visited.append(url)
+            log.info(
+                "[AI-DISCOVERY][PAGE] source=%s step=%s url=%s title=%r html_chars=%s "
+                "visible_text_chars=%s links=%s project_links=%s is_login=%s",
+                self.source_name,
+                step,
+                url,
+                page.title,
+                len(html or ""),
+                len(page.text),
+                len(page.links),
+                sum(1 for link in page.links if _looks_like_item(link.url)),
+                page.is_login,
+            )
+            log.info("[AI-DISCOVERY][PAGE-TEXT] source=%s url=%s text=%s", self.source_name, url, page.text)
+            log.info(
+                "[AI-DISCOVERY][PAGE-LINKS] source=%s url=%s links=%r",
+                self.source_name,
+                url,
+                [(link.index, link.label, link.url) for link in page.links],
+            )
             if page.is_login:
                 raise DiscoveryError("سایت فرم ورود نشان داد؛ کوکی منقضی شده است — «/market» را بزن.")
 
@@ -619,6 +658,17 @@ class DiscoveryAgent:
 
             action = str(decision.get("action") or "").strip().lower()
             why = truncate(str(decision.get("why") or ""), 120)
+            log.info(
+                "[AI-DISCOVERY][DECISION] source=%s url=%s action=%r why=%r "
+                "link_index=%r selected_indexes=%r raw_json=%r",
+                self.source_name,
+                url,
+                action,
+                why,
+                decision.get("link"),
+                decision.get("links"),
+                decision,
+            )
             if why:
                 history.append(f"{_short(url)}: {action} — {why}")
 
@@ -664,12 +714,35 @@ class DiscoveryAgent:
         if not result.projects and self._login_seen:
             raise DiscoveryError("سایت فرم ورود نشان داد؛ کوکی منقضی شده است — «/market» را بزن.")
         log.info(
-            "%s: AI discovery read %s pages / %s projects (%s LLM calls)",
+            "[AI-DISCOVERY][END] source=%s pages_read=%s detail_pages=%s projects=%s "
+            "llm_calls=%s visited=%r notes=%r queued_not_opened=%r",
             self.source_name,
             result.pages_read,
+            self._detail_pages,
             len(result.projects),
             result.llm_calls,
+            result.visited,
+            result.notes,
+            list(queue),
         )
+        for project in result.projects:
+            log.info(
+                "[AI-DISCOVERY][PROJECT] source=%s id=%s title=%r url=%s "
+                "budget=%r raw=%r skills=%r category=%r employer=%r deadline=%r "
+                "description_chars=%s description=%r",
+                project.source,
+                project.external_id,
+                project.title,
+                project.url,
+                project.budget.model_dump() if project.budget else None,
+                project.raw,
+                project.skills,
+                project.category,
+                project.employer,
+                project.employer_deadline,
+                len(project.description or ""),
+                project.description[:12_000],
+            )
         return result
 
     # ------------------------------------------------------------------ steps
@@ -727,8 +800,28 @@ class DiscoveryAgent:
             text=_sanitize_page_text(text + ("\n(این صفحه فهرست پروژه است.)" if list_like else "")),
             links=_sanitize_page_text(render_links(page.links)),
         )
+        log.info(
+            "[AI-DISCOVERY][MODEL-INPUT] source=%s url=%s title=%r list_like=%s "
+            "input_text_chars=%s prompt_chars=%s input_text=%r links_sent=%r",
+            self.source_name,
+            page.url,
+            page.title,
+            list_like,
+            len(text),
+            len(prompt),
+            text,
+            [(link.index, link.label, link.url) for link in page.links[:30]],
+        )
         answer = await self._complete_json(AGENT_SYSTEM, prompt, max_tokens=STEP_MAX_TOKENS)
-        data = parse_json_object(getattr(answer, "text", answer))
+        raw_answer = getattr(answer, "text", answer)
+        data = parse_json_object(raw_answer)
+        log.info(
+            "[AI-DISCOVERY][MODEL-OUTPUT] source=%s url=%s raw_output=%r parsed_json=%r",
+            self.source_name,
+            page.url,
+            raw_answer,
+            data,
+        )
         if not data:
             raise DiscoveryError("مدل JSON معتبر برنگرداند.")
         return data
@@ -742,19 +835,64 @@ class DiscoveryAgent:
                 return None
         page = digest_html(html, url, base_url=self.base_url, max_text=MAX_DETAIL_CHARS)
         self._detail_pages += 1
+        source_description = _extract_description(html)
+        log.info(
+            "[AI-EXTRACT][PAGE] source=%s url=%s title=%r html_chars=%s visible_text_chars=%s "
+            "description_chars=%s is_login=%s",
+            self.source_name,
+            url,
+            page.title,
+            len(html or ""),
+            len(page.text),
+            len(source_description),
+            page.is_login,
+        )
+        log.info("[AI-EXTRACT][VISIBLE-TEXT] source=%s url=%s text=%s", self.source_name, url, page.text)
+        if source_description:
+            log.info(
+                "[AI-EXTRACT][DESCRIPTION-HTML] source=%s url=%s text=%s",
+                self.source_name,
+                url,
+                source_description[:12_000],
+            )
         if page.is_login:
             self._login_seen = True
+            log.warning("[AI-EXTRACT][LOGIN-PAGE] source=%s url=%s; skipping extraction", self.source_name, url)
             return None
         prompt = EXTRACT_PROMPT.format(url=url, text=_sanitize_page_text(page.text))
+        log.info(
+            "[AI-EXTRACT][MODEL-INPUT] source=%s url=%s prompt_chars=%s input_text_chars=%s",
+            self.source_name,
+            url,
+            len(prompt),
+            len(page.text),
+        )
         try:
             answer = await self._complete_json(EXTRACT_SYSTEM, prompt, max_tokens=EXTRACT_MAX_TOKENS)
         except Exception as exc:
-            log.debug("discovery: extraction failed for %s (%s)", url, exc)
+            log.warning("[AI-EXTRACT][MODEL-FAILED] source=%s url=%s error=%r", self.source_name, url, str(exc))
             return None
-        data = parse_json_object(getattr(answer, "text", answer))
+        raw_answer = getattr(answer, "text", answer)
+        data = parse_json_object(raw_answer)
+        log.info(
+            "[AI-EXTRACT][MODEL-OUTPUT] source=%s url=%s raw_output=%r parsed_json=%r",
+            self.source_name,
+            url,
+            raw_answer,
+            data,
+        )
         if not data or data.get("is_project") is False:
+            log.warning(
+                "[AI-EXTRACT][REJECTED] source=%s url=%s reason=%s",
+                self.source_name,
+                url,
+                "invalid_json" if not data else "model_says_not_project",
+            )
             return None
-        return self._to_project(url, data, page, source_description=_extract_description(html))
+        project = self._to_project(url, data, page, source_description=source_description)
+        if project is None:
+            log.warning("[AI-EXTRACT][REJECTED] source=%s url=%s reason=normalization_returned_none", self.source_name, url)
+        return project
 
     def _to_project(
         self,

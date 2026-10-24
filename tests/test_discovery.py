@@ -364,6 +364,7 @@ def make_source(llm=None, monkeypatch=None) -> ParscodersSource:
 async def test_source_uses_ai_discovery_when_a_key_exists(monkeypatch):
     llm = ScriptedLLM()
     source = make_source(llm, monkeypatch)
+    source.settings["discovery"] = {**source.settings.get("discovery", {}), "mode": "auto"}
     try:
         projects = await source.fetch_projects()
     finally:
@@ -380,6 +381,7 @@ async def test_source_falls_back_to_selectors_when_the_model_fails(monkeypatch):
             raise RuntimeError("429 rate limit")
 
     original = make_source(Broken(), monkeypatch)
+    original.settings["discovery"] = {**original.settings.get("discovery", {}), "mode": "auto"}
     try:
         projects = await original.fetch_projects()
     finally:

@@ -246,8 +246,23 @@ def _looks_like_item(url: str) -> bool:
 def _block_lines(root: Any) -> list[str]:
     """Extract readable leaf blocks without flattening an entire page into one string."""
     block_tags = (
-        "h1", "h2", "h3", "h4", "h5", "p", "li", "dt", "dd", "tr", "th", "td",
-        "blockquote", "div", "section", "article", "main",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "p",
+        "li",
+        "dt",
+        "dd",
+        "tr",
+        "th",
+        "td",
+        "blockquote",
+        "div",
+        "section",
+        "article",
+        "main",
     )
     lines: list[str] = []
     for node in root.find_all(block_tags):
@@ -325,7 +340,11 @@ def _extract_description(html: str, *, max_chars: int = 12_000) -> str:
     soup = BeautifulSoup(html or "", "lxml")
     for tag in soup(["script", "style", "noscript", "svg", "head", "iframe", "form", "button"]):
         tag.decompose()
-    for node in list(soup.select('[hidden], [aria-hidden="true"], [style*="display:none"], [style*="display: none"], [style*="visibility:hidden"]')):
+    for node in list(
+        soup.select(
+            '[hidden], [aria-hidden="true"], [style*="display:none"], [style*="display: none"], [style*="visibility:hidden"]'
+        )
+    ):
         node.decompose()
 
     for selector in _DESCRIPTION_SELECTORS:
@@ -405,7 +424,22 @@ def digest_html(
             break
 
     # Keep menu links above, but remove repetitive/hidden UI from the text sent to the model.
-    for tag in soup(["script", "style", "noscript", "svg", "head", "iframe", "footer", "form", "button", "input", "select", "textarea"]):
+    for tag in soup(
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "head",
+            "iframe",
+            "footer",
+            "form",
+            "button",
+            "input",
+            "select",
+            "textarea",
+        ]
+    ):
         tag.decompose()
     for node in list(
         soup.select(
@@ -741,7 +775,8 @@ class DiscoveryAgent:
         page_budget = parser.find_budget(page.text)
         description_budget = parser.find_budget(source_description) if source_description else None
         verified_budget = (
-            page_budget if page_budget is not None and (page_budget.is_known or page_budget.negotiable)
+            page_budget
+            if page_budget is not None and (page_budget.is_known or page_budget.negotiable)
             else description_budget
         )
         if verified_budget is not None and (verified_budget.is_known or verified_budget.negotiable):
@@ -766,7 +801,9 @@ class DiscoveryAgent:
 
         # Prefer the actual HTML description node; otherwise retain the visible page
         # text instead of replacing it with an LLM-compressed summary that may omit requirements.
-        description = clean_text(source_description or page.text or str(data.get("description") or ""))[:12_000]
+        description = clean_text(source_description or page.text or str(data.get("description") or ""))[
+            :12_000
+        ]
         skills = data.get("skills") or []
         if isinstance(skills, str):
             skills = re.split(r"[,،/|]", skills)

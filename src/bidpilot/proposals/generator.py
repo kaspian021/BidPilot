@@ -194,12 +194,17 @@ class ProposalGenerator:
 
     async def _generate_with_llm(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
         """Try the free providers in order; the first valid text wins."""
+        insights = insights_for(project, limit=4)
+        playbook_hints = "\n".join(
+            f"- چالش احتمالی: {challenge} | راه‌حل فنی: {solution}" for challenge, solution in insights
+        )
         system, user = build_prompts(
             project,
             self.profile,
             self.settings,
             amount,
             delivery_days,
+            playbook_hints=playbook_hints,
         )
         failures: list[str] = []
         for provider, client in self._clients_ready():

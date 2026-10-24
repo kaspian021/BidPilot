@@ -68,6 +68,9 @@ class Project(BaseModel):
     employer: str | None = None
     #: the delivery time the employer asked for ("۱۰ روز", "۲ هفته") — never invented
     employer_deadline: str = ""
+    key_requirements: list[str] = Field(default_factory=list)
+    employer_questions: list[str] = Field(default_factory=list)
+    deliverables: list[str] = Field(default_factory=list)
     published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=utcnow)
     raw: dict = Field(default_factory=dict)
@@ -87,8 +90,16 @@ class Project(BaseModel):
             parts.append(f"بودجه کارفرما: {self.budget.as_text()}")
         if self.employer_deadline:
             parts.append(f"زمان تحویل اعلامی کارفرما: {self.employer_deadline}")
+        if self.deliverables:
+            parts.append("خروجی‌ها و تحویلی‌های مورد انتظار کارفرما:\n- " + "\n- ".join(self.deliverables))
+        if self.key_requirements:
+            parts.append("نیازمندی‌ها و الزامات کلیدی کارفرما:\n- " + "\n- ".join(self.key_requirements))
+        if self.employer_questions:
+            parts.append(
+                "سؤالات یا خواسته‌های صریح کارفرما از فریلنسر:\n- " + "\n- ".join(self.employer_questions)
+            )
         if self.description:
-            parts.append(f"توضیحات کارفرما:\n{self.description}")
+            parts.append(f"توضیحات کامل کارفرما:\n{self.description}")
         return "\n".join(parts)
 
 

@@ -329,7 +329,9 @@ def _extract_between_markers(
         pos, marker = min(matches)
         start = pos + len(marker)
     end = len(cleaned)
-    markers = [clean_text(marker) for marker in (end_markers or _DESCRIPTION_END_MARKERS) if clean_text(marker)]
+    markers = [
+        clean_text(marker) for marker in (end_markers or _DESCRIPTION_END_MARKERS) if clean_text(marker)
+    ]
     for marker in markers:
         pos = cleaned.find(marker, start)
         if pos >= 0:

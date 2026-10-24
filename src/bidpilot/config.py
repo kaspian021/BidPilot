@@ -157,8 +157,11 @@ class LLMConfig(BaseModel):
     #: tried in order when the primary provider is unavailable or rate-limited
     fallbacks: list[str] = Field(default_factory=lambda: list(DEFAULT_FALLBACKS))
     temperature: float = 0.6
-    max_tokens: int = 900
+    max_tokens: int = 1_600
     timeout_seconds: float = 45.0
+    #: tokens per minute to stay under (0 = take the provider preset's value).
+    #: Free Groq keys allow 8,000/min; the client waits instead of getting 429s.
+    tokens_per_minute: int = 0
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")

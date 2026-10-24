@@ -13,8 +13,8 @@ from ..config import AppConfig, LLMConfig, Profile, ProposalConfig
 from ..llm_providers import LLMProvider, build_client, resolve_chain
 from ..models import Project, Proposal
 from ..pricing.budget import format_toman
-from ..text import count_emoji, persian_ratio, to_persian_digits
-from .llm_client import LLMClient, LLMError
+from ..text import count_emoji, persian_ratio, to_ascii_digits, to_persian_digits
+from .llm_client import LLMClient, LLMError, LLMResponse
 from .playbook import insights_for
 from .prompts import REPAIR_PROMPT, build_prompts
 
@@ -27,6 +27,35 @@ _SALAM = ("سلام", "وقت بخیر", "درود")
 
 class ProposalError(RuntimeError):
     pass
+
+
+_NUMBER_RUN = re.compile(r"\d[\d,٬،.\s]*\d|\d")
+_SCALED = re.compile(r"(\d+(?:\.\d+)?)\s*(میلیون|هزار)")
+_CURRENCY = re.compile(r"توم[ا]?ن|تومن")
+
+
+def mentions_amount(text: str, amount: int) -> bool:
+    """Does the bid actually state this price — in *any* digit/separator style?
+
+    Models happily write «۱٬۵۰۰٬۰۰۰», «۱,۵۰۰,۰۰۰» or «۱.۵ میلیون». Comparing
+    against one string made good proposals fail validation and fall back to a
+    template, which looked like "the AI ignored the price".
+    """
+    ascii_text = to_ascii_digits(text or "").replace("٫", ".").replace("٬", ",")
+    for match in _NUMBER_RUN.finditer(ascii_text):
+        digits = re.sub(r"\D", "", match.group())
+        if digits and int(digits) == amount:
+            return True
+    for match in _SCALED.finditer(ascii_text):
+        value = float(match.group(1))
+        scale = 1_000_000 if match.group(2) == "میلیون" else 1_000
+        if abs(value * scale - amount) < max(1.0, amount * 0.005):
+            return True
+    return False
+
+
+def mentions_currency(text: str) -> bool:
+    return bool(_CURRENCY.search(to_ascii_digits(text or "")))
 
 
 @dataclass
@@ -66,19 +95,9 @@ def validate_proposal(
     for phrase in config.banned_phrases:
         if phrase and phrase in stripped:
             issues.append(f"عبارت ممنوعه استفاده شده: {phrase}")
-    if amount is not None:
-        # accept ۱٬۰۰۰٬۰۰۰ / ۱,۰۰۰,۰۰۰ / 1000000 in either digit script
-        needles = {
-            f"{amount:,}",
-            to_persian_digits(f"{amount:,}"),
-            f"{amount:,}".replace(",", "٬"),
-            to_persian_digits(f"{amount:,}".replace(",", "٬")),
-            str(amount),
-            to_persian_digits(str(amount)),
-        }
-        if not any(needle in stripped for needle in needles):
-            issues.append(f"قیمت پیشنهادی ({amount:,}) در متن ذکر نشده است.")
-    if "تومان" not in stripped and "تومن" not in stripped:
+    if amount is not None and not mentions_amount(stripped, amount):
+        issues.append(f"قیمت پیشنهادی ({amount:,}) در متن ذکر نشده است.")
+    if not mentions_currency(stripped):
         issues.append("واحد قیمت (تومان) در متن نیامده است.")
     return ValidationReport(issues)
 
@@ -185,7 +204,7 @@ class ProposalGenerator:
         failures: list[str] = []
         for provider, client in self._clients_ready():
             try:
-                response = await client.complete(system, user)
+                response = await self._complete_proposal(client, system, user)
             except LLMError as exc:
                 log.warning("Provider %s failed: %s", provider.id, exc)
                 failures.append(f"{provider.id}: {exc}")
@@ -201,7 +220,7 @@ class ProposalGenerator:
                 )
                 try:
                     repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
-                    fixed = await client.complete(system, repair)
+                    fixed = await self._complete_proposal(client, system, repair)
                     if validate_proposal(fixed.text.strip(), self.settings, amount).ok:
                         text = fixed.text.strip()
                         response = fixed
@@ -220,6 +239,27 @@ class ProposalGenerator:
 
         detail = "؛ ".join(failures) if failures else "هیچ ارائه‌دهنده‌ای تنظیم نشده است."
         raise LLMError(f"تولید متن با مدل زبانی ناموفق بود — {detail}")
+
+    async def _complete_proposal(self, client: LLMClient, system: str, user: str) -> LLMResponse:
+        """One proposal call — with more room when the answer was cut off.
+
+        A truncated bid loses its closing paragraph (price + «تومان»), which
+        validation then rejects as if the model had ignored the price. So a
+        ``finish_reason == "length"`` answer is retried with twice the budget.
+        """
+        budget = max(int(self.llm_config.max_tokens or 900), 1_400)
+        response = await self._call(client, system, user, budget)
+        if getattr(response, "truncated", False):
+            log.info("Proposal hit the %s-token limit; retrying with more room", budget)
+            response = await self._call(client, system, user, min(budget * 2, 3_000))
+        return response
+
+    @staticmethod
+    async def _call(client: LLMClient, system: str, user: str, budget: int) -> LLMResponse:
+        try:
+            return await client.complete(system, user, max_tokens=budget)
+        except TypeError:  # a minimal client (tests, older wrappers) has no such kwarg
+            return await client.complete(system, user)
 
     def generate_from_template(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
         """Render the longest template that fits ``proposal.max_chars``.

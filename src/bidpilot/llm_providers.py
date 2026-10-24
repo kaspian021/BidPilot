@@ -43,6 +43,9 @@ class ProviderPreset:
     key_url: str = ""
     note: str = ""
     requires_key: bool = True
+    #: free-tier tokens-per-minute cap (0 = unknown/unlimited). Used to pace calls
+    #: instead of collecting HTTP 429s. Groq's free plan is 8,000 TPM.
+    tokens_per_minute: int = 0
     extra_headers: Mapping[str, str] = field(default_factory=dict)
 
     @property
@@ -58,7 +61,9 @@ PRESETS: dict[str, ProviderPreset] = {
         # free-tier model since Groq retired the Llama family for free accounts (2026)
         model="openai/gpt-oss-120b",
         key_url="https://console.groq.com/keys",
-        note="ساخت توکن رایگان است و منقضی نمی‌شود؛ سقف درخواست روزانه دارد.",
+        # free plan: 30 RPM / 1,000 RPD / 8,000 TPM (the TPM one is the tight one)
+        tokens_per_minute=7000,
+        note="توکن رایگان و همیشگی؛ سهمیه ۸٬۰۰۰ توکن در دقیقه — برنامه خودش فاصله‌ها را رعایت می‌کند.",
     ),
     "gemini": ProviderPreset(
         id="gemini",
@@ -112,6 +117,7 @@ class LLMProvider:
     api_key: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     note: str = ""
+    tokens_per_minute: int = 0
 
     @property
     def free(self) -> bool:
@@ -202,6 +208,7 @@ def resolve_chain(
                 api_key=api_key,
                 extra_headers=dict(preset.extra_headers),
                 note=preset.note,
+                tokens_per_minute=preset.tokens_per_minute,
             )
 
         if name == primary and getattr(llm_config, "extra_headers", None):
@@ -218,6 +225,8 @@ def resolve_chain(
 def build_client(provider: LLMProvider, llm_config: Any):
     from .proposals.llm_client import LLMClient
 
+    # an explicit llm.tokens_per_minute always wins over the preset's default
+    budget = int(getattr(llm_config, "tokens_per_minute", 0) or 0) or provider.tokens_per_minute
     return LLMClient(
         base_url=provider.base_url,
         api_key=provider.api_key,
@@ -226,6 +235,7 @@ def build_client(provider: LLMProvider, llm_config: Any):
         max_tokens=int(getattr(llm_config, "max_tokens", 900)),
         timeout=float(getattr(llm_config, "timeout_seconds", 45.0)),
         extra_headers=provider.extra_headers,
+        tokens_per_minute=budget,
     )
 
 

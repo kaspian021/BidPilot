@@ -1108,10 +1108,12 @@ class BotService:
             )
         if error:
             # a failed search must not be reported as «nothing found»
+            from .sources.discovery import friendly_llm_error
+
             return (
                 "⚠️ <b>جست‌وجوی هوشمند انجام نشد</b> — با سلکتورهای ثابت سایت ادامه دادم.\n"
-                f"<pre>{escape(error[:500])}</pre>"
-                "/test یا /llm را ببین."
+                f"{escape(friendly_llm_error(error))}\n"
+                "<i>جزئیات کامل در لاگ است؛ /test یا /llm را هم ببین.</i>"
             )
         if result is not None:
             return (

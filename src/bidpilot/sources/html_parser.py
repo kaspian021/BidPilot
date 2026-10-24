@@ -128,6 +128,28 @@ _BUDGET_RANGE_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+
+_DESCRIPTION_END_MARKERS = (
+    "مهارت‌های مورد نیاز",
+    "مهارت های مورد نیاز",
+    "مهارت‌های موردنیاز",
+    "مهارت های موردنیاز",
+    "مهارت‌ها:",
+    "مهارت ها:",
+    "سرویس‌های مرتبط",
+    "سرویس های مرتبط",
+    "خدمات مرتبط",
+    "توضیحات بیشتر",
+    "فریلنسرهایی که در این پروژه پیشنهاد ارسال کرده‌اند",
+    "آخرین پروژه‌های",
+    "آخرین پروژه های",
+    "فرصت انتخاب پیشنهادها",
+    "مشاهده‌ی پروژه",
+    "مشاهده پروژه",
+)
+
+
 def _labeled_range_budget(text: str, value_start: int) -> Budget | None:
     """Parse a nearby explicit budget range before single-amount fallbacks truncate it."""
     value_tail = text[value_start : value_start + 220]
@@ -149,26 +171,6 @@ def _labeled_range_budget(text: str, value_start: int) -> Budget | None:
     ):
         return None
     return budget
-
-
-_DESCRIPTION_END_MARKERS = (
-    "مهارت‌های مورد نیاز",
-    "مهارت های مورد نیاز",
-    "مهارت‌های موردنیاز",
-    "مهارت های موردنیاز",
-    "مهارت‌ها:",
-    "مهارت ها:",
-    "سرویس‌های مرتبط",
-    "سرویس های مرتبط",
-    "خدمات مرتبط",
-    "توضیحات بیشتر",
-    "فریلنسرهایی که در این پروژه پیشنهاد ارسال کرده‌اند",
-    "آخرین پروژه‌های",
-    "آخرین پروژه های",
-    "فرصت انتخاب پیشنهادها",
-    "مشاهده‌ی پروژه",
-    "مشاهده پروژه",
-)
 
 
 def _node_text_candidates(node: Tag) -> list[str]:

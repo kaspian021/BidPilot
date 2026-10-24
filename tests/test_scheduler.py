@@ -9,7 +9,7 @@ class FakeApp:
         self.tag = tag
         self.closed = False
         self.setup_called = False
-        self.config = SimpleNamespace(runtime=SimpleNamespace(poll_interval_seconds=60, jitter_seconds=0))
+        self.config = SimpleNamespace(runtime=SimpleNamespace(poll_interval_seconds=60, jitter_seconds=0, live=False))
 
     async def setup(self) -> None:
         self.setup_called = True

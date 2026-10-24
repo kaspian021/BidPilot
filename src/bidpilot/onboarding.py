@@ -262,16 +262,16 @@ def proxy_questions(store: SettingsStore) -> list[Question]:
     """LLM proxy — the fix when Groq answers 403 because of the user's country."""
     return [
         Question(
-            key="llm.proxy",
-            prompt="پروکسی برای هوش مصنوعی (اختیاری)",
+            key="network.proxy",
+            prompt="پروکسی برای تلگرام و هوش مصنوعی (اختیاری)",
             kind="text",
             stage="llm",
             optional=True,
             validator=validate_proxy,
             help=(
-                "اگر سرویس هوش مصنوعی ۴۰۳ (Forbidden) می‌دهد، معمولاً IP شما را بلاک کرده. "
+                "در ایران تلگرام مسدود است و Groq هم ۴۰۳ می‌دهد؛ هر دو با یک پروکسی حل می‌شوند. "
                 "آدرس پروکسی/VPN محلی را بده؛ مثلاً http://127.0.0.1:10809 "
-                "(V2Ray/Clash پورت HTTP). برای خاموش‌کردن: off"
+                "(پورت HTTP در V2Ray/Clash). برای خاموش‌کردن: off"
             ),
         )
     ]
@@ -822,16 +822,12 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
         store.update({key: value, "profile.import_pending": {"type": import_kind, "value": value}})
         reset_secret_cache()
         return
-    if key == "llm.proxy":
-        text = str(value or "").strip()
-        if text.lower() in {"off", "none", "خاموش", "بدون", "-"}:
-            store.update({"llm.proxy": None})
-            reset_secret_cache()
-            return
-        if text and "://" not in text:
-            text = "http://" + text
-        store.update({"llm.proxy": text or None})
-        reset_secret_cache()
+    if key in {"llm.proxy", "network.proxy"}:
+        # one setting for every *foreign* service (Telegram + LLM); the Iranian
+        # marketplace keeps going direct
+        from .network import set_proxy
+
+        set_proxy(store, str(value or ""))
         return
     if key == "pricing.bid_percent":
         percent = min(100, max(10, int(value)))

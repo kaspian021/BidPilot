@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -46,16 +47,81 @@ def interpreter() -> str:
     return sys.executable or "python"
 
 
-def install_command(package: str) -> str:
-    """A copy-pasteable command that targets *this* interpreter."""
+def _quoted() -> str:
     exe = interpreter()
     if " " in exe and not exe.startswith('"'):
         exe = f'"{exe}"'
-    return f"{exe} -m pip install --upgrade {package}"
+    return exe
 
 
 def uv_available() -> bool:
     return shutil.which("uv") is not None
+
+
+def has_pip() -> bool:
+    """False in a uv-created venv: ``python -m pip`` answers «No module named pip»."""
+    try:
+        return importlib.util.find_spec("pip") is not None
+    except (ImportError, ValueError):  # pragma: no cover - broken install
+        return False
+
+
+def install_command(package: str) -> str:
+    """A copy-pasteable command that targets *this* interpreter.
+
+    A venv created by ``uv`` has **no pip at all** — telling the user to run
+    ``python -m pip install …`` there fails with «No module named pip», which is
+    exactly what happened on a real Windows machine.
+    """
+    if not has_pip() and uv_available():
+        return f"uv pip install --python {_quoted()} --upgrade {package}"
+    return f"{_quoted()} -m pip install --upgrade {package}"
+
+
+def editable_commands(project_root: str | Path) -> list[list[str]]:
+    """Install *this repository* into the running interpreter, pip or not."""
+    root = str(project_root)
+    commands: list[list[str]] = []
+    if has_pip():
+        commands.append([interpreter(), "-m", "pip", "install", "-e", root])
+    uv = shutil.which("uv")
+    if uv:
+        # the normal case for a uv venv: no pip, but uv is right there
+        commands.append([uv, "pip", "install", "--python", interpreter(), "-e", root])
+    if not has_pip():
+        commands.append([interpreter(), "-m", "ensurepip", "--upgrade"])
+        commands.append([interpreter(), "-m", "pip", "install", "-e", root])
+    return commands
+
+
+def editable_install_command(project_root: str | Path) -> str:
+    """The one-line version of what ``editable_commands`` would run first."""
+    commands = editable_commands(project_root)
+    if not commands:  # pragma: no cover - pip and uv both missing
+        return f"{_quoted()} -m ensurepip --upgrade"
+    return " ".join(commands[0])
+
+
+def install_editable(project_root: str | Path, *, timeout: float = 300.0) -> tuple[bool, str]:
+    """``pip install -e <root>``, falling back to uv / ensurepip like ``install``."""
+    last = ""
+    for command in editable_commands(project_root):
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed, non-shell command
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            last = str(exc)
+            continue
+        output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+        if completed.returncode == 0 and "ensurepip" not in command:
+            return True, output[-500:]
+        last = output[-500:] or f"کد خروج {completed.returncode}"
+    return False, last
 
 
 def _pip(package: str) -> list[str]:
@@ -130,8 +196,12 @@ def ensure(module: str, *, timeout: float = 240.0) -> tuple[bool, str]:
 __all__ = [
     "DEPENDENCIES",
     "Dependency",
+    "editable_commands",
+    "editable_install_command",
     "ensure",
     "has",
+    "has_pip",
+    "install_editable",
     "install",
     "install_command",
     "interpreter",

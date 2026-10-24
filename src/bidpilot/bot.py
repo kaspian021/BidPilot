@@ -79,16 +79,27 @@ class TelegramAPI:
         client: httpx.AsyncClient | None = None,
         base_url: str = "https://api.telegram.org",
         timeout: float = 70.0,
+        proxy: str = "",
     ) -> None:
         self.token = token
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        #: api.telegram.org is blocked in Iran — a local proxy is the only way in
+        self.proxy = (proxy or "").strip()
         self._client = client
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            kwargs: dict[str, Any] = {"timeout": self.timeout}
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+            self._client = httpx.AsyncClient(**kwargs)
         return self._client
+
+    async def set_proxy(self, proxy: str) -> None:
+        """Switch the proxy without restarting the bot (closes the old client)."""
+        self.proxy = (proxy or "").strip()
+        await self.aclose()
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -299,7 +310,7 @@ class BotService:
 
     # --------------------------------------------------------------- polling
     async def run_forever(self, *, poll_timeout: int = 50) -> None:
-        me = await self.api.get_me()
+        me = await self._wait_for_telegram()
         self._log(f"bot @{me.get('username', '?')} is listening")
         await self.api.set_commands()
         offset: int | None = None
@@ -319,6 +330,43 @@ class BotService:
                     await self.handle_update(update)
                 except Exception:  # pragma: no cover - never kill the bot
                     log.exception("Failed to handle update")
+
+    async def _wait_for_telegram(self, *, attempts: int = 0) -> dict[str, Any]:
+        """Retry ``getMe`` with backoff — a VPN that is still connecting is not fatal.
+
+        The old behaviour raised on the first failure and the CLI exited with a
+        traceback, which is a terrible first impression for «اتصال برقرار نشد».
+        """
+        from .network import check_telegram
+
+        delay = 5.0
+        tries = 0
+        while True:
+            try:
+                return await self.api.get_me()
+            except BotAPIError as exc:
+                tries += 1
+                ok, detail = await check_telegram(self.api.token, proxy=self.api.proxy)
+                hint = ""
+                if not ok and "توکن" in detail:
+                    hint = (
+                        "\n🔑 توکن رد شد. توکن را از @BotFather بگیر و در settings بگذار "
+                        "(bidpilot settings set telegram.bot_token -v <TOKEN>)."
+                    )
+                else:
+                    hint = (
+                        "\n🔌 اتصال به api.telegram.org برقرار نشد. در ایران تلگرام بدون "
+                        "VPN/پروکسی در دسترس نیست. VPN را روشن کن و آدرس پروکسی محلی را با "
+                        "/proxy بده (یا: bidpilot settings set network.proxy http://127.0.0.1:10809)."
+                    )
+                self._last_send_error = str(exc)
+                # WARNING (not INFO) on purpose: a dead connection must be visible
+                # in the console of a user who never reads logs.
+                log.warning("getMe failed (%s): %s%s", tries, exc, hint)
+                if attempts and tries >= attempts:
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.6, 60.0)
 
     # --------------------------------------------------------------- updates
     async def handle_update(self, update: dict[str, Any]) -> None:
@@ -1007,11 +1055,15 @@ class BotService:
             text += "\n\n<b>باقی‌مانده:</b>\n" + "\n".join(f"• {escape(s)}" for s in steps)
         text += "\n\n" + tone_summary(self.store)
 
+        from .network import proxy_from_store
+
+        proxy = proxy_from_store(self.store)
+        text += "\n🔌 پروکسی: " + (f"<code>{escape(proxy)}</code>" if proxy else "تنظیم نشده (مستقیم)")
         if self._last_send_error:
             text += (
                 "\n⚠️ آخرین ارسال به تلگرام ناموفق بود ("
                 + escape(self._last_send_error[:120])
-                + ") — اتصال/VPN را بررسی کن."
+                + ") — VPN/پروکسی را بررسی کن: /proxy"
             )
 
         from .runtime_info import install_info
@@ -1080,6 +1132,66 @@ class BotService:
             {"inline_keyboard": [[{"text": "🔁 تلاش دوباره", "callback_data": "profile:retry"}]]},
         )
 
+    async def _apply_proxy_and_check(self, chat_id: str) -> None:
+        """Save the proxy, reconnect Telegram through it, then prove it works."""
+        from .network import diagnose, proxy_from_store
+
+        proxy = proxy_from_store(self.store)
+        setter = getattr(self.api, "set_proxy", None)
+        if setter is not None:
+            await setter(proxy)  # next request builds a client with the new proxy
+        if proxy:
+            await self.send(
+                chat_id,
+                f"🔌 پروکسی ذخیره شد: <code>{escape(proxy)}</code>\n"
+                "دارم تلگرام و هوش مصنوعی را با همین پروکسی تست می‌کنم…",
+            )
+        else:
+            await self.send(chat_id, "✅ پروکسی خاموش شد؛ مستقیم وصل می‌شوم. دارم تست می‌کنم…")
+
+        reach = await diagnose(
+            token=str(getattr(self.api, "token", "") or ""),
+            llm_check=self._llm_probe(),
+            proxy=proxy,
+        )
+        await self.send(chat_id, reach.summary())
+        if reach.telegram:
+            await self.send(chat_id, "✅ از این به بعد ربات از همین مسیر وصل می‌شود.")
+        else:
+            await self.send(
+                chat_id,
+                "❌ هنوز تلگرام در دسترس نیست. اگر VPN روشن است، پورت پروکسی‌اش را چک کن "
+                "(V2Ray/Clash پورت HTTP، مثلاً 10809) و دوباره /proxy بزن.",
+                {"inline_keyboard": [[{"text": "🔁 تست دوباره", "callback_data": "llm:test"}]]},
+            )
+
+    def _llm_probe(self):
+        """A callable ``diagnose`` can await: is the model reachable right now?"""
+
+        async def probe() -> tuple[bool, str]:
+            provider = str(self.store.get("llm.provider") or "groq")
+            key = self.store.get("llm.api_key") or self.store.get(f"llm.keys.{provider}")
+            if not key:
+                return False, "کلید تنظیم نشده (/llm)"
+            from .llm_providers import get_preset, is_reasoning_model, verify_provider
+
+            preset = get_preset(provider)
+            model = str(self.store.get("llm.model") or preset.model)
+            ok, message = await verify_provider(
+                LLMProvider(
+                    id=preset.id,
+                    base_url=str(self.store.get("llm.base_url") or preset.base_url),
+                    model=model,
+                    api_key=str(key),
+                    extra_headers=dict(preset.extra_headers),
+                ),
+                proxy=str(self.store.get("network.proxy") or self.store.get("llm.proxy") or ""),
+                reasoning_effort="low" if is_reasoning_model(model) else "",
+            )
+            return ok, message
+
+        return probe
+
     async def _cmd_settings(self, chat_id: str) -> None:
         rows = self.store.masked_items()
         if not rows:
@@ -1101,9 +1213,10 @@ class BotService:
             return
         await self.send(chat_id, "⏳ در حال تست کلید هوش مصنوعی…")
         from .llm_providers import is_reasoning_model
+        from .network import proxy_from_store
 
         model = str(self.store.get("llm.model") or preset.model)
-        proxy = str(self.store.get("llm.proxy") or "")
+        proxy = proxy_from_store(self.store)
         ok, message = await verify_provider(
             LLMProvider(
                 id=preset.id,
@@ -1427,15 +1540,7 @@ class BotService:
             )
             return
         if flow.name == "proxy":
-            proxy = str(self.store.get("llm.proxy") or "")
-            if not proxy:
-                await self.send(chat_id, "✅ پروکسی خاموش شد؛ مستقیم وصل می‌شوم.")
-                return
-            await self.send(
-                chat_id,
-                f"🔌 پروکسی ذخیره شد: <code>{escape(proxy)}</code>\nدارم با همین پروکسی تست می‌کنم…",
-            )
-            await self._cmd_test(chat_id)
+            await self._apply_proxy_and_check(chat_id)
             return
         if flow.name == "mode":
             live = str(self.store.get("runtime.submit_mode")) == "live"
@@ -1538,7 +1643,9 @@ def build_bot(
             "  bidpilot setup            # راه‌اندازی گام‌به‌گام\n"
             "  bidpilot settings set telegram.bot_token <TOKEN>"
         )
-    api = TelegramAPI(str(token))
+    from .network import proxy_from_store
+
+    api = TelegramAPI(str(token), proxy=proxy_from_store(store))
     return BotService(store, api, config_path=config_path)
 
 

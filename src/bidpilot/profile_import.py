@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -33,6 +32,7 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from .jsonparse import parse_json_object
 from .llm_providers import LLMProvider, resolve_chain
 from .settings_store import SettingsStore
 
@@ -421,27 +421,6 @@ async def _llm_extract(
     finally:
         await client.aclose()
     return parse_json_object(response.text)
-
-
-def parse_json_object(raw: str) -> dict[str, Any] | None:
-    """Pull the first JSON object out of an LLM answer (fences, chatter, …)."""
-    text = str(raw or "").strip()
-    if not text:
-        return None
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    candidates = [fenced.group(1)] if fenced else []
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(text[start : end + 1])
-    for candidate in candidates:
-        try:
-            data = json.loads(candidate)
-        except ValueError:
-            continue
-        if isinstance(data, dict):
-            return data
-    return None
 
 
 def clean_fields(payload: dict[str, Any], *, hints: dict[str, Any] | None = None) -> dict[str, Any]:

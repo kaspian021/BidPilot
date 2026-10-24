@@ -88,6 +88,46 @@ def to_persian_digits(text: str) -> str:
     return text.translate({ord(a): p for a, p in zip(_ASCII_DIGITS, PERSIAN_DIGITS, strict=False)})
 
 
+#: how many days each duration unit means
+_DURATION_UNITS = {
+    "روز": 1,
+    "روزه": 1,
+    "روزه‌ای": 1,
+    "day": 1,
+    "days": 1,
+    "هفته": 7,
+    "هفته‌ای": 7,
+    "week": 7,
+    "weeks": 7,
+    "ماه": 30,
+    "ماهه": 30,
+    "ماهه‌ای": 30,
+    "month": 30,
+    "months": 30,
+}
+
+
+def parse_days(text: str | None) -> int | None:
+    """Read a delivery time out of free text ("۱۰ روز"، "۲ هفته"، "1 ماه").
+
+    Returns ``None`` when the text has no usable duration — the caller then keeps
+    its own default instead of guessing for the employer.
+    """
+    if not text:
+        return None
+    cleaned = to_ascii_digits(str(text)).lower()
+    match = re.search(
+        r"(\d{1,3})\s*(?:تا\s*\d{1,3}\s*)?"
+        r"(روز|روزه|روزه‌ای|هفته|هفته‌ای|ماه|ماهه|ماهه‌ای|days?|weeks?|months?)",
+        cleaned,
+    )
+    if match:
+        number, unit = int(match.group(1)), match.group(2)
+        days = number * _DURATION_UNITS.get(unit, 1)
+        return days if 0 < days <= 365 else None
+    return None
+
+
 def count_emoji(text: str) -> int:
     """Rough emoji counter (works for the ranges clients actually use)."""
     import unicodedata

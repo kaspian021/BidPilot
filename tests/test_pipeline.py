@@ -256,3 +256,51 @@ async def test_llm_failure_reason_reaches_the_report(tmp_path):
 
     assert "429 rate limit" in report.llm_error
     await application.close()
+
+
+async def test_employer_deadline_shortens_the_offer(tmp_path):
+    """If the employer asks for 5 days, we never promise 14."""
+    config = make_config(tmp_path, submit_mode="dry_run")
+    config.sources = [
+        SourceConfig(
+            type="mock",
+            settings={
+                "projects": [
+                    {
+                        "external_id": "9",
+                        "title": "ساخت اپلیکیشن Flutter",
+                        "description": "فروشگاه موبایل",
+                        "budget": {"min": 2_000_000, "max": 4_000_000},
+                        "skills": ["Flutter"],
+                        "employer_deadline": "۵ روز",
+                    }
+                ],
+                "latency": 0,
+            },
+        )
+    ]
+    config.pricing = {**config.pricing, "delivery_days": 14}
+    application, notifier = await build_app(config)
+    report = (await application.cycle())[0]
+
+    assert report.dry_run == 1 and report.proposed
+    bid = notifier.kinds(EventKind.BID_DRY_RUN)[0].bid
+    assert bid is not None and bid.delivery_days == 5
+    assert "۵ روز" in bid.proposal.text or "5 روز" in bid.proposal.text
+    await application.close()
+
+
+async def test_digest_reports_ai_discovery_pages(tmp_path):
+    config = make_digest_config(tmp_path, submit_mode="dry_run")
+    application, notifier = await build_app(config)
+    for source in application.sources.values():
+        from bidpilot.sources.discovery import DiscoveryResult
+
+        source.last_discovery = DiscoveryResult(pages_read=7, llm_calls=9)
+
+    await application.cycle()
+
+    digest = notifier.kinds(EventKind.DIGEST)[0].body
+    assert "جست‌وجوی هوشمند" in digest
+    assert "7" in digest
+    await application.close()

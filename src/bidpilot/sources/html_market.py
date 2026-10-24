@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -28,9 +29,18 @@ from bs4 import BeautifulSoup
 
 from ..config import AppConfig, Secrets
 from ..credentials import SiteCredentials, site_credentials
+from ..llm_providers import build_client, resolve_chain
 from ..models import Project, Proposal, SubmissionResult, SubmissionStatus
 from . import html_parser as parser
 from .base import Source, SourceError
+from .discovery import (
+    MAX_DETAIL_PAGES,
+    MAX_PROJECTS,
+    MAX_STEPS,
+    DiscoveryAgent,
+    DiscoveryError,
+    DiscoveryResult,
+)
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +81,14 @@ class HtmlMarketSource(Source):
         if not merged.get("base_url") and self.default_base_url:
             merged["base_url"] = self.default_base_url
         super().__init__(merged, config, secrets, client)
+        #: what the AI discovery did on the last run (shown by /preview and the digest)
+        self.last_discovery: DiscoveryResult | None = None
+        self.last_discovery_error: str = ""
+        self._llm_clients: list[Any] = []
+        #: the last AI discovery, reused for a while so a 2-minute poll loop
+        #: cannot burn a free tier with the same pages over and over
+        self._last_projects: list[Project] = []
+        self._last_fetch_at: float = 0.0
         legacy = secrets.model_dump() if hasattr(secrets, "model_dump") else {}
         self.credentials: SiteCredentials = site_credentials(
             self.name,
@@ -208,8 +226,88 @@ class HtmlMarketSource(Source):
             )
         return True, f"{len(projects)} پروژه در صفحه اول پیدا شد."
 
+    # -------------------------------------------------------- AI discovery
+    def discovery_settings(self) -> dict[str, Any]:
+        cfg = self.settings.get("discovery")
+        return cfg if isinstance(cfg, dict) else {}
+
+    def discovery_mode(self) -> str:
+        mode = str(self.discovery_settings().get("mode") or "auto").strip().lower()
+        return mode if mode in {"ai", "selectors", "auto", "off"} else "auto"
+
+    def _discovery_providers(self) -> list[Any]:
+        """The same free-provider chain the proposals use (key required)."""
+        llm = self.config.llm
+        if not getattr(llm, "enabled", False):
+            return []
+        try:
+            return resolve_chain(llm, self.secrets.llm_keys, self.secrets.llm_api_key)
+        except Exception as exc:  # broken llm config must not break fetching
+            log.debug("%s: no discovery provider (%s)", self.name, exc)
+            return []
+
+    def ai_discovery_enabled(self) -> bool:
+        if self.discovery_mode() in {"selectors", "off"}:
+            return False
+        return bool(self._discovery_providers())
+
+    async def _discover_with_ai(self) -> list[Project]:
+        """Let the model read the site (inside this account) and bring back projects."""
+        providers = self._discovery_providers()
+        if not providers:
+            raise DiscoveryError("هوش مصنوعی برای جست‌وجو در سایت تنظیم نشده است.")
+        cfg = self.discovery_settings()
+        failures: list[str] = []
+        for provider in providers:
+            client = build_client(provider, self.config.llm)
+            self._llm_clients.append(client)
+            agent = DiscoveryAgent(
+                source_name=self.name,
+                base_url=self.base_url,
+                fetch=self.get_html,
+                llm=client,
+                profile=self.config.profile,
+                brief=str(cfg.get("brief") or ""),
+                seed_paths=[str(p) for p in (cfg.get("seed_paths") or ["/"])],
+                max_steps=int(cfg.get("max_steps") or MAX_STEPS),
+                max_detail_pages=int(cfg.get("max_detail_pages") or MAX_DETAIL_PAGES),
+                max_projects=int(cfg.get("max_projects") or MAX_PROJECTS),
+                page_delay=float(cfg.get("page_delay_seconds") or 0),
+            )
+            try:
+                result = await agent.discover()
+            except Exception as exc:
+                failures.append(f"{provider.id}: {exc}")
+                log.warning("%s: AI discovery via %s failed: %s", self.name, provider.id, exc)
+                continue
+            self.last_discovery = result
+            if result.projects:
+                self.last_discovery_error = ""
+                return result.projects
+            failures.append(f"{provider.id}: هیچ پروژه‌ای پیدا نشد")
+        self.last_discovery_error = "؛ ".join(failures) or "جست‌وجوی هوشمند نتیجه نداد"
+        raise DiscoveryError(self.last_discovery_error)
+
     # ------------------------------------------------------------- fetching
     async def fetch_projects(self) -> list[Project]:
+        if self.ai_discovery_enabled():
+            cfg = self.discovery_settings()
+            reuse = float(cfg.get("reuse_seconds", 600) or 0)
+            if self._last_projects and (time.monotonic() - self._last_fetch_at) < reuse:
+                log.debug("%s: reusing the last AI discovery (%ss old)", self.name, reuse)
+                return list(self._last_projects)
+            try:
+                found = await self._discover_with_ai()
+                found.sort(key=lambda p: (p.published_at is not None, p.published_at), reverse=True)
+                log.info("%s: %s projects discovered by AI", self.name, len(found))
+                self._last_projects = list(found)
+                self._last_fetch_at = time.monotonic()
+                return found
+            except Exception as exc:
+                # the model is a helper, not a single point of failure
+                log.warning("%s: AI discovery failed (%s); using selectors", self.name, exc)
+                self.last_discovery_error = str(exc)
+
         list_cfg = self.settings.get("list") or {}
         path = list_cfg.get("path", "/")
         page_param = list_cfg.get("page_param", "page")
@@ -331,6 +429,15 @@ class HtmlMarketSource(Source):
             http_status=response.status_code,
             payload_debug={"action": action, "fields": sorted(payload)},
         )
+
+    async def aclose(self) -> None:  # type: ignore[override]
+        for client in self._llm_clients:
+            try:
+                await client.aclose()
+            except Exception:  # pragma: no cover - closing must never raise
+                pass
+        self._llm_clients.clear()
+        await super().aclose()
 
 
 def _hidden_inputs(html: str) -> dict[str, str]:

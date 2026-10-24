@@ -69,7 +69,14 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    async def complete(self, system: str, user: str, *, max_tokens: int | None = None) -> LLMResponse:
+    async def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int | None = None,
+        response_format: dict | None = None,
+    ) -> LLMResponse:
         payload = {
             "model": self.model,
             "temperature": self.temperature,
@@ -79,6 +86,8 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
         }
+        if response_format:
+            payload["response_format"] = response_format
         client = await self._get_client()
         last_error: Exception | None = None
         started = time.monotonic()

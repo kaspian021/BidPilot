@@ -66,6 +66,8 @@ class Project(BaseModel):
     skills: list[str] = Field(default_factory=list)
     category: str | None = None
     employer: str | None = None
+    #: the delivery time the employer asked for ("۱۰ روز", "۲ هفته") — never invented
+    employer_deadline: str = ""
     published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=utcnow)
     raw: dict = Field(default_factory=dict)
@@ -83,6 +85,8 @@ class Project(BaseModel):
             parts.append(f"مهارت‌های مورد نیاز: {', '.join(self.skills)}")
         if self.budget:
             parts.append(f"بودجه کارفرما: {self.budget.as_text()}")
+        if self.employer_deadline:
+            parts.append(f"زمان تحویل اعلامی کارفرما: {self.employer_deadline}")
         if self.description:
             parts.append(f"توضیحات کارفرما:\n{self.description}")
         return "\n".join(parts)

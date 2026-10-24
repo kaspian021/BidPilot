@@ -1036,6 +1036,148 @@ def inspect(
     _run(main())
 
 
+@app.command()
+def explore(
+    site: str | None = typer.Option(None, "--site", "-s", help="سایت (پیش‌فرض: سایت فعال)"),
+    limit: int = typer.Option(6, "--limit", "-n", help="چند پروژه نشان داده شود"),
+    propose: bool = typer.Option(
+        False, "--propose/--no-propose", help="برای پروژه‌ی اول، پیشنهاد هم بساز (بدون ارسال)"
+    ),
+    config: str = CONFIG_OPTION,
+) -> None:
+    """تماشای جست‌وجوی هوش مصنوعی داخل سایت — بدون تلگرام و بدون ارسال پیشنهاد.
+
+    مدل از صفحه‌ی اصلی شروع می‌کند، فهرست‌ها را خودش پیدا می‌کند و صفحه‌ی پروژه‌ها را
+    می‌خواند. اینجا دقیقاً می‌بینی چه آدرس‌هایی باز شد و از هر پروژه چه چیزی برداشت شد.
+
+    مثال:
+      bidpilot explore
+      bidpilot explore -s ponisha --propose
+    """
+
+    async def main() -> None:
+        from .config import SourceConfig
+
+        cfg = _load(config)
+        store = get_store()
+        active = site or _active_site(store)
+        if not active:
+            raise typer.BadParameter("سایت فعالی تنظیم نشده است: /market یا --site")
+        if active not in available_sources():
+            raise typer.BadParameter(
+                f"سایت «{active}» ثبت نشده است. یکی از: {', '.join(available_sources())}"
+            )
+        entry = cfg.source(active)
+        if entry is None:
+            cfg.sources = [*cfg.sources, SourceConfig(type=active, settings={})]
+        elif not entry.enabled:
+            entry.enabled = True  # «explore -s X» یعنی همان حالا X را ببین
+
+        application = build_application(cfg)
+        try:
+            await application.db.init()
+            if active not in application.sources:
+                raise typer.BadParameter(
+                    f"سایت «{active}» ساخته نشد؛ لاگ را ببین. سایت‌های آماده: "
+                    f"{', '.join(application.sources) or '—'}"
+                )
+            source = application.sources[active]
+            mode = getattr(source, "discovery_mode", lambda: "off")()
+            console.print(
+                f"[bold]🌐 {escape(site_label(active))}[/bold] — "
+                f"حالت جست‌وجو: [cyan]{escape(str(mode))}[/cyan]"
+            )
+            if mode == "selectors" or mode == "off":
+                console.print(
+                    "[yellow]کلید AI پیدا نشد یا جست‌وجوی هوشمند خاموش است؛ "
+                    "سلکتورهای ثابت سایت خوانده می‌شوند.[/yellow]"
+                )
+            else:
+                console.print("[dim]مدل دارد داخل سایت می‌گردد… (۲۰ تا ۶۰ ثانیه)[/dim]")
+            projects = await source.fetch_projects()
+
+            result = getattr(source, "last_discovery", None)
+            error = str(getattr(source, "last_discovery_error", "") or "")
+            if result is not None:
+                console.print(
+                    f"\n🧭 [bold]{result.pages_read}[/bold] صفحه خوانده شد · "
+                    f"[bold]{len(projects)}[/bold] پروژه پیدا شد · "
+                    f"[bold]{result.llm_calls}[/bold] درخواست به مدل"
+                )
+                for url in result.visited:
+                    console.print(f"  • {escape(url)}")
+                for note in result.notes:
+                    console.print(f"  [dim]↳ {escape(note)}[/dim]")
+            elif error:
+                console.print(f"\n[red]❌ جست‌وجوی هوشمند شکست خورد:[/red] {escape(error[:800])}")
+                console.print("[dim]با سلکتورهای ثابت ادامه داده شد.[/dim]")
+            else:
+                console.print("\n[dim]خروجی از سلکتورهای CSS آمد (بدون مدل).[/dim]")
+
+            if not projects:
+                console.print("\n[yellow]هیچ پروژه‌ای برنگشت.[/yellow]")
+                return
+
+            table = Table(title=f"پروژه‌ها — {site_label(active)}")
+            table.add_column("#", justify="right")
+            table.add_column("عنوان")
+            table.add_column("بودجه‌ی کارفرما")
+            table.add_column("مهلت")
+            table.add_column("لینک", overflow="fold")
+            for index, project in enumerate(projects[:limit], start=1):
+                budget = (
+                    f"{project.budget.lower:,} تا {project.budget.upper:,} تومان"
+                    if project.budget and project.budget.is_known
+                    else "—"
+                )
+                table.add_row(
+                    str(index),
+                    escape(project.title[:60]),
+                    escape(budget),
+                    escape(project.employer_deadline or "—"),
+                    escape(project.url),
+                )
+            console.print(table)
+
+            if propose:
+                from .text import parse_days
+
+                generator = application.generator
+                if generator is None:  # pragma: no cover - always built
+                    console.print("[red]تولیدکننده‌ی پیشنهاد ساخته نشد.[/red]")
+                    return
+
+                project = projects[0]
+                delivery = int(cfg.pricing.get("delivery_days", 14))
+                hint = parse_days(project.employer_deadline)
+                if hint:
+                    delivery = min(delivery, hint)
+                pricing = PricingConfig(**cfg.pricing).build()
+                price = pricing.price(project, project.budget)
+                if price is None:
+                    console.print("[yellow]برای این پروژه بودجه‌ی مشخصی نیست؛ پیشنهاد ساخته نشد.[/yellow]")
+                    return
+                proposal = await generator.generate(project, price.amount, delivery)
+                console.print(
+                    Panel(
+                        escape(proposal.text),
+                        title=f"پیشنهاد آزمایشی | {escape(project.title)}",
+                        subtitle=f"{proposal.generated_by} · {price.amount:,} تومان · {delivery} روز",
+                        border_style="cyan",
+                    )
+                )
+                reason = str(getattr(generator, "last_llm_error", "") or "")
+                if reason:
+                    console.print(
+                        f"[yellow]⚠️ مدل جواب نداد؛ متن از قالب ساخته شد: {escape(reason[:400])}[/yellow]"
+                    )
+                _mark_safe_test("dry_run")
+        finally:
+            await application.close()
+
+    _run(main())
+
+
 # ------------------------------------------------------------------- telegram
 @app.command("go-live")
 def go_live(

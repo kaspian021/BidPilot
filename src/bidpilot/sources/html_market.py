@@ -258,26 +258,50 @@ class HtmlMarketSource(Source):
         candidates = [auth.get("check_path") or "/"]
         if candidates[0] != "/":
             candidates.append("/")  # a guessed dashboard path must not be fatal
+        client = await self.client()
         for path in dict.fromkeys(candidates):
             try:
-                html = await self.get_html(path)
-                break
+                response = await client.get(path)
             except Exception as exc:
-                errors.append(f"{path}: {exc}")
+                errors.append(f"{path}: {type(exc).__name__}")
+                continue
+
+            final_path = urlsplit(str(response.url)).path.casefold()
+            log.info(
+                "[AUTH][VERIFY-RESPONSE] source=%s requested_path=%s status=%s "
+                "final_path=%s html_chars=%s",
+                self.name,
+                urlsplit(str(path)).path,
+                response.status_code,
+                final_path,
+                len(response.text or ""),
+            )
+            if response.status_code in (401, 403) or re.search(
+                r"/(?:login|signin|sign-in)(?:/|$)", final_path
+            ):
+                return False, "سایت به صفحه‌ی ورود هدایت کرد یا دسترسی را رد کرد؛ کوکی پارس‌کدرز را در «/market» به‌روز کن."
+            if response.status_code >= 400:
+                errors.append(f"{path}: HTTP {response.status_code}")
+                continue
+            html = response.text
+            break
         if not html:
             return False, "صفحه‌ی بررسی باز نشد: " + "؛ ".join(errors[:2])
 
         lowered = (html or "").casefold()
         logged_in = [str(m).casefold() for m in (auth.get("logged_in_markers") or []) if m]
         login_only = [str(m).casefold() for m in (auth.get("login_markers") or []) if m]
+        has_logged_in_marker = bool(logged_in and any(marker in lowered for marker in logged_in))
+        has_login_marker = bool(login_only and any(marker in lowered for marker in login_only))
 
-        if logged_in and any(marker in lowered for marker in logged_in):
+        if has_logged_in_marker:
             return True, "وارد حساب کاربری شدیم ✅"
-        if login_only and any(marker in lowered for marker in login_only):
-            if not (logged_in and any(marker in lowered for marker in logged_in)):
-                return False, "سایت صفحه‌ی ورود نشان داد؛ کوکی منقضی شده است — «/market» را بزن."
+        if has_login_marker:
+            return False, "سایت صفحه‌ی ورود نشان داد؛ کوکی منقضی شده است — «/market» را بزن."
         if _looks_like_login_page(html, auth):
             return False, "سایت فرم ورود نشان داد؛ کوکی/رمز معتبر نیست — «/market» را بزن."
+        if auth.get("require_auth_markers"):
+            return False, "صفحه باز شد، اما نشانه‌ی مشخص ورود به حساب پیدا نشد؛ برای جلوگیری از ارسال اشتباه، کوکی را در «/market» دوباره ثبت و سپس «/test» را اجرا کن."
         return True, "صفحه باز شد و نشانه‌ی «ورود لازم است» نداشت (وضعیت قطعی نیست)."
 
     # -------------------------------------------------------------- health
@@ -660,9 +684,22 @@ class HtmlMarketSource(Source):
 
         form, payload = parser.find_bid_form(page.text, bid_cfg)
         if form is None:
+            login_link = parser.find_proposal_login_link(page.text, str(page.url))
+            if login_link:
+                log.warning(
+                    "[BID][LOGIN-GATED] source=%s id=%s proposal_action_path=%s",
+                    self.name,
+                    project.external_id,
+                    login_link,
+                )
+                return self.fail(
+                    "لینک «ارسال پیشنهاد» در صفحه به مسیر ورود هدایت می‌شود؛ "
+                    "نشست فعلی به‌عنوان واردشده تأیید نشد. کوکی پارس‌کدرز را در «/market» "
+                    "دوباره ثبت کن و با «/test» بررسی کن."
+                )
             return self.fail(
                 "صفحهٔ پروژه دریافت شد، اما فرم HTML ارسال پیشنهاد شناسایی نشد؛ "
-                "ساختار صفحه، فرمِ ساخته‌شده با JavaScript یا صفحهٔ ورود/محدودیت شبکه باید بررسی شود."
+                "جزئیات فرم و لینک‌های ارسال در لاگ [BID][FORM-NOT-FOUND] ثبت شده‌اند."
             )
 
         mapping = parser.map_bid_fields(form, bid_cfg)

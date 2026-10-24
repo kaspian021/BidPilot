@@ -229,7 +229,8 @@ def parse_project_card(
     if not title and not link:
         return None
 
-    budget_text = _text(card, fields.get("budget"))
+    budget_selector_text = _text(card, fields.get("budget"))
+    budget_text = budget_selector_text
     budget = _parse_amount(budget_text)
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(card, fields.get("skills"))]
     description = _text(card, fields.get("description"))
@@ -243,11 +244,12 @@ def parse_project_card(
 
     log.info(
         "[PARSER][CARD] source=%s id=%s title=%r url=%s budget_selector_text=%r "
-        "budget_final={%s} skills=%r category=%r employer=%r",
+        "budget_text_used=%r budget_final={%s} skills=%r category=%r employer=%r",
         source_name,
         external_id,
         title,
         link,
+        budget_selector_text,
         budget_text,
         _budget_debug(budget),
         [s for s in skills if s][:12],

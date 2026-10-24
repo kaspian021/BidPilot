@@ -1,0 +1,191 @@
+"""Start/stop the live bidder from Telegram.
+
+The bot used to only *configure* things: the actual polling loop was a CLI
+command you had to open a second terminal for. Now ``🚀 شروع فعالیت`` in the
+chat starts the very same :class:`bidpilot.scheduler.Scheduler` in-process, and
+``/stop`` pauses it — with a report to the owner after the first cycle.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from .app import Application, build_application
+from .config import load_config
+from .scheduler import Scheduler
+from .settings_store import SettingsStore
+
+log = logging.getLogger(__name__)
+
+Notify = Callable[[str], Awaitable[Any]]
+
+
+@dataclass
+class RunSummary:
+    cycles: int = 0
+    fetched: int = 0
+    submitted: int = 0
+    dry_run: int = 0
+    skipped: int = 0
+    failed: int = 0
+    started_at: datetime | None = None
+    last_cycle_at: datetime | None = None
+    last_error: str = ""
+
+    def add(self, reports: list[Any]) -> None:
+        self.cycles += 1
+        self.last_cycle_at = datetime.now(timezone.utc)
+        for report in reports or []:
+            self.fetched += int(getattr(report, "fetched", 0) or 0)
+            self.submitted += int(getattr(report, "submitted", 0) or 0)
+            self.dry_run += int(getattr(report, "dry_run", 0) or 0)
+            self.skipped += int(getattr(report, "skipped", 0) or 0)
+            self.failed += int(getattr(report, "failed", 0) or 0)
+
+    @property
+    def running_for(self) -> str:
+        if self.started_at is None:
+            return ""
+        seconds = int((datetime.now(timezone.utc) - self.started_at).total_seconds())
+        minutes, seconds = divmod(max(0, seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours} ساعت و {minutes} دقیقه"
+        if minutes:
+            return f"{minutes} دقیقه"
+        return f"{seconds} ثانیه"
+
+
+@dataclass
+class Automation:
+    """Owns the background task that polls the marketplace and sends bids."""
+
+    store: SettingsStore
+    config_path: str = "config/config.yaml"
+    notify: Notify | None = None
+    interval: int | None = None
+    sources: list[str] | None = None
+    summary: RunSummary = field(default_factory=RunSummary)
+    _task: asyncio.Task | None = None
+    _app: Application | None = None
+    _scheduler: Scheduler | None = None
+    _notified_first_cycle: bool = False
+
+    # ------------------------------------------------------------------ state
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def _say(self, text: str) -> None:
+        if self.notify is None:
+            return
+        try:
+            await self.notify(text)
+        except Exception as exc:  # pragma: no cover - network
+            log.warning("Could not notify owner: %s", exc)
+
+    # ------------------------------------------------------------------ start
+    async def start(self) -> tuple[bool, str]:
+        if self.running:
+            return False, "رصد از قبل در حال اجراست."
+        try:
+            cfg = load_config(self.config_path, store=self.store)
+            app = build_application(cfg)
+            await app.setup()
+        except Exception as exc:
+            log.exception("Could not start automation")
+            return False, f"برنامه ساخته نشد: {exc}"
+
+        def make_app() -> Application:
+            return build_application(load_config(self.config_path, store=self.store))
+
+        self._app = app
+        self._scheduler = Scheduler(
+            app,
+            interval=self.interval,
+            sources=self.sources,
+            app_factory=make_app,
+            store=self.store,
+            on_report=self._on_report,
+        )
+        self.summary = RunSummary(started_at=datetime.now(timezone.utc))
+        self._notified_first_cycle = False
+        self._task = asyncio.create_task(self._scheduler.run_forever(), name="bidpilot-runner")
+        mode = "واقعی 🔴" if cfg.runtime.live else "آزمایشی 🧪"
+        return True, f"رصد شروع شد — حالت {mode}، هر {self._scheduler.interval} ثانیه."
+
+    # ------------------------------------------------------------------- stop
+    async def stop(self) -> tuple[bool, str]:
+        if not self.running:
+            return False, "الان چیزی در حال اجرا نیست."
+        assert self._scheduler is not None
+        self._scheduler.request_stop()
+        task = self._task
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=30)  # type: ignore[arg-type]
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        await self._shutdown_app()
+        return True, "رصد متوقف شد."
+
+    async def _shutdown_app(self) -> None:
+        self._task = None
+        self._scheduler = None
+        app, self._app = self._app, None
+        if app is not None:
+            try:
+                await app.close()
+            except Exception:  # pragma: no cover
+                pass
+
+    # ---------------------------------------------------------------- reports
+    async def _on_report(self, reports: list[Any]) -> None:
+        self.summary.add(reports)
+        if not self._notified_first_cycle:
+            self._notified_first_cycle = True
+            await self._say(self.first_cycle_text())
+            return
+        if self.summary.submitted:
+            await self._say(self.status_text())
+
+    def first_cycle_text(self) -> str:
+        summary = self.summary
+        lines = ["✅ <b>اولین بررسی انجام شد.</b>"]
+        lines.append(f"🔎 {summary.fetched} پروژه بررسی شد.")
+        if summary.dry_run:
+            lines.append(f"🧪 {summary.dry_run} پیشنهاد ساخته شد (ارسال نشد — حالت آزمایشی).")
+        if summary.submitted:
+            lines.append(f"📨 {summary.submitted} پیشنهاد ارسال شد.")
+        if not summary.fetched:
+            lines.append("پروژه‌ی جدیدی پیدا نشد؛ دور بعد دوباره بررسی می‌شود.")
+        lines.append("")
+        lines.append("برای توقف: /stop — وضعیت: /status")
+        return "\n".join(lines)
+
+    def status_text(self) -> str:
+        summary = self.summary
+        if not self.running:
+            head = "⏸ رصد متوقف است."
+            if summary.cycles:
+                head += f" (آخرین اجرا: {summary.cycles} دور)"
+            return head + "\nبرای شروع: /run"
+        return (
+            "🚀 <b>رصد در حال اجراست</b>\n"
+            f"⏱ {summary.running_for} | {summary.cycles} دور\n"
+            f"🔎 {summary.fetched} پروژه | 📨 {summary.submitted} ارسال | "
+            f"🧪 {summary.dry_run} آزمایشی\n"
+            "توقف: /stop"
+        )
+
+
+__all__ = ["Automation", "RunSummary"]

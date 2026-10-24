@@ -204,6 +204,11 @@ def _print_settings_status(store: SettingsStore, *, reveal: bool = False) -> Non
     )
     table.add_row("لحن", state["tone"] or "—")
     table.add_row("دستورهای سبک", "ثبت شده" if state["style"] else "—")
+    table.add_row(
+        "پروفایل",
+        f"✅ {store.get('profile.full_name')}" if store.get("profile.full_name") else "❌ وارد نشده",
+    )
+    table.add_row("قیمت پیشنهادی", f"{state['bid_percent']}٪ بودجه‌ی کارفرما")
     table.add_row("حالت ارسال", "واقعی" if state["mode"] == "live" else "آزمایشی")
     table.add_row("راه‌اندازی", "کامل" if state["setup_completed"] else "ناتمام")
     console.print(table)
@@ -237,7 +242,6 @@ def bot(
         from .bot import BotAPIError, build_bot
 
         store = get_store()
-        cfg = _load(config)
         token = get_secrets().telegram_bot_token or store.get("telegram.bot_token")
         if not token:
             console.print(
@@ -248,24 +252,19 @@ def bot(
             raise typer.Exit(code=1)
 
         service = build_bot(str(token), store=store, config_path=config)
-        application = None
-        scheduler = None
+        automation = service.automation
+        automation.interval = interval
+        automation.sources = source
         tasks = [asyncio.create_task(service.run_forever(), name="telegram-bot")]
         if with_runner:
-            application = build_application(cfg)
-            await application.setup()
-            from .scheduler import Scheduler
-
-            def make_app():
-                return build_application(load_config(config))
-
-            scheduler = Scheduler(application, interval=interval, sources=source, app_factory=make_app)
-            tasks.append(asyncio.create_task(scheduler.run_forever(), name="scheduler"))
-            console.print("[green]ربات و رصد خودکار هر دو فعال شدند.[/green]")
+            ok, message = await automation.start()
+            console.print(("[green]" if ok else "[red]") + message + "[/]")
         else:
             console.print(
-                "[green]ربات فعال شد.[/green] در تلگرام /start را بزن. "
-                "برای رصد خودکار: [bold]bidpilot run[/bold] یا [bold]bidpilot bot --run[/bold]"
+                "[green]ربات فعال شد.[/green] در تلگرام /start را بزن؛ "
+                "برای شروع ارسال پیشنهادها دکمه‌ی [bold]🚀 شروع فعالیت[/bold] (یا /run) را بزن. "
+                "اگر می‌خواهی از همان لحظه‌ی روشن‌شدن شروع کند: "
+                "[bold]bidpilot bot --run[/bold]"
             )
 
         try:
@@ -279,14 +278,12 @@ def bot(
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
-            if scheduler is not None:
-                scheduler.request_stop()
+            if automation.running:
+                await automation.stop()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await service.api.aclose()
-            if application is not None:
-                await application.close()
 
     _run(main())
 
@@ -538,6 +535,14 @@ def selftest(
                     OK if creds.ready else WARN,
                     creds.summary if creds.ready else f"{creds.summary} — در تلگرام /market",
                 )
+                verify = getattr(src, "verify_session", None)
+                if verify is not None and not offline:
+                    try:
+                        session_ok, session_detail = await verify()
+                    except Exception as exc:  # network problems were reported above
+                        session_ok, session_detail = False, f"خطا: {exc}"
+                    add("ورود به حساب", OK if session_ok else FAIL, session_detail)
+
                 try:
                     ok, detail = await src.healthcheck()
                 except Exception as exc:
@@ -1079,7 +1084,9 @@ def go_live(
     console.print(f"[green]حالت live فعال شد.[/green] ({local_path})")
     console.print(
         "اولین اجرای کنترل‌شده: [bold]bidpilot once --limit 1[/bold]\n"
-        "سپس: [bold]bidpilot run[/bold]   |   بازگشت به آزمایشی: [bold]bidpilot go-live --off[/bold]"
+        "سپس: در تلگرام دکمه‌ی [bold]🚀 شروع فعالیت[/bold] (یا /run) — "
+        "یا از ترمینال: [bold]bidpilot run[/bold]\n"
+        "بازگشت به آزمایشی: [bold]bidpilot go-live --off[/bold] یا /mode"
     )
 
 

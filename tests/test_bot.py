@@ -214,6 +214,15 @@ async def test_full_setup_from_telegram_end_to_end(tmp_path, monkeypatch):
     service, api, store = make_service(tmp_path, monkeypatch)
     await service.handle_update(message(777, "/start"))
 
+    # the login check after setup must not hit the network in a unit test
+    from bidpilot import bot as bot_module
+    from bidpilot.sitecheck import SiteCheck
+
+    async def fake_check(*args, **kwargs):
+        return SiteCheck("parscoders", "پارس‌کدرز", True, "وارد حساب شدیم ✅", projects=3)
+
+    monkeypatch.setattr(bot_module, "check_site", fake_check)
+
     answers = [
         TOKEN,  # telegram bot token
         "1",  # provider: Groq (first free preset)
@@ -222,6 +231,7 @@ async def test_full_setup_from_telegram_end_to_end(tmp_path, monkeypatch):
         "1",  # auth method: username + password
         "ali",  # username
         "secret-pass",  # password
+        "manual",  # profile source: the old manual questions
         "علی",  # first name
         "علی رضایی",  # full name
         "برنامه‌نویس بک‌اند",  # role
@@ -233,6 +243,7 @@ async def test_full_setup_from_telegram_end_to_end(tmp_path, monkeypatch):
         "2",  # tone: رسمی و کوتاه
         "روی تحویل مرحله‌ای تأکید کن",  # style instructions
         "1200",  # max chars
+        "60",  # pricing: 60% of the employer's budget
         "1",  # submit mode: dry run
     ]
     for answer in answers:
@@ -248,5 +259,10 @@ async def test_full_setup_from_telegram_end_to_end(tmp_path, monkeypatch):
     assert store.get("proposal.tone") == TONE_CHOICES[1].value
     assert store.get("proposal.style_instructions") == "روی تحویل مرحله‌ای تأکید کن"
     assert store.get("proposal.max_chars") == 1200
+    assert store.get("pricing.bid_percent") == 60
+    assert store.get("pricing.ratio") == 0.6
     assert store.get("runtime.submit_mode") == "dry_run"
-    assert "تنظیمات ذخیره شد" in api.last_text
+    assert any("تنظیمات ذخیره شد" in text for _, text, _ in api.sent)
+    # after setup the bot proves the login and offers the start button
+    assert any("وارد حساب" in text for _, text, _ in api.sent)
+    assert "شروع فعالیت" in str(api.sent[-1][2])  # the start button is attached

@@ -28,6 +28,7 @@ from .llm_providers import (
     verify_provider,
 )
 from .settings_store import SettingsStore, parse_chat_ids, parse_list_answer
+from .text import to_persian_digits
 
 KEEP = object()  #: answer means "leave the stored value untouched"
 
@@ -37,6 +38,7 @@ STAGE_TITLES: dict[str, str] = {
     "market": "سایت فریلنسری و حساب کاربری",
     "profile": "پروفایل و نمونه‌کار",
     "style": "لحن و سبک نوشتن پیشنهاد",
+    "pricing": "قیمت پیشنهادی",
     "mode": "حالت ارسال",
 }
 
@@ -354,14 +356,108 @@ def _profile_field(name: str) -> Any:
     return defaults.get(name)
 
 
+#: How the user wants their profile filled in — one input instead of eight questions.
+PROFILE_SOURCE_CHOICES = (
+    Choice(
+        "resume",
+        "رزومه PDF (پیشنهادی)",
+        "فایل PDF رزومه را همین‌جا بفرست؛ نام، سابقه، مهارت‌ها و نمونه‌کارها خودکار استخراج می‌شوند.",
+    ),
+    Choice(
+        "github",
+        "لینک گیت‌هاب",
+        "پروفایل و مخزن‌های عمومی‌ات را می‌خوانم و مهارت‌ها و نمونه‌کارها را برمی‌دارم.",
+    ),
+    Choice(
+        "portfolio",
+        "لینک سایت/پورتفولیو",
+        "صفحه را می‌خوانم و هر چه در آن هست (مهارت، نمونه‌کار، لینک) را استخراج می‌کنم.",
+    ),
+    Choice("manual", "ورود دستی", "خودت نام، سابقه، مهارت‌ها و نمونه‌کارها را می‌نویسی."),
+    Choice("skip", "فعلاً رد کن", "هر چه الان در پروفایل هست حفظ می‌شود."),
+)
+
+PROFILE_SOURCE_VALUES = tuple(choice.value for choice in PROFILE_SOURCE_CHOICES)
+_PROFILE_KEYS = ("first_name", "full_name", "role", "years_experience", "stack", "highlights")
+
+
+def _profile_source(store: SettingsStore) -> str:
+    stored = str(store.get("profile.source") or "").strip().lower()
+    if stored in PROFILE_SOURCE_VALUES:
+        return stored
+    # Existing users answered the old manual questions: don't force a re-import.
+    if any(store.get(f"profile.{key}") for key in _PROFILE_KEYS):
+        return "manual"
+    return "resume"
+
+
+def _profile_source_default(store: SettingsStore) -> str:
+    return _profile_source(store)
+
+
+def _profile_url_prompt(store: SettingsStore) -> str:
+    if _profile_source(store) == "github":
+        return "لینک پروفایل گیت‌هابت را بفرست"
+    return "لینک سایت شخصی یا پورتفولیوت را بفرست"
+
+
+def _profile_url_help(store: SettingsStore) -> str:
+    if _profile_source(store) == "github":
+        return (
+            "مثال: https://github.com/kaspian021 — از API عمومی گیت‌هاب (بدون توکن) "
+            "مخزن‌ها و توضیحاتشان خوانده می‌شود."
+        )
+    return (
+        "مثال: https://kaspian021.github.io/portfolio — صفحه خوانده و متنش با همان کلید "
+        "هوش مصنوعی تحلیل می‌شود. اگر قبلاً پروفایل را ساختی، با /skip رد کن."
+    )
+
+
 def profile_questions(store: SettingsStore) -> list[Question]:
+    """One import question + the manual fallback — never eight questions in a row."""
     return [
+        Question(
+            key="profile.source",
+            prompt="پروفایلت را از کدام راه بسازیم؟",
+            kind="choice",
+            stage="profile",
+            choices=list(PROFILE_SOURCE_CHOICES),
+            dynamic_default=_profile_source_default,
+            help=(
+                "لازم نیست رزومه را دستی تایپ کنی: یک فایل PDF، یا لینک گیت‌هاب/پورتفولیو کافی است. "
+                "استخراج اطلاعات با همان کلید هوش مصنوعی رایگان انجام می‌شود و بعد نشانت می‌دهم."
+            ),
+        ),
+        Question(
+            key="profile.resume_path",
+            prompt="فایل PDF رزومه را همین‌جا بفرست",
+            kind="file",
+            stage="profile",
+            optional=True,
+            help=(
+                "فایل را در تلگرام به‌صورت Document (نه عکس) بفرست. حداکثر ۲۰ مگابایت. "
+                "در ترمینال مسیر فایل را بنویس، مثلاً C:\\Users\\me\\resume.pdf — "
+                "با /skip رد می‌شوی."
+            ),
+            when=lambda s: _profile_source(s) == "resume",
+        ),
+        Question(
+            key="profile.source_url",
+            prompt="لینک را بفرست",
+            stage="profile",
+            optional=True,
+            validator=_validate_url,
+            dynamic_prompt=_profile_url_prompt,
+            dynamic_help=_profile_url_help,
+            when=lambda s: _profile_source(s) in {"github", "portfolio"},
+        ),
         Question(
             key="profile.first_name",
             prompt="اسم کوچکت چیست؟",
             stage="profile",
             validator=_validate_short_text,
             dynamic_default=lambda s: s.get("profile.first_name") or _profile_field("first_name"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.full_name",
@@ -369,6 +465,7 @@ def profile_questions(store: SettingsStore) -> list[Question]:
             stage="profile",
             validator=_validate_short_text,
             dynamic_default=lambda s: s.get("profile.full_name") or _profile_field("full_name"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.role",
@@ -376,6 +473,7 @@ def profile_questions(store: SettingsStore) -> list[Question]:
             stage="profile",
             help="مثال: برنامه‌نویس فول‌استک، متخصص وردپرس، طراح UI/UX",
             dynamic_default=lambda s: s.get("profile.role") or _profile_field("role"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.years_experience",
@@ -384,6 +482,7 @@ def profile_questions(store: SettingsStore) -> list[Question]:
             stage="profile",
             validator=_validate_years,
             dynamic_default=lambda s: s.get("profile.years_experience") or _profile_field("years_experience"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.stack",
@@ -392,6 +491,7 @@ def profile_questions(store: SettingsStore) -> list[Question]:
             stage="profile",
             help="با کاما جدا کن؛ مثال: Python، Django، React، PostgreSQL",
             dynamic_default=lambda s: s.get("profile.stack") or _profile_field("stack"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.highlights",
@@ -400,6 +500,7 @@ def profile_questions(store: SettingsStore) -> list[Question]:
             stage="profile",
             help="با کاما جدا کن. هوش مصنوعی فقط همین‌ها را می‌تواند ادعا کند — پس واقعی باشند.",
             dynamic_default=lambda s: s.get("profile.highlights") or _profile_field("highlights"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.portfolio_url",
@@ -408,15 +509,57 @@ def profile_questions(store: SettingsStore) -> list[Question]:
             optional=True,
             validator=_validate_url,
             dynamic_default=lambda s: s.get("profile.portfolio_url") or _profile_field("portfolio_url"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
         Question(
             key="profile.signature",
             prompt="امضای پایان پیام",
             stage="profile",
             optional=True,
-            help="مثال: با احترام، سارا محمدی",
+            help="مثال: با احترام، سارا محمدی — با /skip رد می‌شوی.",
             dynamic_default=lambda s: s.get("profile.signature") or _profile_field("signature"),
+            when=lambda s: _profile_source(s) == "manual",
         ),
+    ]
+
+
+DEFAULT_BID_PERCENT = 60
+
+
+def bid_percent(store: SettingsStore) -> int:
+    """How much of the employer's budget we bid (percent), 10‑100."""
+    stored = store.get("pricing.bid_percent")
+    if stored is None:
+        ratio = store.get("pricing.ratio")
+        try:
+            stored = round(float(ratio) * 100) if ratio is not None else None
+        except (TypeError, ValueError):
+            stored = None
+    try:
+        value = int(stored) if stored is not None else DEFAULT_BID_PERCENT
+    except (TypeError, ValueError):
+        value = DEFAULT_BID_PERCENT
+    return min(100, max(10, value))
+
+
+def pricing_questions(store: SettingsStore) -> list[Question]:
+    return [
+        Question(
+            key="pricing.bid_percent",
+            prompt="چند درصد از بودجه‌ی اعلامی کارفرما را پیشنهاد بدهیم؟",
+            kind="int",
+            stage="pricing",
+            default=DEFAULT_BID_PERCENT,
+            validator=lambda value: (
+                None if 10 <= int(value) <= 100 else "عددی بین ۱۰ تا ۱۰۰ بنویس (مثلاً ۶۰ برای ۶۰٪ بودجه)."
+            ),
+            help=(
+                "اگر کارفرما بازه بدهد (مثلاً ۵۰۰٬۰۰۰ تا ۱٬۵۰۰٬۰۰۰)، همین درصد از بازه انتخاب می‌شود "
+                "و همیشه داخل بازه می‌ماند. ۵۰٪ = وسط بازه، ۳۰٪ = رقابتی‌تر، ۸۰٪ = گران‌تر. "
+                "عدد ۱۰۰ یعنی سقف بودجه."
+            ),
+            dynamic_default=lambda s: bid_percent(s),
+        )
     ]
 
 
@@ -490,6 +633,7 @@ def all_questions(store: SettingsStore) -> list[Question]:
         *marketplace_questions(store),
         *profile_questions(store),
         *style_questions(store),
+        *pricing_questions(store),
         *mode_questions(store),
     ]
 
@@ -563,15 +707,37 @@ def parse_answer(question: Question, raw: Any, store: SettingsStore) -> Any:
             return KEEP
         raise QuestionError("این مورد خالی نمی‌تواند باشد؛ مقدارش را بنویس.")
 
+    if question.kind == "file":
+        from pathlib import Path as _Path
+
+        candidate = _Path(text.strip().strip('"').strip("'")).expanduser()
+        if not candidate.is_file():
+            raise QuestionError(
+                "فایل پیدا نشد. مسیر کامل فایل PDF را بنویس (مثلاً C:\\Users\\me\\resume.pdf)."
+            )
+        if candidate.suffix.lower() != ".pdf":
+            raise QuestionError("فقط فایل PDF پذیرفته می‌شود.")
+        return str(candidate)
+
     if question.kind == "int":
         try:
-            return int(_normalise(text).replace(",", ""))
+            number = int(_normalise(text).replace(",", ""))
         except ValueError as exc:
             raise QuestionError("یک عدد صحیح بنویس.") from exc
+        if question.validator:
+            problem = question.validator(number)
+            if problem:
+                raise QuestionError(problem)
+        return number
     if question.kind == "list":
         values = parse_chat_ids(text) if question.key == "telegram.chat_ids" else parse_list_answer(text)
         if not values:
             raise QuestionError("حداقل یک مقدار بنویس.")
+        if question.validator:
+            # list validators work on the raw answer (e.g. chat ids)
+            problem = question.validator(text)
+            if problem:
+                raise QuestionError(problem)
         return values
     if question.kind == "confirm":
         lowered = _normalise(text)
@@ -597,6 +763,20 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
         return
     key = question.store_key(store)
 
+    if key == "profile.source" and str(value).strip().lower() == "skip":
+        # "فعلاً رد کن" must not pin the choice: next time we ask again
+        return
+    if key in {"profile.resume_path", "profile.source_url"}:
+        # the actual analysis happens in the async layer (bot / terminal wizard)
+        import_kind = "file" if key == "profile.resume_path" else "url"
+        store.update({key: value, "profile.import_pending": {"type": import_kind, "value": value}})
+        reset_secret_cache()
+        return
+    if key == "pricing.bid_percent":
+        percent = min(100, max(10, int(value)))
+        store.update({"pricing.bid_percent": percent, "pricing.ratio": round(percent / 100, 2)})
+        reset_secret_cache()
+        return
     if key == "llm.api_key":
         provider = str(store.get("llm.provider") or DEFAULT_PROVIDER).strip().lower()
         store.update({"llm.api_key": value, f"llm.keys.{provider}": value})
@@ -700,6 +880,9 @@ def readiness(store: SettingsStore) -> dict[str, Any]:
         "tone": store.get("proposal.tone") or "",
         "style": bool(store.get("proposal.style_instructions")),
         "mode": store.get("runtime.submit_mode") or "dry_run",
+        "profile_source": str(store.get("profile.source") or ""),
+        "profile_imported_at": store.get("profile.imported_at"),
+        "bid_percent": bid_percent(store),
         "setup_completed": bool(store.get("setup.completed")),
     }
 
@@ -735,10 +918,24 @@ def status_text(store: SettingsStore) -> str:
         f"{mark(state['credentials'])} سایت فعال: {site_label(state['marketplace'])}",
         f"{mark(bool(state['tone']))} لحن: {state['tone'] or 'تعیین نشده'}",
         f"{mark(state['style'])} دستورهای سبک: " + ("ثبت شده" if state["style"] else "ثبت نشده (اختیاری)"),
+        f"{mark(bool(store.get('profile.full_name')))} پروفایل: "
+        + (str(store.get("profile.full_name")) if store.get("profile.full_name") else "وارد نشده")
+        + (" (از " + _profile_source_label(state["profile_source"]) + ")" if state["profile_source"] else ""),
+        f"💰 قیمت: {to_persian_digits(str(state['bid_percent']))}٪ بودجه‌ی کارفرما",
         f"حالت ارسال: {'🔴 واقعی' if state['mode'] == 'live' else '🧪 آزمایشی'}",
         f"تنظیمات اولیه: {'کامل ✅' if state['setup_completed'] else 'ناتمام ⚠️'}",
     ]
     return "\n".join(lines)
+
+
+def _profile_source_label(source: str) -> str:
+    return {
+        "resume": "رزومه",
+        "github": "گیت‌هاب",
+        "portfolio": "پورتفولیو",
+        "manual": "ورود دستی",
+        "skip": "—",
+    }.get(str(source or ""), str(source or ""))
 
 
 def tone_summary(store: SettingsStore) -> str:
@@ -823,6 +1020,36 @@ def _prompt_question(console, question: Question, store: SettingsStore, index: i
             console.print(f"[red]{escape(str(exc))}[/red]")
 
 
+def _run_pending_profile_import(console, store: SettingsStore) -> None:
+    from rich.markup import escape
+
+    from .profile_import import (
+        ProfileImportError,
+        pending_import,
+        run_pending_import,
+        summary_text,
+    )
+
+    if pending_import(store) is None:
+        return
+    console.print("[cyan]در حال خواندن و تحلیل رزومه/پروفایل…[/cyan]")
+    try:
+        result = asyncio.run(run_pending_import(store))
+    except ProfileImportError as exc:
+        console.print(f"[yellow]{escape(str(exc))}[/yellow]")
+        return
+    except Exception as exc:  # network/quota — the profile keeps its old values
+        console.print(f"[yellow]تحلیل پروفایل انجام نشد: {escape(str(exc))}[/yellow]")
+        return
+    if result is None:  # pragma: no cover - defensive
+        return
+    console.print(summary_text(result.fields, title="پروفایل استخراج‌شده"))
+    if result.used_llm:
+        console.print("[green]استخراج با هوش مصنوعی انجام شد.[/green]")
+    for warning in result.warnings:
+        console.print(f"[yellow]{escape(warning)}[/yellow]")
+
+
 def run_terminal_wizard(
     store: SettingsStore,
     console,
@@ -866,6 +1093,9 @@ def run_terminal_wizard(
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]متوقف شد؛ پاسخ‌های داده‌شده ذخیره شده‌اند.[/yellow]")
         return False
+
+    # A resume/URL answer is analysed here (the questions themselves stay sync).
+    _run_pending_profile_import(console, store)
 
     # post-setup checks: test the key and the Telegram connection when possible
     provider = _current_provider(store)

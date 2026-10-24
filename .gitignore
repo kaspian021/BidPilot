@@ -4,6 +4,7 @@
 !.env.example
 config/config.local.yaml
 data/
+data/uploads/
 *.sqlite3
 *.db
 

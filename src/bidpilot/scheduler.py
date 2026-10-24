@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import signal
 from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import Any
 
 from .app import Application
 from .config import reset_secret_cache
@@ -27,6 +29,7 @@ class Scheduler:
         sources: list[str] | None = None,
         app_factory: Callable[[], Application] | None = None,
         store: SettingsStore | None = None,
+        on_report: Callable[[list[Any]], Any] | None = None,
     ) -> None:
         self.app = app
         self.interval = interval or app.config.runtime.poll_interval_seconds
@@ -39,6 +42,8 @@ class Scheduler:
         self._app_factory = app_factory
         self._store = store or get_store()
         self._settings_stamp = self._store.stamp()
+        # Telegram bot: report the first cycle result back to the owner.
+        self._on_report = on_report
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -76,6 +81,16 @@ class Scheduler:
             pass
         return True
 
+    async def _emit_report(self, reports: list[Any]) -> None:
+        if self._on_report is None:
+            return
+        try:
+            result = self._on_report(reports)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # a broken callback must not stop the bidder
+            log.warning("on_report callback failed: %s", exc)
+
     async def run_forever(self) -> None:
         self._install_signal_handlers()
         mode = "LIVE" if self.app.config.runtime.live else "DRY-RUN"
@@ -95,6 +110,7 @@ class Scheduler:
                 await self.reload_if_settings_changed()
                 reports = await self.app.cycle(self.sources)
                 self.consecutive_errors = 0
+                await self._emit_report(reports)
                 for report in reports:
                     log.info(report.summary())
                     for error in report.errors:

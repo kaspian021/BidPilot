@@ -147,6 +147,51 @@ class HtmlMarketSource(Source):
             )
         return ok
 
+    async def verify_session(self) -> tuple[bool, str]:
+        """Check the stored account by opening a page only a logged-in user sees.
+
+        Cookie mode cannot be *proved* without a request, so we fetch
+        ``auth.check_path`` and look for the site's own markers. When the page is
+        inconclusive we say so instead of blocking the user.
+        """
+        auth = self.settings.get("auth") or {}
+        if auth.get("mode") == "none":
+            return True, "این سایت ورود لازم ندارد."
+        if not self.credentials.ready:
+            return False, "کوکی/نام کاربری ثبت نشده است — «/market» را بزن."
+
+        if auth.get("mode") == "credentials":
+            ok, detail = await self.login()
+            if not ok:
+                return False, detail or "لاگین با نام کاربری/رمز ناموفق بود (کپچا یا رمز اشتباه)."
+
+        html = ""
+        errors: list[str] = []
+        candidates = [auth.get("check_path") or "/"]
+        if candidates[0] != "/":
+            candidates.append("/")  # a guessed dashboard path must not be fatal
+        for path in dict.fromkeys(candidates):
+            try:
+                html = await self.get_html(path)
+                break
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+        if not html:
+            return False, "صفحه‌ی بررسی باز نشد: " + "؛ ".join(errors[:2])
+
+        lowered = (html or "").casefold()
+        logged_in = [str(m).casefold() for m in (auth.get("logged_in_markers") or []) if m]
+        login_only = [str(m).casefold() for m in (auth.get("login_markers") or []) if m]
+
+        if logged_in and any(marker in lowered for marker in logged_in):
+            return True, "وارد حساب کاربری شدیم ✅"
+        if login_only and any(marker in lowered for marker in login_only):
+            if not (logged_in and any(marker in lowered for marker in logged_in)):
+                return False, "سایت صفحه‌ی ورود نشان داد؛ کوکی منقضی شده است — «/market» را بزن."
+        if _looks_like_login_page(html, auth):
+            return False, "سایت فرم ورود نشان داد؛ کوکی/رمز معتبر نیست — «/market» را بزن."
+        return True, "صفحه باز شد و نشانه‌ی «ورود لازم است» نداشت (وضعیت قطعی نیست)."
+
     # -------------------------------------------------------------- health
     async def healthcheck(self) -> tuple[bool, str]:
         list_cfg = self.settings.get("list") or {}

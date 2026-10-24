@@ -304,3 +304,58 @@ class _ReadyCreds:
     method = "cookie"
     ready = True
     summary = "کوکی ثبت شده"
+
+
+
+async def test_http_diagnostics_log_redirects_without_query_values(caplog):
+    import logging
+
+    import httpx
+
+    from bidpilot.config import AppConfig, Secrets
+    from bidpilot.sources.ponisha.adapter import PonishaSource
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search/projects":
+            return httpx.Response(
+                302,
+                headers={"location": "/dashboard?session=must-not-be-logged"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            text="<html><body>ok</body></html>",
+            headers={"content-type": "text/html; charset=utf-8"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://ponisha.ir",
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+    source = PonishaSource(
+        {"discovery": {"log_extraction_details": True}},
+        AppConfig(),
+        Secrets(),
+        client=client,
+    )
+
+    try:
+        with caplog.at_level(logging.INFO, logger="bidpilot.sources.html_market"):
+            html = await source.get_html(
+                "/search/projects?private=query-secret",
+                params={"access_token": "parameter-secret"},
+            )
+    finally:
+        await client.aclose()
+
+    assert html == "<html><body>ok</body></html>"
+    assert "[HTTP][REQUEST]" in caplog.text
+    assert "[HTTP][RESPONSE]" in caplog.text
+    assert "status=200" in caplog.text
+    assert "/dashboard" in caplog.text
+    assert "redirects=" in caplog.text and "302" in caplog.text
+    assert "query-secret" not in caplog.text
+    assert "parameter-secret" not in caplog.text
+    assert "must-not-be-logged" not in caplog.text

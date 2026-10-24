@@ -377,6 +377,7 @@ def _find_project_header_budget(
         if _normalized_marker(marker)
     ]
     end_index = len(ordered)
+    end_found = False
     for index in range(title_index + 1, len(ordered)):
         node = ordered[index]
         if node.name not in {"h2", "h3", "h4", "h5"}:
@@ -384,7 +385,18 @@ def _find_project_header_budget(
         heading_text = _normalized_marker(node.get_text(" ", strip=True))
         if any(marker in heading_text for marker in markers):
             end_index = index
+            end_found = True
             break
+
+    # Without a recognizable section boundary, this fallback cannot distinguish
+    # the current project's metadata from recommended-project cards below it.
+    if not end_found:
+        if diagnostics:
+            log.info(
+                "[PARSER][HEADER-BUDGET] title=%r result=no_section_boundary",
+                title,
+            )
+        return None, "", "not_found", ""
 
     money_nodes: list[str] = []
     checked = 0

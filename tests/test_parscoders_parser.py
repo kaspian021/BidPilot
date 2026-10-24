@@ -190,5 +190,5 @@ def test_diagnostics_log_raw_card_and_detail_budget_evidence(caplog):
     assert enriched.raw["detail_budget_source"] == "detail_page_text"
     assert "[PARSER][CARD-TEXT]" in caplog.text
     assert "[PARSER][DETAIL-TEXT]" in caplog.text
-    assert "بودجه: ۲۰,۰۰۰,۰۰۰ تا ۴۰,۰۰۰,۰۰۰ تومان" in caplog.text
+    assert "بودجه: 20,000,000 تا 40,000,000 تومان" in caplog.text
     assert "detail_budget_source" not in caplog.text or "detail_page_text" in caplog.text

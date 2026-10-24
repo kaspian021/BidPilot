@@ -549,4 +549,3 @@ def test_detail_page_extracts_explicit_employer_deadline():
         {"detail_fields": {"description": [], "budget": [], "skills": []}},
     )
     assert enriched.employer_deadline == "1 روز"
-

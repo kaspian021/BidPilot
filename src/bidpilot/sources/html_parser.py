@@ -1319,9 +1319,7 @@ def requires_javascript(html: str) -> bool:
     persian_disabled = has_javascript and any(
         marker in text for marker in ("غیر فعال", "غیرفعال", "فعال نیست")
     )
-    persian_enable = "جاوا اسکریپت" in text and any(
-        marker in text for marker in ("فعال کنید", "فعال باشد")
-    )
+    persian_enable = "جاوا اسکریپت" in text and any(marker in text for marker in ("فعال کنید", "فعال باشد"))
     english_required = bool(
         re.search(
             r"javascript.{0,60}(?:disabled|not enabled|must be enabled|is required)",

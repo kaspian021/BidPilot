@@ -115,7 +115,7 @@ def test_find_budget_handles_labels_and_rejects_counters():
 
 
 def test_budget_range_split_across_lines_keeps_both_bounds():
-    from bidpilot.sources.html_parser import find_budget, enrich_from_detail
+    from bidpilot.sources.html_parser import enrich_from_detail, find_budget
 
     raw = "بودجه 25,000 تومان\n تا\n 500,000 تومان مهلت برای انجام 2روز وضعیت مناقصه باز"
     budget = find_budget(raw)

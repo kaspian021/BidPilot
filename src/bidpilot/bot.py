@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from .automation import Automation
 from .llm_providers import LLMProvider, get_preset, verify_provider
 from .notifications.telegram import split_message
 from .onboarding import (
@@ -38,12 +39,14 @@ from .onboarding import (
     QuestionError,
     all_questions,
     apply_answer,
+    bid_percent,
     llm_questions,
     mark_setup_complete,
     marketplace_questions,
     missing_steps,
     mode_questions,
     parse_answer,
+    pricing_questions,
     profile_questions,
     readiness,
     save_chat_id,
@@ -55,6 +58,7 @@ from .onboarding import (
     tone_summary,
 )
 from .settings_store import SettingsStore, get_store
+from .sitecheck import check_site
 
 log = logging.getLogger(__name__)
 
@@ -147,6 +151,23 @@ class TelegramAPI:
                 params.pop("reply_markup", None)
                 await self.call("sendMessage", **params)
 
+    async def get_file(self, file_id: str) -> dict[str, Any]:
+        return await self.call("getFile", file_id=file_id) or {}
+
+    async def download_file(self, file_path: str, *, limit: int = 20 * 1024 * 1024) -> bytes:
+        """Download a document the user sent (Telegram limits bot downloads to 20 MB)."""
+        client = await self._get_client()
+        url = f"{self.base_url}/file/bot{self.token}/{file_path}"
+        try:
+            response = await client.get(url)
+        except httpx.HTTPError as exc:  # pragma: no cover - network
+            raise BotAPIError(self._scrub(f"دانلود فایل ناموفق بود: {exc}")) from exc
+        if response.status_code >= 400:
+            raise BotAPIError(f"دانلود فایل ناموفق بود (HTTP {response.status_code})")
+        if len(response.content) > limit:
+            raise BotAPIError("فایل بزرگ‌تر از حد مجاز (۲۰ مگابایت) است.")
+        return response.content
+
     async def answer_callback(self, callback_id: str, text: str = "") -> None:
         try:
             await self.call("answerCallbackQuery", callback_query_id=callback_id, text=text[:190])
@@ -184,9 +205,12 @@ class Flow:
 
 HELP_TEXT = """<b>BidPilot — راهنما</b>
 
-/setup — راه‌اندازی کامل (تلگرام، هوش مصنوعی رایگان، حساب سایت، پروفایل، لحن، حالت ارسال)
-/style — لحن و دستورهای نوشتن پیشنهاد
-/profile — نام، سابقه، مهارت‌ها و نمونه‌کار
+/setup — راه‌اندازی کامل (تلگرام، هوش مصنوعی رایگان، حساب سایت، پروفایل، لحن، قیمت، حالت ارسال)
+/run — 🚀 شروع فعالیت: رصد پروژه‌ها و ارسال پیشنهادها
+/stop — ⏸ توقف ارسال
+/check — بررسی اینکه هنوز وارد حساب سایت هستیم یا نه
+/style — لحن، دستورهای نوشتن و درصد قیمت
+/profile — ساخت پروفایل از رزومه PDF، گیت‌هاب یا پورتفولیو (یا ورود دستی)
 /llm — انتخاب سرویس هوش مصنوعی رایگان و کلید آن
 /sites — همه‌ی سایت‌های فریلنسری و وضعیت هرکدام
 /site <name> — عوض کردن سایت فعال (مثلاً /site ponisha)
@@ -211,12 +235,17 @@ class BotService:
         *,
         config_path: str = "config/config.yaml",
         log_fn: Callable[[str], None] | None = None,
+        automation: Automation | None = None,
     ) -> None:
         self.store = store
         self.api = api
         self.config_path = config_path
         self._flows: dict[str, Flow] = {}
         self._log = log_fn or (lambda message: log.info("%s", message))
+        #: background bidder, started from the chat with «شروع فعالیت»
+        self.automation = automation or Automation(
+            store=store, config_path=config_path, notify=self.notify_owner
+        )
 
     # ------------------------------------------------------------- transport
     async def send(self, chat_id: str | int, text: str, reply_markup: dict | None = None) -> None:
@@ -272,6 +301,11 @@ class BotService:
         chat_id = chat.get("id")
         if chat_id is None:
             return
+        if message.get("document"):
+            if not self.is_allowed(chat_id):
+                return
+            await self._handle_document(message, str(chat_id))
+            return
         text = (message.get("text") or "").strip()
         if not text:
             return
@@ -324,6 +358,28 @@ class BotService:
             await self._cmd_site(chat, data.split(":", 1)[1])
             return
 
+        if data == "run:ask":
+            await self._cmd_run(chat)
+            return
+        if data == "run:confirm":
+            await self._start_work(chat)
+            return
+        if data == "run:stop":
+            await self._cmd_stop(chat)
+            return
+        if data == "cmd:profile":
+            await self.handle_command(chat, "/profile", "")
+            return
+        if data == "cmd:check":
+            await self._cmd_check(chat)
+            return
+        if data == "cmd:run":
+            await self._cmd_run(chat)
+            return
+        if data == "cmd:mode":
+            await self.handle_command(chat, "/mode", "")
+            return
+
         if data == "cmd:status":
             await self.handle_command(chat, "/status", "")
         elif data == "cmd:setup":
@@ -350,7 +406,10 @@ class BotService:
         elif command == "/setup":
             await self._start_flow(chat_id, "setup", all_questions(self.store), mark_complete=True)
         elif command in {"/style", "/tone"}:
-            await self._start_flow(chat_id, "style", style_questions(self.store))
+            # tone + writing instructions + the share of the budget we bid
+            await self._start_flow(
+                chat_id, "style", [*style_questions(self.store), *pricing_questions(self.store)]
+            )
         elif command == "/profile":
             await self._start_flow(chat_id, "profile", profile_questions(self.store))
         elif command == "/llm":
@@ -369,6 +428,12 @@ class BotService:
             await self._cmd_preview(chat_id)
         elif command == "/test":
             await self._cmd_test(chat_id)
+        elif command == "/run":
+            await self._cmd_run(chat_id)
+        elif command == "/stop":
+            await self._cmd_stop(chat_id)
+        elif command == "/check":
+            await self._cmd_check(chat_id)
         elif command == "/settings":
             await self._cmd_settings(chat_id)
         elif command == "/skip":
@@ -384,6 +449,205 @@ class BotService:
                 await self.send(chat_id, "چیزی در جریان نیست. /help")
         else:
             await self.send(chat_id, "این دستور را نمی‌شناسم.\n\n" + HELP_TEXT)
+
+    # ------------------------------------------------------- documents/profile
+    async def _handle_document(self, message: dict[str, Any], chat_id: str) -> None:
+        """A PDF resume the user sent while the profile flow waits for a file."""
+        flow = self._flows.get(chat_id)
+        question = flow.current if flow else None
+        document = message.get("document") or {}
+        name = str(document.get("file_name") or "resume.pdf")
+        mime = str(document.get("mime_type") or "")
+        size = int(document.get("file_size") or 0)
+
+        if question is None or question.kind != "file":
+            await self.send(
+                chat_id,
+                "فایل گرفتم، ولی الان جایی برای آن باز نیست.\nبرای ساختن پروفایل از رزومه: /profile",
+            )
+            return
+        if not (mime == "application/pdf" or name.lower().endswith(".pdf")):
+            await self.send(chat_id, "⚠️ فقط فایل PDF پذیرفته می‌شود (نه عکس، نه Word).")
+            return
+        if size and size > 20 * 1024 * 1024:
+            await self.send(chat_id, "⚠️ فایل بزرگ‌تر از ۲۰ مگابایت است. نسخه‌ی کوچک‌تر بفرست.")
+            return
+
+        file_id = str(document.get("file_id") or "")
+        await self.send(chat_id, "📄 فایل رسید؛ دارم می‌خوانم و تحلیل می‌کنم…")
+        try:
+            info = await self.api.get_file(file_id)
+            remote_path = str(info.get("file_path") or "")
+            data = await self.api.download_file(remote_path)
+        except Exception as exc:
+            await self.send(
+                chat_id,
+                f"⚠️ فایل دانلود نشد: {escape(str(exc))}\n"
+                "می‌توانی لینک گیت‌هاب/پورتفولیو بدهی (/profile) یا فایل را دوباره بفرستی.",
+            )
+            return
+
+        target = self._uploads_dir() / name
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        except OSError as exc:
+            await self.send(chat_id, f"❌ ذخیره‌ی فایل ناموفق بود: {escape(str(exc))}")
+            return
+
+        await self._consume_answer(chat_id, str(target))
+
+    def _uploads_dir(self):
+        from pathlib import Path
+
+        base = getattr(self.store, "path", None)
+        root = Path(base).parent if base else Path("data")
+        return root / "uploads"
+
+    async def _import_profile_from_pending(self, chat_id: str) -> None:
+        """Run the queued resume/URL import and tell the user exactly what was extracted."""
+        from .profile_import import (
+            ProfileImportError,
+            pending_import,
+            run_pending_import,
+            summary_text,
+        )
+
+        pending = pending_import(self.store)
+        if not pending:
+            return
+        await self.send(chat_id, "🤖 دارم متن را با هوش مصنوعی تحلیل می‌کنم…")
+        try:
+            result = await run_pending_import(self.store, save_dir=self._uploads_dir())
+        except ProfileImportError as exc:
+            await self.send(
+                chat_id,
+                f"⚠️ {escape(str(exc))}\n\n"
+                "می‌توانی دوباره با /profile فایل/لینک بدهی، یا اطلاعات را دستی وارد کنی.",
+            )
+            return
+        except Exception as exc:  # network, quota, bad config…
+            log.exception("Profile import failed")
+            await self.send(
+                chat_id,
+                f"⚠️ تحلیل پروفایل انجام نشد: {escape(str(exc))}\n"
+                "اطلاعات فعلی حفظ شد؛ با /profile دوباره تلاش کن یا دستی وارد کن.",
+            )
+            return
+
+        if result is None:  # pragma: no cover - defensive
+            return
+        body = summary_text(result.fields)
+        footer = (
+            "🤖 استخراج با هوش مصنوعی انجام شد."
+            if result.used_llm
+            else "ℹ️ استخراج ساده (بدون هوش مصنوعی) انجام شد."
+        )
+        warnings = "\n".join(f"⚠️ {escape(w)}" for w in result.warnings)
+        await self.send(
+            chat_id,
+            body
+            + "\n\n"
+            + footer
+            + (("\n" + warnings) if warnings else "")
+            + "\n\nاگر چیزی درست نیست، /profile را بزن و دستی اصلاح کن.",
+        )
+
+    # ------------------------------------------------------------ start/stop
+    async def _cmd_run(self, chat_id: str) -> None:
+        """«شروع فعالیت» — confirm what will happen, then start the bidder."""
+        state = readiness(self.store)
+        missing = missing_steps(self.store, include_recommended=False)
+        if not state["credentials"]:
+            await self.send(chat_id, "🔑 اول حساب سایت را وصل کن: /market")
+            return
+        if missing:
+            await self.send(
+                chat_id,
+                "⚠️ هنوز این‌ها ناقص است:\n" + "\n".join(f"• {escape(m)}" for m in missing) + "\n\n/setup",
+            )
+            return
+        if self.automation.running:
+            await self.send(chat_id, self.automation.status_text(), self._run_keyboard())
+            return
+
+        live = state["mode"] == "live"
+        mode_line = (
+            "🔴 <b>واقعی</b> — پیشنهادها روی سایت ثبت می‌شوند."
+            if live
+            else "🧪 <b>آزمایشی</b> — پیشنهادها ساخته می‌شوند ولی ارسال نمی‌شوند."
+        )
+        limits = self._limits()
+        await self.send(
+            chat_id,
+            "<b>آماده‌ی شروع</b>\n\n"
+            f"🌐 سایت: {escape(site_label(state['marketplace']))}\n"
+            f"💰 قیمت: {bid_percent(self.store)}٪ بودجه‌ی کارفرما\n"
+            f"🎭 لحن: {escape(str(state['tone'] or 'پیش‌فرض'))}\n"
+            f"⏱ فاصله‌ی بررسی: هر {limits['interval']} ثانیه\n"
+            f"📊 سقف: {limits['per_day']} پیشنهاد در روز، {limits['per_hour']} در ساعت\n\n"
+            f"{mode_line}\n\n"
+            "با «تأیید و شروع» رصد پروژه‌ها و ارسال پیشنهاد آغاز می‌شود.",
+            {
+                "inline_keyboard": [
+                    [{"text": "🚀 تأیید و شروع", "callback_data": "run:confirm"}],
+                    [
+                        {"text": "🧪 تغییر به آزمایشی", "callback_data": "cmd:mode"}
+                        if live
+                        else {"text": "🔴 حالت واقعی", "callback_data": "cmd:mode"}
+                    ],
+                    [{"text": "لغو", "callback_data": "cmd:cancel"}],
+                ]
+            },
+        )
+
+    def _limits(self) -> dict[str, Any]:
+        try:
+            from .config import load_config
+
+            cfg = load_config(self.config_path, store=self.store)
+            return {
+                "interval": int(cfg.runtime.poll_interval_seconds or 120),
+                "per_day": int(cfg.runtime.max_bids_per_day or 0),
+                "per_hour": int(cfg.runtime.max_bids_per_hour or 0),
+            }
+        except Exception:  # pragma: no cover - broken config
+            return {"interval": 120, "per_day": 0, "per_hour": 0}
+
+    async def _start_work(self, chat_id: str) -> None:
+        if self.automation.running:
+            await self.send(chat_id, self.automation.status_text(), self._run_keyboard())
+            return
+        await self.send(chat_id, "🔐 یک‌بار ورود به حساب را بررسی می‌کنم…")
+        check = await check_site(self.store, config_path=self.config_path)
+        await self.send(chat_id, check.message())
+        if not check.ok:
+            return
+        ok, message = await self.automation.start()
+        await self.send(
+            chat_id,
+            ("🚀 " if ok else "❌ ") + escape(message) + ("\n\nاولین نتیجه را همین‌جا می‌فرستم." if ok else ""),
+            self._run_keyboard() if ok else None,
+        )
+
+    async def _cmd_stop(self, chat_id: str) -> None:
+        ok, message = await self.automation.stop()
+        await self.send(chat_id, ("⏸ " if ok else "ℹ️ ") + escape(message), self._run_keyboard())
+
+    async def _cmd_check(self, chat_id: str) -> None:
+        await self.send(chat_id, "🔐 دارم ورود به حساب سایت را بررسی می‌کنم…")
+        check = await check_site(self.store, config_path=self.config_path)
+        await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
+
+    @staticmethod
+    def _run_keyboard() -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "🚀 شروع فعالیت", "callback_data": "run:ask"}],
+                [{"text": "⏸ توقف", "callback_data": "run:stop"}],
+                [{"text": "📊 وضعیت", "callback_data": "cmd:status"}],
+            ]
+        }
 
     async def _cmd_sites(self, chat_id: str) -> None:
         rows = sites_overview(self.store)
@@ -503,6 +767,8 @@ class BotService:
             )
         )
         await self.send(chat_id, ("✅ " if ok else "❌ ") + escape(message))
+        check = await check_site(self.store, config_path=self.config_path)
+        await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
 
     async def _cmd_preview(self, chat_id: str) -> None:
         await self.send(chat_id, "⏳ در حال گرفتن یک پروژه و نوشتن پیشنهاد نمونه…")
@@ -663,6 +929,8 @@ class BotService:
         if question.store_key(self.store) == "telegram.chat_ids":
             save_chat_id(self.store, chat_id)
         self._log(f"chat {chat_id}: saved {question.store_key(self.store)}")
+        if question.store_key(self.store) in {"profile.resume_path", "profile.source_url"}:
+            await self._import_profile_from_pending(chat_id)
         flow.index += 1
         await self._advance(chat_id)
 
@@ -678,22 +946,57 @@ class BotService:
                 + self._menu_hint(),
                 self._menu_keyboard(),
             )
+            await self._post_setup(chat_id)
             return
         if flow.name == "style":
             await self.send(
                 chat_id,
-                "🎭 به‌روز شد.\n" + escape(tone_summary(self.store)) + "\n\nبرای دیدن نتیجه: /preview",
+                "🎭 به‌روز شد.\n"
+                + escape(tone_summary(self.store))
+                + f"\n💰 قیمت: {bid_percent(self.store)}٪ بودجه‌ی کارفرما"
+                + "\n\nبرای دیدن نتیجه: /preview",
             )
             return
+        if flow.name == "market":
+            # right after the account is entered: prove the login and offer «شروع فعالیت»
+            await self.send(chat_id, "✅ حساب ذخیره شد.")
+            await self._post_setup(chat_id)
+            return
         await self.send(chat_id, "✅ ذخیره شد.\n\n" + status_text(self.store))
+
+    async def _post_setup(self, chat_id: str) -> None:
+        """Right after setup: prove the login works, then offer «شروع فعالیت»."""
+        state = readiness(self.store)
+        if not state["credentials"]:
+            return
+        await self.send(chat_id, "🔐 حالا ورود به حساب سایت را بررسی می‌کنم…")
+        check = await check_site(self.store, config_path=self.config_path)
+        await self.send(chat_id, check.message())
+        if not check.ok:
+            return
+        await self.send(
+            chat_id,
+            "همه‌چیز آماده است. با زدن دکمه‌ی زیر، رصد پروژه‌ها و ارسال پیشنهاد شروع می‌شود.",
+            {
+                "inline_keyboard": [
+                    [{"text": "🚀 شروع فعالیت", "callback_data": "run:ask"}],
+                    [
+                        {"text": "🧪 پیش‌نمایش", "callback_data": "cmd:preview"},
+                        {"text": "📊 وضعیت", "callback_data": "cmd:status"},
+                    ],
+                ]
+            },
+        )
 
     # ------------------------------------------------------------------ misc
     @staticmethod
     def _menu_hint() -> str:
         return (
             "چه کاری می‌خواهی؟\n"
-            "• /style تغییر لحن و سبک پیشنهاد\n"
+            "• /run شروع فعالیت (ارسال پیشنهادها)\n"
+            "• /style تغییر لحن، سبک و درصد قیمت\n"
             "• /preview دیدن یک پیشنهاد نمونه\n"
+            "• /stop توقف ارسال\n"
             "• /mode آزمایشی یا ارسال واقعی\n"
             "• /settings دیدن مقادیر ذخیره‌شده\n"
             "• /test تست کلید هوش مصنوعی"
@@ -703,18 +1006,20 @@ class BotService:
     def _menu_keyboard() -> dict[str, Any]:
         return {
             "inline_keyboard": [
+                [{"text": "🚀 شروع فعالیت", "callback_data": "run:ask"}],
                 [
-                    {"text": "🎭 لحن", "callback_data": "cmd:style"},
                     {"text": "🧪 پیش‌نمایش", "callback_data": "cmd:preview"},
+                    {"text": "🎭 لحن", "callback_data": "cmd:style"},
                 ],
                 [
                     {"text": "🌐 سایت‌ها", "callback_data": "cmd:sites"},
                     {"text": "🔑 حساب سایت", "callback_data": "cmd:market"},
                 ],
                 [
+                    {"text": "👤 پروفایل", "callback_data": "cmd:profile"},
                     {"text": "📊 وضعیت", "callback_data": "cmd:status"},
-                    {"text": "⚙️ تنظیم مجدد", "callback_data": "cmd:setup"},
                 ],
+                [{"text": "⚙️ تنظیم مجدد", "callback_data": "cmd:setup"}],
             ]
         }
 

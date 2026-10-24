@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from bidpilot import onboarding
@@ -138,6 +140,7 @@ def test_terminal_wizard_saves_answers(tmp_path, monkeypatch):
             "1",  # credentials method
             "ali",  # username
             "secret",  # password
+            "manual",  # profile source -> the manual questions
             "علی",  # first name
             "علی رضایی",  # full name
             "برنامه‌نویس بک‌اند",  # role
@@ -149,6 +152,7 @@ def test_terminal_wizard_saves_answers(tmp_path, monkeypatch):
             "1",  # tone
             "روی تحویل مرحله‌ای تأکید کن.",  # style
             "1200",  # max chars
+            "70",  # pricing: 70% of the employer budget
             "1",  # dry-run
         ]
     )
@@ -193,3 +197,103 @@ def test_llm_is_recommended_not_required_for_setup_completion(tmp_path):
 
     onboarding.mark_setup_complete(store)
     assert onboarding.readiness(store)["setup_completed"] is True
+
+
+def test_profile_source_decides_which_questions_are_asked(tmp_path):
+    store = make_store(tmp_path)
+    source_q = next(q for q in onboarding.profile_questions(store) if q.key == "profile.source")
+    assert source_q.current_default(store) == "resume"  # nothing stored yet
+
+    onboarding.apply_answer(store, source_q, "github")
+    questions = {q.store_key(store): q for q in onboarding.profile_questions(store)}
+    assert questions["profile.source_url"].applicable(store) is True
+    assert questions["profile.resume_path"].applicable(store) is False
+    assert questions["profile.first_name"].applicable(store) is False  # no manual Q&A
+
+    onboarding.apply_answer(store, source_q, "manual")
+    questions = {q.store_key(store): q for q in onboarding.profile_questions(store)}
+    assert questions["profile.first_name"].applicable(store) is True
+    assert questions["profile.source_url"].applicable(store) is False
+
+
+def test_existing_manual_profile_is_not_forced_through_an_import(tmp_path):
+    store = make_store(tmp_path)
+    store.set("profile.full_name", "علی اقبالی")
+    source_q = next(q for q in onboarding.profile_questions(store) if q.key == "profile.source")
+    assert source_q.current_default(store) == "manual"
+
+
+def test_skipping_the_profile_source_pins_nothing(tmp_path):
+    store = make_store(tmp_path)
+    onboarding.apply_answer(
+        store, next(q for q in onboarding.profile_questions(store) if q.key == "profile.source"), "skip"
+    )
+    assert store.get("profile.source") is None
+
+
+def test_bid_percent_is_stored_as_a_ratio(tmp_path):
+    store = make_store(tmp_path)
+    question = onboarding.pricing_questions(store)[0]
+    assert onboarding.parse_answer(question, "۴۵", store) == 45
+    onboarding.apply_answer(store, question, 45)
+    assert store.get("pricing.bid_percent") == 45
+    assert store.get("pricing.ratio") == 0.45
+    assert onboarding.bid_percent(store) == 45
+    # the question shows the stored percentage next time
+    assert question.current_default(store) == 45
+
+
+def test_bid_percent_range_is_validated(tmp_path):
+    store = make_store(tmp_path)
+    question = onboarding.pricing_questions(store)[0]
+    with pytest.raises(onboarding.QuestionError):
+        onboarding.parse_answer(question, "5", store)
+    with pytest.raises(onboarding.QuestionError):
+        onboarding.parse_answer(question, "150", store)
+
+
+def test_terminal_wizard_imports_a_resume_pdf(tmp_path, monkeypatch):
+    """The terminal wizard runs the same analysis queue as the bot."""
+    from pdf_fixtures import make_pdf
+
+    store = make_store(tmp_path)
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(
+        make_pdf(
+            [
+                "Sara Ahmadi",
+                "UI/UX Designer",
+                "7 years of experience",
+                "Figma, React",
+                "https://github.com/sara",
+            ]
+        )
+    )
+    store.update(
+        {
+            "telegram.bot_token": "123456789:AAHabcdefghijklmnopqrstuvwxyz012345",
+            "telegram.chat_ids": ["42"],
+            "llm.provider": "groq",
+            "marketplace.name": "mock",
+        }
+    )
+    answers = {
+        "marketplace.name": "mock",
+        "profile.source": "resume",
+        "profile.resume_path": str(resume),
+    }
+    monkeypatch.setattr(
+        onboarding,
+        "_prompt_question",
+        lambda console, question, st, index, total: answers.get(
+            question.store_key(st), question.current_default(st)
+        ),
+    )
+    from rich.console import Console
+
+    onboarding.run_terminal_wizard(store, Console(record=True))
+
+    assert store.get("profile.full_name") == "Sara Ahmadi"
+    assert store.get("profile.years_experience") == 7
+    assert store.get("profile.source") == "resume"
+    assert Path(store.get("profile.resume_path")).exists()

@@ -89,6 +89,10 @@ class Source(abc.ABC):
     async def healthcheck(self) -> tuple[bool, str]:
         return True, "ok"
 
+    async def verify_session(self) -> tuple[bool, str]:
+        """Is the stored account usable right now? Sources override this."""
+        return True, "این منبع ورود لازم ندارد."
+
     # ---------------------------------------------------------------- helpers
     async def get_html(self, path: str, **kwargs: Any) -> str:
         client = await self.client()

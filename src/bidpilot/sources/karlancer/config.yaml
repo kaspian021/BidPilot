@@ -140,6 +140,12 @@ bid:
 auth:
   mode: "cookie"
   cookie_name: "PHPSESSID"
+  # --- checking the saved session (used by /test and after setup) -------------
+  # صفحه‌ای که فقط کاربر لاگین‌شده می‌بیند؛ اگر پیدا نشد، صفحه‌ی اصلی امتحان می‌شود.
+  check_path: "/dashboard"
+  logged_in_markers: ['خروج', 'داشبورد', 'پروفایل من', 'پنل کاربری', 'حساب کاربری']
+  login_markers: ['ورود به حساب', 'فراموشی رمز', 'بازیابی رمز']
+
   login_path: "/login"
   submit_path: "/login"
   username_field: "username"

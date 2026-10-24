@@ -308,6 +308,17 @@ def apply_store_to_raw(raw: dict[str, Any], store: SettingsStore) -> dict[str, A
         notifications["chat_ids"] = chat_ids
         raw["notifications"] = notifications
 
+    ratio = store.get("pricing.ratio")
+    if ratio is not None:
+        try:
+            value = min(1.0, max(0.0, float(ratio)))
+        except (TypeError, ValueError):
+            value = None
+        if value is not None:
+            pricing = dict(raw.get("pricing") or {})
+            pricing["ratio"] = value
+            raw["pricing"] = pricing
+
     marketplace = store.get("marketplace.name")
     if marketplace:
         sources = [dict(src) for src in (raw.get("sources") or [])]

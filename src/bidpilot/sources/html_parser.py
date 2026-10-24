@@ -308,6 +308,183 @@ def _project_scope(soup: BeautifulSoup, title: str) -> Tag | None:
     return best
 
 
+_MONEY_EXPRESSION_RE = re.compile(
+    r"(?<!\w)"
+    r"(?P<amount>\d(?:[\d,.\u066c\u060c]*\d)?\s*"
+    r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?"
+    r"(?:\s*(?:تا|الی|[-–—])\s*\d(?:[\d,.\u066c\u060c]*\d)?\s*"
+    r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?)?"
+    r"(?:تومان|تومن|ریال))",
+    re.IGNORECASE,
+)
+_BUDGET_PREFIX_RE = re.compile(
+    r"(?:بودجه(?:[\u200c]?[یٔ])?|سقف\s*بودجه|مبلغ|حق[\u200c-]?الزحمه|"
+    r"هزینه|قیمت|برآورد(?:ی)?|تخمینی|تقریبی|حداقل|حداکثر|تصریح|از|حدود)"
+    r"\s*[:：\-]?\s*",
+    re.IGNORECASE,
+)
+_BUDGET_SUFFIX_RE = re.compile(r"[\d\s:/\-–—آ-ی]*")
+
+
+def _normalized_marker(value: str) -> str:
+    return clean_text(value).replace("\u200c", " ").replace("ي", "ی").replace("ك", "ک").casefold()
+
+
+def _find_project_header_budget(
+    soup: BeautifulSoup,
+    title: str,
+    *,
+    end_markers: list[str] | tuple[str, ...] | None = None,
+    diagnostics: bool = False,
+) -> tuple[Budget | None, str, str, str]:
+    """Find a budget amount in short metadata nodes between the project title and skills section.
+
+    Ponisha renders the budget as an unclassed text node adjacent to the description.
+    Keep the search bounded before the skills heading so recommendation-card prices
+    lower on the page can never become this project's budget.
+    """
+    normalized_title = _normalized_marker(title)
+    headings = soup.find_all(["h1", "h2", "h3", "h4"])
+    heading: Tag | None = None
+    for candidate in headings:
+        normalized = _normalized_marker(candidate.get_text(" ", strip=True))
+        if normalized == normalized_title or (
+            normalized_title
+            and normalized_title in normalized
+            and len(normalized) <= len(normalized_title) + 30
+        ):
+            heading = candidate
+            break
+
+    if heading is None:
+        if diagnostics:
+            log.info("[PARSER][HEADER-BUDGET] title=%r result=no_project_heading", title)
+        return None, "", "no_project_heading", ""
+
+    node_tags = [
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "p",
+        "div",
+        "span",
+        "li",
+        "dt",
+        "dd",
+        "td",
+        "label",
+        "small",
+        "strong",
+        "b",
+        "time",
+    ]
+    ordered = list(soup.find_all(node_tags))
+    try:
+        title_index = ordered.index(heading)
+    except ValueError:
+        if diagnostics:
+            log.info("[PARSER][HEADER-BUDGET] title=%r result=title_not_in_dom_order", title)
+        return None, "", "no_project_heading", ""
+
+    markers = [
+        _normalized_marker(marker)
+        for marker in (end_markers or _DESCRIPTION_END_MARKERS)
+        if _normalized_marker(marker)
+    ]
+    end_index = len(ordered)
+    end_found = False
+    for index in range(title_index + 1, len(ordered)):
+        node = ordered[index]
+        if node.name not in {"h2", "h3", "h4", "h5"}:
+            continue
+        heading_text = _normalized_marker(node.get_text(" ", strip=True))
+        if any(marker in heading_text for marker in markers):
+            end_index = index
+            end_found = True
+            break
+
+    # Without a recognizable section boundary, this fallback cannot distinguish
+    # the current project's metadata from recommended-project cards below it.
+    if not end_found:
+        if diagnostics:
+            log.info(
+                "[PARSER][HEADER-BUDGET] title=%r result=no_section_boundary",
+                title,
+            )
+        return None, "", "not_found", ""
+
+    money_nodes: list[str] = []
+    checked = 0
+    # Only inspect the DOM between this title and the first section heading below it.
+    for node in ordered[title_index + 1 : end_index]:
+        text = clean_text(node.get_text(" ", strip=True))
+        if len(text) > 180:
+            # A parent container can include the full description and other sections.
+            # Data attributes are still eligible, but its combined visible text is not.
+            visible_candidates: list[str] = []
+        else:
+            has_nested_text = node.find(node_tags) is not None
+            visible_candidates = [] if has_nested_text else ([text] if text else [])
+
+        attrs = [
+            clean_text(str(node.get(attr) or ""))
+            for attr in ("data-budget", "data-price", "data-amount", "aria-label", "title", "content")
+            if node.get(attr) is not None
+        ]
+        candidates = [*visible_candidates, *attrs]
+        for evidence in candidates:
+            if not evidence or len(evidence) > 180:
+                continue
+            if not re.search(r"تومان|تومن|ریال", evidence):
+                continue
+
+            checked += 1
+            money_nodes.append(
+                f"<{node.name} class={(node.get('class') or [])[:4]!r} text={evidence[:140]!r}>"
+            )
+            matches = list(_MONEY_EXPRESSION_RE.finditer(evidence))
+            for match in reversed(matches):
+                prefix = evidence[: match.start()].strip()
+                suffix = evidence[match.end() :].strip()
+                # Accept an amount-only metadata node, optionally preceded by a
+                # short label such as the "تصریح" marker seen in the supplied log.
+                # Reject full descriptive sentences and unrelated numeric prose.
+                if len(prefix) > 20 or len(suffix) > 36:
+                    continue
+                if re.search(r"[.!؟؛،\n]", prefix) or re.search(r"[.!؟؛،\n]", suffix):
+                    continue
+                if prefix and not _BUDGET_PREFIX_RE.fullmatch(prefix):
+                    continue
+                if suffix and not _BUDGET_SUFFIX_RE.fullmatch(suffix):
+                    continue
+
+                amount_text = clean_text(match.group("amount"))
+                budget = parse_budget_text(amount_text)
+                if budget is None or not budget.is_known:
+                    continue
+                if diagnostics:
+                    log.info(
+                        "[PARSER][HEADER-BUDGET] title=%r result=found source=project_header_money_node "
+                        "amount=%r evidence=%r candidates_checked=%s",
+                        title,
+                        amount_text,
+                        evidence,
+                        checked,
+                    )
+                return budget, amount_text, "project_header_money_node", evidence
+
+    if diagnostics:
+        log.info(
+            "[PARSER][HEADER-BUDGET] title=%r result=not_found candidates_checked=%s money_nodes=%r",
+            title,
+            checked,
+            money_nodes[:8],
+        )
+    return None, "", "not_found", ""
+
+
 def _extract_between_markers(
     text: str,
     start_markers: list[str] | tuple[str, ...] | None = None,
@@ -726,9 +903,10 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
 
     budget = _parse_amount(budget_text)
     budget_origin = "detail_selector" if budget is not None and budget.is_known else "detail_selector_miss"
+    budget_source_evidence = ""
     if budget is None or not budget.is_known:
         # Searching flattened body text can combine "cost" wording with a number
-        # in a different recommended project. Ponisha can require a verified scope.
+        # in a different recommended project. First search the scoped project DOM.
         if scope is not None:
             found, evidence, origin = _find_budget_in_markup(
                 scoped_root, detail.get("budget"), settings.get("budget_regex")
@@ -745,9 +923,20 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
             budget_text = evidence or found.source_text or budget_text
             budget_origin = "detail_page_text" if origin == "labeled_text_block" else origin
         else:
-            budget_origin = (
-                "not_found" if scope is not None or not require_project_scope else "no_project_scope"
+            header_cfg = settings.get("description_fallback") or {}
+            found, amount_text, origin, source_evidence = _find_project_header_budget(
+                soup,
+                project.title,
+                end_markers=header_cfg.get("end_markers"),
+                diagnostics=bool(settings.get("_diagnostics")),
             )
+            if found is not None and found.is_known:
+                budget = found
+                budget_text = amount_text
+                budget_origin = origin
+                budget_source_evidence = source_evidence
+            else:
+                budget_origin = "not_found" if scope is not None or not require_project_scope else origin
 
     if not description:
         fallback_cfg = settings.get("description_fallback") or {}
@@ -756,6 +945,10 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
             fallback_cfg.get("start_markers"),
             fallback_cfg.get("end_markers"),
         )
+    # The bounded page-text description can include the neighboring budget/date
+    # widget. Remove that exact DOM text node so proposal text remains only the brief.
+    if description and budget_source_evidence and budget_source_evidence in description:
+        description = description.rsplit(budget_source_evidence, 1)[0].rstrip()
     log.info(
         "[PARSER][DETAIL] source=%s id=%s title=%r url=%s scope_found=%s scope_tag=%s "
         "scope_id=%r scope_class=%r budget_selector_text=%r budget_text_used=%r "

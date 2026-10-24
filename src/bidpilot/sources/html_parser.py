@@ -112,9 +112,7 @@ _SCOPED_BUDGET_LABELS = (
     r"project\s+budget",
     r"budget(?:\s+amount)?",
 )
-_SCOPED_BUDGET_REGEXES = tuple(
-    rf"{label}\s*[:：]?\s*([^\n]{{2,100}})" for label in _SCOPED_BUDGET_LABELS
-)
+_SCOPED_BUDGET_REGEXES = tuple(rf"{label}\s*[:：]?\s*([^\n]{{2,100}})" for label in _SCOPED_BUDGET_LABELS)
 _DESCRIPTION_END_MARKERS = (
     "مهارت‌های مورد نیاز",
     "مهارت های مورد نیاز",

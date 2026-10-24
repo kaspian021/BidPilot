@@ -716,9 +716,7 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     # On Ponisha, do not trust broad price/budget selectors across the entire page
     # if we could not isolate this project's own DOM section.
     budget_selector_text = (
-        _text(scoped_root, detail.get("budget"))
-        if scope is not None or not require_project_scope
-        else ""
+        _text(scoped_root, detail.get("budget")) if scope is not None or not require_project_scope else ""
     )
     budget_text = budget_selector_text
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(scoped_root, detail.get("skills"))]

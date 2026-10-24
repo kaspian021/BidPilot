@@ -797,9 +797,15 @@ class BotService:
             return
         await self.send(chat_id, "🔐 یک‌بار ورود به حساب را بررسی می‌کنم…")
         check = await check_site(self.store, config_path=self.config_path)
-        await self.send(chat_id, check.message())
         if not check.ok:
+            await self.send(
+                chat_id,
+                check.message()
+                + "\\n\\n⛔ <b>ورود به حساب تأیید نشد؛ جست‌وجو و ارسال پیشنهاد شروع نمی‌شود.</b>\\n"
+                "از /market کوکی/ورود را به‌روز کن، با /test دوباره بررسی کن و سپس /run را بزن.",
+            )
             return
+        await self.send(chat_id, check.message())
         ok, message = await self.automation.start()
         await self.send(
             chat_id,

@@ -101,6 +101,36 @@ class Automation:
             log.exception("Could not start automation")
             return False, f"برنامه ساخته نشد: {exc}"
 
+        # Refuse to start LIVE discovery if we cannot prove that the marketplace
+        # session is valid. This catches CLI --run as well as the Telegram button.
+        if cfg.runtime.live:
+            names = self.sources or list(app.sources)
+            for name in names:
+                source = app.sources.get(name)
+                if source is None:
+                    continue
+                try:
+                    session_ok, session_detail = await source.verify_session()
+                except Exception as exc:
+                    session_ok = False
+                    session_detail = f"بررسی نشست با خطای {type(exc).__name__} متوقف شد."
+                log.info(
+                    "[AUTOMATION][SESSION-CHECK] source=%s live=True ok=%s detail=%r",
+                    name,
+                    session_ok,
+                    session_detail,
+                )
+                if not session_ok:
+                    message = (
+                        f"⛔ <b>وارد حساب کاربری «{name}» نیستیم یا نشست معتبر نیست.</b>\n"
+                        "جست‌وجو و ارسال پیشنهاد شروع نشد. از /market ورود/کوکی را به‌روز کن، "
+                        "با /test وضعیت ورود را بررسی کن و سپس دوباره /run را بزن.\n"
+                        f"جزئیات: {session_detail or 'ورود تأیید نشد.'}"
+                    )
+                    await self._say(message)
+                    await app.close()
+                    return False, "ورود به حساب تأیید نشد؛ عملیات شروع نشد."
+
         def make_app() -> Application:
             return build_application(load_config(self.config_path, store=self.store))
 
@@ -115,9 +145,18 @@ class Automation:
         )
         self.summary = RunSummary(started_at=datetime.now(timezone.utc))
         self._notified_first_cycle = False
-        self._task = asyncio.create_task(self._scheduler.run_forever(), name="bidpilot-runner")
+        self._task = asyncio.create_task(self._run_scheduler(), name="bidpilot-runner")
         mode = "واقعی 🔴" if cfg.runtime.live else "آزمایشی 🧪"
         return True, f"رصد شروع شد — حالت {mode}، هر {self._scheduler.interval} ثانیه."
+
+    async def _run_scheduler(self) -> None:
+        try:
+            if self._scheduler is not None:
+                await self._scheduler.run_forever()
+        finally:
+            # The scheduler also exits automatically if authentication expires.
+            # Release the app/database/HTTP clients in either shutdown path.
+            await self._shutdown_app()
 
     # ------------------------------------------------------------------- stop
     async def stop(self) -> tuple[bool, str]:
@@ -151,6 +190,11 @@ class Automation:
     # ---------------------------------------------------------------- reports
     async def _on_report(self, reports: list[Any]) -> None:
         self.summary.add(reports)
+        if any(getattr(report, "authentication_failed", False) for report in reports):
+            # Application._dispatch_digest sends the explicit login-required alert.
+            if self._scheduler is not None:
+                self._scheduler.request_stop()
+            return
         if not self._notified_first_cycle:
             self._notified_first_cycle = True
             await self._say(self.first_cycle_text())

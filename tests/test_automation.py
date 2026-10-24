@@ -319,3 +319,47 @@ def test_bid_percent_changes_the_effective_price(env):
     # and it never leaves the employer's range
     env.set("pricing.ratio", 1.0)
     assert price() == 1_500_000
+
+
+async def test_live_automation_refuses_to_start_without_a_valid_session(env, tmp_path, monkeypatch):
+    import bidpilot.automation as automation_module
+
+    monkeypatch.chdir(tmp_path)
+    env.update({"marketplace.name": "parscoders", "runtime.submit_mode": "live"})
+    cfg = load_config(CONFIG, store=env)
+    assert cfg.runtime.live
+
+    class UnauthenticatedSource:
+        async def verify_session(self):
+            return False, "کوکی منقضی شده است"
+
+    class FakeApp:
+        def __init__(self):
+            self.config = cfg
+            self.sources = {"parscoders": UnauthenticatedSource()}
+            self.closed = False
+
+        async def setup(self):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    fake_app = FakeApp()
+    monkeypatch.setattr(automation_module, "load_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(automation_module, "build_application", lambda config: fake_app)
+    notes = []
+
+    async def notify(text):
+        notes.append(text)
+
+    automation = Automation(store=env, config_path=CONFIG, notify=notify)
+    ok, message = await automation.start()
+
+    assert not ok
+    assert "ورود" in message
+    assert fake_app.closed
+    assert not automation.running
+    assert automation._scheduler is None
+    assert notes and "وارد حساب کاربری" in notes[0]
+    assert "جست‌وجو و ارسال پیشنهاد شروع نشد" in notes[0]

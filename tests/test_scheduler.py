@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 from bidpilot.scheduler import Scheduler
@@ -9,7 +10,9 @@ class FakeApp:
         self.tag = tag
         self.closed = False
         self.setup_called = False
-        self.config = SimpleNamespace(runtime=SimpleNamespace(poll_interval_seconds=60, jitter_seconds=0))
+        self.config = SimpleNamespace(
+            runtime=SimpleNamespace(poll_interval_seconds=60, jitter_seconds=0, live=False)
+        )
 
     async def setup(self) -> None:
         self.setup_called = True
@@ -44,3 +47,39 @@ async def test_scheduler_without_factory_never_reloads(tmp_path):
     scheduler = Scheduler(app, interval=60, jitter=0, store=SettingsStore(tmp_path / "s.json"))
     assert await scheduler.reload_if_settings_changed() is False
     assert scheduler.app is app
+
+
+async def test_scheduler_stops_after_a_report_marks_authentication_failed(tmp_path):
+    class AuthReport:
+        source = "parscoders"
+        authentication_failed = True
+        errors = ["ورود به حساب تأیید نشد"]
+
+        def summary(self):
+            return "authentication failed"
+
+    class AuthApp(FakeApp):
+        def __init__(self):
+            super().__init__()
+            self.sources = {"parscoders": object()}
+            self.cycles = 0
+
+        async def cycle(self, sources=None):
+            self.cycles += 1
+            return [AuthReport()]
+
+    app = AuthApp()
+    callback_reports = []
+    scheduler = Scheduler(
+        app,
+        interval=600,
+        jitter=0,
+        store=SettingsStore(tmp_path / "settings.json"),
+        on_report=lambda reports: callback_reports.extend(reports),
+    )
+
+    await asyncio.wait_for(scheduler.run_forever(), timeout=2)
+
+    assert app.cycles == 1
+    assert len(callback_reports) == 1
+    assert scheduler._stop.is_set()

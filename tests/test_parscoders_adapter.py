@@ -249,3 +249,22 @@ async def test_detail_html_is_cached_between_poll_cycles():
     assert list_route.call_count == 2
     assert detail_route.call_count == 3
     await source.aclose()
+
+
+@respx.mock
+async def test_submit_redirect_without_success_confirmation_is_not_counted_as_submitted():
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=PROJECT_HTML)
+    )
+    respx.post("https://parscoders.com/project/12345/bid").mock(
+        return_value=httpx.Response(302, headers={"Location": "/project/12345"})
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "session-value"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام و وقت بخیر"), 1_000_000, 14)
+
+    assert result.status.value == "failed"
+    assert "نامشخص" in result.message
+    await source.aclose()

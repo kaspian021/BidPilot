@@ -289,7 +289,8 @@ class ProposalGenerator:
                     f"با ابزارهای مورد نیاز این پروژه ({'، '.join(overlap[:3])}) کار کرده‌ام"
                 )
         if not relevance_bits:
-            relevance_bits.append("پروژه‌هایی با همین جنس کار و همین سطح از جزئیات را اجرا کرده‌ام")
+            # Never imply matching past experience unless the profile supports it.
+            relevance_bits.append("راهکار را بر اساس نیازها و محدودیت‌های اعلام‌شده‌ی همین پروژه تنظیم می‌کنم")
         relevance = "، و ".join(relevance_bits) + "."
 
         context = {

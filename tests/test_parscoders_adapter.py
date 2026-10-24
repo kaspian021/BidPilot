@@ -131,7 +131,7 @@ async def test_submit_bid_handles_expired_session():
     result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
 
     assert result.status.value == "failed"
-    assert "فرم ارسال پیشنهاد پیدا نشد" in result.message or "نشست" in result.message
+    assert "صفحهٔ پروژه دریافت شد" in result.message or "نشست" in result.message
     await source.aclose()
 
 

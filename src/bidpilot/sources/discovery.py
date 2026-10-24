@@ -305,6 +305,11 @@ _METADATA_LINE = re.compile(
     r"مهارت|دسته.?بندی|کارفرما|وضعیت|status|تومان|تومن|ریال",
     re.IGNORECASE,
 )
+_DEADLINE_RE = re.compile(
+    r"(?:مهلت(?:\\s+تحویل)?|زمان\\s+تحویل|مدت\\s+زمان(?:\\s+مورد\\s+نظر)?|deadline|delivery\\s+time)"
+    r"\\s*[:：\\-]?\\s*([0-9]+(?:[.,][0-9]+)?\\s*(?:روز(?:\\s+کاری)?|هفته(?:\\s+کاری)?|ماه|ساعت|دقیقه|days?|weeks?|months?|hours?))",
+    re.IGNORECASE,
+)
 _CONTENT_SELECTORS = (
     "main",
     '[role="main"]',
@@ -796,9 +801,14 @@ class DiscoveryAgent:
                 budget_source = "missing"
 
         deadline = clean_text(str(data.get("deadline_text") or ""))[:100]
-        deadline_key = " ".join(deadline.split()).casefold()
-        if not deadline_key or deadline_key not in evidence_text:
-            deadline = ""
+        deadline_match = _DEADLINE_RE.search(evidence_text)
+        if deadline_match:
+            # Prefer a deterministic duration visibly tied to the deadline label.
+            deadline = clean_text(deadline_match.group(1))[:100]
+        else:
+            deadline_key = " ".join(deadline.split()).casefold()
+            if not deadline_key or deadline_key not in evidence_text:
+                deadline = ""
 
         # Prefer the actual HTML description node; otherwise retain the visible page
         # text instead of replacing it with an LLM-compressed summary that may omit requirements.

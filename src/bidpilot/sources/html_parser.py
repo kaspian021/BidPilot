@@ -149,6 +149,8 @@ def _labeled_range_budget(text: str, value_start: int) -> Budget | None:
     ):
         return None
     return budget
+
+
 _DESCRIPTION_END_MARKERS = (
     "مهارت‌های مورد نیاز",
     "مهارت های مورد نیاز",

@@ -35,12 +35,7 @@ class Repository:
         return (await self.session.execute(stmt)).scalars().first()
 
     async def latest_bid_for_project(self, project_id: int) -> BidRow | None:
-        stmt = (
-            select(BidRow)
-            .where(BidRow.project_id == project_id)
-            .order_by(BidRow.id.desc())
-            .limit(1)
-        )
+        stmt = select(BidRow).where(BidRow.project_id == project_id).order_by(BidRow.id.desc()).limit(1)
         return (await self.session.execute(stmt)).scalars().first()
 
     async def refresh_project_row(self, row: ProjectRow, project: Project) -> ProjectRow:

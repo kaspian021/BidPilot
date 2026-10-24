@@ -361,8 +361,7 @@ class HtmlMarketSource(Source):
         ai_enabled = self.ai_discovery_enabled()
         cfg = self.discovery_settings()
         log.info(
-            "[FETCH][START] source=%s base_url=%s mode=%s ai_enabled=%s "
-            "log_extraction_details=%s",
+            "[FETCH][START] source=%s base_url=%s mode=%s ai_enabled=%s log_extraction_details=%s",
             self.name,
             self.base_url,
             mode,
@@ -503,8 +502,7 @@ class HtmlMarketSource(Source):
             try:
                 enriched = parser.enrich_from_detail(html, project, detail_cfg)
                 log.info(
-                    "[SELECTORS][DETAIL-RESULT] source=%s id=%s title=%r "
-                    "budget_before=%r budget_after=%r",
+                    "[SELECTORS][DETAIL-RESULT] source=%s id=%s title=%r budget_before=%r budget_after=%r",
                     self.name,
                     project.external_id,
                     project.title,

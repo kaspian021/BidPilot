@@ -158,9 +158,7 @@ async def test_submit_bid_detects_proposal_action_gated_by_login():
       </form>
     </body></html>
     """
-    respx.get("https://parscoders.com/project/12345").mock(
-        return_value=httpx.Response(200, text=page)
-    )
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
     post_route = respx.post("https://parscoders.com/project/12345").mock(
         return_value=httpx.Response(200, text="unexpected")
     )
@@ -185,9 +183,7 @@ async def test_verify_session_does_not_treat_generic_account_text_as_login_proof
       <div>فراموشی رمز</div>
     </body></html>
     """
-    respx.get("https://parscoders.com/dashboard").mock(
-        return_value=httpx.Response(200, text=login_page)
-    )
+    respx.get("https://parscoders.com/dashboard").mock(return_value=httpx.Response(200, text=login_page))
     source = make_source()
     source.credentials = SiteCredentials(site="parscoders", method="cookie", cookie="PHPSESSID=session-value")
 
@@ -196,4 +192,3 @@ async def test_verify_session_does_not_treat_generic_account_text_as_login_proof
     assert ok is False
     assert "ورود" in message or "کوکی" in message
     await source.aclose()
-

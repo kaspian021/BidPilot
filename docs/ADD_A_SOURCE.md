@@ -1,130 +1,174 @@
 # افزودن یک مارکت‌پلیس جدید
 
-هدف: در ۳۰ دقیقه یک سایت جدید را به BidPilot وصل کنید.
+BidPilot از چند سایت فریلنسری هم‌زمان پشتیبانی می‌کند و فقط **یکی** در هر لحظه فعال
+است (از تلگرام با `/site` عوض می‌شود). هر سایت حساب کاربری مستقل خودش را دارد:
+`credentials.<site>.cookie` / `username` / `password` / `method`.
 
-## ۱) ساخت آداپتور
+افزودن سایت معمولاً **فقط یک فایل YAML** است؛ کد لازم نیست.
 
-```bash
-mkdir -p src/bidpilot/sources/mysite
-touch src/bidpilot/sources/mysite/__init__.py
+---
+
+## راه ۱ (پیشنهادی): فقط YAML
+
+ساختار:
+
+```
+src/bidpilot/sources/mysite/
+├── __init__.py
+├── adapter.py       # ۱۲ خط
+└── config.yaml      # سلکتورها، مسیر لیست، فرم پیشنهاد، نحوه‌ی ورود
 ```
 
+`adapter.py`:
+
 ```python
-# src/bidpilot/sources/mysite/adapter.py
-from __future__ import annotations
+from pathlib import Path
 
-import re
-from urllib.parse import urljoin
-
-from bs4 import BeautifulSoup
-
-from ...models import Project, Proposal, SubmissionResult, SubmissionStatus
-from ...pricing.budget import parse_budget
-from ...text import clean_text
-from ..base import Source
+from ..html_market import HtmlMarketSource, load_yaml_settings
 from ..registry import register_source
+
+_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+
+
+def load_default_settings() -> dict:
+    return load_yaml_settings(_CONFIG_PATH)
 
 
 @register_source("mysite")
-class MySiteSource(Source):
-    async def fetch_projects(self) -> list[Project]:
-        html = await self.get_html(self.settings.get("list_path", "/jobs"))
-        soup = BeautifulSoup(html, "lxml")
-        projects: list[Project] = []
-
-        for card in soup.select(self.settings.get("card_selector", "article.job")):
-            link = card.select_one("a")
-            if link is None:
-                continue
-            href = urljoin(self.base_url + "/", link["href"])
-            external_id = re.search(r"/jobs/(\d+)", href).group(1)
-
-            projects.append(
-                Project(
-                    source=self.name,
-                    external_id=external_id,
-                    title=clean_text(link.get_text(" ", strip=True)),
-                    url=href,
-                    description=clean_text(card.select_one(".desc").get_text(" ", strip=True))
-                    if card.select_one(".desc")
-                    else "",
-                    budget=parse_budget(card.select_one(".budget").get_text() if card.select_one(".budget") else ""),
-                    skills=[clean_text(s.get_text()) for s in card.select(".tag")],
-                )
-            )
-        return projects
-
-    async def submit_bid(self, project, proposal: Proposal, amount: int, delivery_days: int | None):
-        client = await self.client()
-        response = await client.post(
-            f"/jobs/{project.external_id}/bids",
-            data={
-                "price": amount,
-                "message": proposal.text,
-                "delivery_days": delivery_days or "",
-            },
-            headers={"Referer": project.url},
-        )
-        if response.status_code >= 400:
-            return self.fail(f"HTTP {response.status_code}", response.status_code)
-        if "موفق" not in clean_text(response.text):
-            return self.fail("پاسخ موفقیت در صفحه پیدا نشد.")
-        return SubmissionResult(status=SubmissionStatus.SUBMITTED, message="ثبت شد", http_status=response.status_code)
-
-    async def healthcheck(self) -> tuple[bool, str]:
-        projects = await self.fetch_projects()
-        return (bool(projects), f"{len(projects)} پروژه پیدا شد")
+class MySiteSource(HtmlMarketSource):
+    name = "mysite"
+    config_file = _CONFIG_PATH
+    default_base_url = "https://mysite.example"
 ```
 
+`__init__.py`:
+
 ```python
-# src/bidpilot/sources/mysite/__init__.py
 from .adapter import MySiteSource
 
 __all__ = ["MySiteSource"]
 ```
 
-برای اینکه ماژول در زمان import ثبت شود، در `src/bidpilot/sources/registry.py` به `_load_builtin` اضافه کنید:
+و ثبت در `src/bidpilot/sources/registry.py`:
 
 ```python
-from . import mock, mysite, parscoders  # noqa: F401
+from . import karlancer, mock, mysite, parscoders, ponisha  # noqa: F401
 ```
 
-## ۲) تنظیمات
+### config.yaml
 
 ```yaml
-# config/config.yaml
-sources:
-  - type: "mysite"
-    enabled: true
-    settings:
-      base_url: "https://mysite.example"
-      list_path: "/jobs"
-      card_selector: "article.job"
-      headers: { "X-Requested-With": "XMLHttpRequest" }
-      cookies: { "session": "..." }   # یا از SettingsStore / محیط با متغیر خودتان
+base_url: "https://mysite.example"
+
+list:
+  path: "/jobs"
+  page_param: "page"
+  max_pages: 2                    # ۱ = فقط صفحه اول
+  min_items_per_page: 1
+  card_selectors:                 # به ترتیب امتحان می‌شوند
+    - "article.job-card"
+    - "li.job-item"
+  fields:                         # برای هر فیلد چند سلکتور (اولی که پیدا شد)
+    title: ["h2 a", "a.job-title"]
+    link: ["h2 a", "a.job-title"]
+    description: [".excerpt", "p.summary"]
+    budget: [".budget", "[class*='price']"]
+    skills: [".tags .tag", "li.skill"]
+    employer: [".employer"]
+    published_at: ["time", ".date"]
+  id_regex: "/jobs/(\\d+)"        # شناسه‌ی یکتا از URL
+  fetch_details: true             # باز کردن صفحه‌ی هر پروژه برای متن کامل
+  detail_concurrency: 3
+
+detail:
+  path: "/jobs/{external_id}"     # یا "{url}" اگر آدرس کامل لازم است
+  detail_fields:
+    description: ["#job-description", ".job-body"]
+    budget: [".budget"]
+
+bid:
+  form_selectors: ["form#bid-form", "form[action*='bid']"]
+  fields:
+    amount: ["input[name*='price']", "input[name*='amount']"]
+    description: ["textarea[name*='message']", "textarea"]
+    days: ["input[name*='day']"]
+  include_hidden: true
+  success_text_contains: ["با موفقیت", "ثبت شد"]
+  failure_text_contains: ["قبلاً پیشنهاد", "وارد شوید", "خطا"]
+
+auth:
+  mode: "cookie"                  # cookie | credentials | none
+  cookie_name: "PHPSESSID"
+  login_path: "/login"
+  submit_path: "/login"
+  username_field: "username"
+  password_field: "password"
+  parse_hidden: true              # توکن CSRF فرم لاگین را خودکار پر می‌کند
 ```
 
-کلیدهای امنیتی (کوکی/توکن) را در `config.Secrets` فیلد اضافه کنید — مقدارش از
-`data/settings.json` (کلیدهایی مثل `credentials.<source>.cookie`) یا `.env` می‌آید، نه YAML.
-برای اینکه ویزارد/ربات هم آن را بپرسند، یک `Question` در `onboarding.py` اضافه کنید.
+> اگر سایت هیچ سلکتوری نداشته باشد، BidPilot یک **fallback محتوایی** اجرا می‌کند:
+> لینک‌هایی که شبیه صفحه‌ی پروژه‌اند (id عددی در URL) پیدا و کارت‌بندی می‌شوند؛
+> اما متن/بودجه‌ی دقیق فقط با سلکتور درست به دست می‌آید. `bidpilot inspect`
+> می‌گوید کدام حالت فعال شده است.
 
-## ۳) بررسی بدون ارسال
+### پیدا کردن سلکتورها بدون حدس زدن
 
 ```bash
-bidpilot doctor                       # آیا صفحه باز می‌شود و پروژه‌ای پیدا می‌شود؟
-bidpilot preview -s mysite --limit 2  # متن و قیمت‌ها را ببینید
-bidpilot once -s mysite --dry-run     # یک دور کامل بدون ارسال
+bidpilot inspect -s mysite                    # صفحه‌ی لیست سایت فعال/انتخابی
+bidpilot inspect -s mysite -u https://mysite.example/jobs
+bidpilot inspect -s mysite -f ~/Downloads/jobs.html   # فایل ذخیره‌شده از مرورگر
 ```
 
-## ۴) تست
+خروجی می‌گوید هر سلکتور چند مورد پیدا می‌کند، چند لینک پروژه‌مانند وجود دارد و
+تشخیص خودکار چند پروژه پیدا کرده است. اولین سلکتوری که تعداد معقولی (چند کارت)
+پیدا می‌کند را در `config.yaml` بگذارید.
+
+### تنظیمات و ورود
+
+- `config/config.yaml` لازم نیست تغییر کند؛ اگر خواستید، یک بلوک
+  `- type: "mysite"` اضافه کنید (پیش‌فرض `enabled: false`).
+- کوکی/رمز **در YAML نوشته نمی‌شود**. از تلگرام `/market` یا ترمینال:
+
+```bash
+bidpilot settings use mysite
+bidpilot settings set credentials.mysite.cookie -v (Get-Clipboard -Raw).Trim()   # ویندوز
+bidpilot settings set credentials.mysite.method -v cookie
+```
+
+سپس:
+
+```bash
+bidpilot selftest -s mysite          # حساب + لیست + فرم پیشنهاد (بدون ارسال)
+bidpilot preview -s mysite --limit 2
+```
+
+---
+
+## راه ۲ (پیشرفته): آداپتور سفارشی
+
+اگر سایت JSON API دارد یا رفتارش با فرم HTML جور نیست، مستقیم از `Source` ارث ببرید
+(نمونه‌ی کامل و تست با `respx`: `src/bidpilot/sources/mock/`). قرارداد:
+
+- `fetch_projects()` → `list[Project]` با `external_id` پایدار از URL.
+- `submit_bid(project, proposal, amount, delivery_days)` → همیشه `SubmissionResult`
+  برمی‌گرداند (هرگز exception انتظاری بالا نمی‌دهد).
+- `healthcheck()` → `(ok, پیام)` و وقتی سلکتور/سایت شکست، `False`.
+- `login()` اگر سایت ورود با رمز دارد.
+- ورود/نشست از `bidpilot.credentials.site_credentials(self.name)` خوانده شود تا
+  حساب هر سایت جدا بماند.
+
+ثبت در `registry._load_builtin` هم مثل راه ۱.
+
+---
+
+## تست
 
 ```python
-# tests/test_mysite_adapter.py
 import httpx, respx
 from bidpilot.sources.mysite.adapter import MySiteSource
 
 @respx.mock
-async def test_fetch(monkeypatch):
+async def test_fetch():
     respx.get("https://mysite.example/jobs").mock(
         return_value=httpx.Response(200, text=(FIXTURES / "mysite_list.html").read_text())
     )
@@ -133,15 +177,20 @@ async def test_fetch(monkeypatch):
     assert projects[0].external_id
 ```
 
+نمونه‌های موجود: `tests/test_credentials.py`، `tests/test_multi_site.py`،
+`tests/test_parscoders_parser.py` و `tests/fixtures/`.
+
 ## چک‌لیست کیفیت آداپتور
 
 - [ ] `external_id` پایدار است (از URL، نه از عنوان).
-- [ ] تاریخ انتشار پروژه‌های تکراری باعث ثبت دوباره نمی‌شود.
-- [ ] `submit_bid` هرگز exception «انتظاری» بالا نمی‌دهد؛ همیشه `SubmissionResult` برمی‌گرداند.
-- [ ] نشست منقضی/بلاک/قبلاً ارسال‌شده تشخیص داده می‌شود.
+- [ ] پروژه‌های تکراری دوباره ثبت نمی‌شوند.
+- [ ] `submit_bid` همیشه `SubmissionResult` برمی‌گرداند (شامل «قبلاً پیشنهاد داده‌اید»).
+- [ ] نشست منقضی/بلاک تشخیص داده می‌شود و پیامش به `/market` راهنمایی می‌کند.
 - [ ] `healthcheck` وقتی سلکتورها می‌شکنند `False` برمی‌گرداند.
+- [ ] `credentials.<site>.*` تنها منبع اعتبارنامه است (نه YAML، نه `.env` اجباری).
 - [ ] برای هر رفتار سایت یک تست با `respx` وجود دارد.
 
 ## نکته‌ی حقوقی
 
-برای بعضی سایت‌ها ارسال خودکار خلاف قوانین است یا API رسمی وجود دارد. اگر API رسمی هست، همان را ترجیح دهید (سریع‌تر، پایدارتر و بی‌ریسک‌تر).
+برای بعضی سایت‌ها ارسال خودکار خلاف قوانین است یا API رسمی وجود دارد. اگر API رسمی
+هست، همان را ترجیح دهید (سریع‌تر، پایدارتر و بی‌ریسک‌تر).

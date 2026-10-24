@@ -47,8 +47,11 @@ from .onboarding import (
     profile_questions,
     readiness,
     save_chat_id,
+    site_label,
+    sites_overview,
     status_text,
     style_questions,
+    switch_site,
     tone_summary,
 )
 from .settings_store import SettingsStore, get_store
@@ -155,6 +158,8 @@ class TelegramAPI:
             {"command": "status", "description": "وضعیت و تنظیمات فعلی"},
             {"command": "setup", "description": "راه‌اندازی گام‌به‌گام"},
             {"command": "style", "description": "تغییر لحن و سبک پیشنهاد"},
+            {"command": "sites", "description": "سایت‌های فریلنسری و سوییچ"},
+            {"command": "market", "description": "حساب سایت فعال (کوکی/رمز)"},
             {"command": "preview", "description": "دیدن یک پیشنهاد نمونه"},
             {"command": "mode", "description": "آزمایشی / ارسال واقعی"},
             {"command": "help", "description": "راهنما"},
@@ -183,7 +188,9 @@ HELP_TEXT = """<b>BidPilot — راهنما</b>
 /style — لحن و دستورهای نوشتن پیشنهاد
 /profile — نام، سابقه، مهارت‌ها و نمونه‌کار
 /llm — انتخاب سرویس هوش مصنوعی رایگان و کلید آن
-/market — انتخاب سایت و ذخیره‌ی حساب
+/sites — همه‌ی سایت‌های فریلنسری و وضعیت هرکدام
+/site <name> — عوض کردن سایت فعال (مثلاً /site ponisha)
+/market — حساب سایت فعال: روش ورود + کوکی یا نام کاربری/رمز
 /status — چه چیزهایی تنظیم شده است؟
 /preview — یک پیشنهاد نمونه از یک پروژه‌ی واقعی (بدون ارسال)
 /mode — جابه‌جایی بین حالت آزمایشی و واقعی
@@ -313,6 +320,10 @@ class BotService:
             await self._consume_answer(chat, value)
             return
 
+        if data.startswith("site:"):
+            await self._cmd_site(chat, data.split(":", 1)[1])
+            return
+
         if data == "cmd:status":
             await self.handle_command(chat, "/status", "")
         elif data == "cmd:setup":
@@ -321,6 +332,10 @@ class BotService:
             await self.handle_command(chat, "/style", "")
         elif data == "cmd:preview":
             await self.handle_command(chat, "/preview", "")
+        elif data == "cmd:sites":
+            await self.handle_command(chat, "/sites", "")
+        elif data == "cmd:market":
+            await self.handle_command(chat, "/market", "")
         elif data == "cmd:help":
             await self.send(chat_id, HELP_TEXT)
         elif data == "cmd:cancel":
@@ -342,6 +357,10 @@ class BotService:
             await self._start_flow(chat_id, "llm", llm_questions(self.store))
         elif command == "/market":
             await self._start_flow(chat_id, "market", marketplace_questions(self.store))
+        elif command == "/sites":
+            await self._cmd_sites(chat_id)
+        elif command == "/site":
+            await self._cmd_site(chat_id, rest)
         elif command == "/mode":
             await self._start_flow(chat_id, "mode", mode_questions(self.store))
         elif command == "/status":
@@ -366,6 +385,65 @@ class BotService:
         else:
             await self.send(chat_id, "این دستور را نمی‌شناسم.\n\n" + HELP_TEXT)
 
+    async def _cmd_sites(self, chat_id: str) -> None:
+        rows = sites_overview(self.store)
+        lines = ["<b>سایت‌های فریلنسری</b>", ""]
+        for row in rows:
+            mark = "🟢" if row["active"] else ("✅" if row["ready"] else "⚪️")
+            lines.append(
+                f"{mark} <b>{escape(row['label'])}</b>\n"
+                f"     {escape(row['summary'])}" + ("\n     <i>سایت فعال</i>" if row["active"] else "")
+            )
+        lines.append("")
+        lines.append("برای عوض کردن سایت فعال یکی را بزن (یا <code>/site ponisha</code>):")
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": ("🔵 " if row["active"] else "") + row["label"].split(" (")[0],
+                        "callback_data": f"site:{row['site']}",
+                    }
+                ]
+                for row in rows
+            ]
+        }
+        await self.send(chat_id, "\n".join(lines), keyboard)
+
+    async def _cmd_site(self, chat_id: str, name: str) -> None:
+        name = (name or "").strip()
+        if not name:
+            await self._cmd_sites(chat_id)
+            return
+        try:
+            active = switch_site(self.store, name)
+        except QuestionError as exc:
+            await self.send(chat_id, f"⚠️ {escape(str(exc))}\n\n/sites")
+            return
+
+        # keep the running daemon in sync (scheduler reloads on the next cycle)
+        self._log(f"active site switched to {active}")
+        from .credentials import site_credentials
+
+        creds = site_credentials(active, self.store)
+        token = self.store.get("telegram.bot_token")
+        hint = "برای وارد کردن حساب: /market"
+        if creds.ready:
+            hint = "حساب این سایت ثبت شده ✅ — /test برای بررسی، /preview برای نمونه"
+        if not token:
+            hint += "\n(توکن تلگرام هنوز در پنل ذخیره نشده است.)"
+        await self.send(
+            chat_id,
+            f"✅ سایت فعال شد: <b>{escape(site_label(active))}</b>\n\n{escape(hint)}",
+            {
+                "inline_keyboard": [
+                    [
+                        {"text": "🔑 حساب سایت", "callback_data": "cmd:market"},
+                        {"text": "🏠 همه سایت‌ها", "callback_data": "cmd:sites"},
+                    ]
+                ]
+            },
+        )
+
     async def _cmd_start(self, chat_id: str) -> None:
         save_chat_id(self.store, chat_id)
         state = readiness(self.store)
@@ -382,6 +460,13 @@ class BotService:
 
     async def _cmd_status(self, chat_id: str) -> None:
         text = status_text(self.store)
+        rows = sites_overview(self.store)
+        sites = "\n".join(
+            f"{'🟢' if row['active'] else ('✅' if row['ready'] else '⚪️')} "
+            f"{escape(row['label'])}" + (" (فعال)" if row["active"] else "")
+            for row in rows
+        )
+        text += f"\n\n<b>سایت‌ها</b>\n{sites}"
         steps = missing_steps(self.store)
         if steps:
             text += "\n\n<b>باقی‌مانده:</b>\n" + "\n".join(f"• {escape(s)}" for s in steps)
@@ -448,7 +533,9 @@ class BotService:
         application = build_application(cfg)
         try:
             await application.db.init()
-            name = next(iter(application.sources), None)
+            name = config_name if config_name in application.sources else None
+            if name is None:
+                name = next(iter(application.sources), None)
             if not name:
                 raise RuntimeError("هیچ سایت فریلنسری فعالی تنظیم نشده است. /market")
             source = application.sources[name]
@@ -485,11 +572,15 @@ class BotService:
         *,
         mark_complete: bool = False,
     ) -> None:
-        applicable = [q for q in questions if q.applicable(self.store)]
-        if not applicable:
+        # Keep *all* questions: later answers can make an earlier question
+        # relevant (e.g. choosing "cookie" reveals the cookie field) and
+        # _advance skips whatever does not apply at that moment.
+        if not any(q.applicable(self.store) for q in questions):
             await self.send(chat_id, "همه‌چیز همین حالا تنظیم است ✅")
             return
-        self._flows[chat_id] = Flow(name=name, questions=applicable, index=0, mark_complete=mark_complete)
+        self._flows[chat_id] = Flow(
+            name=name, questions=list(questions), index=0, mark_complete=mark_complete
+        )
         await self._advance(chat_id)
 
     async def _advance(self, chat_id: str) -> None:
@@ -506,8 +597,15 @@ class BotService:
         keyboard = self._choice_keyboard(flow, question)
         await self.send(chat_id, text, keyboard)
 
+    def _visible_count(self, flow: Flow) -> tuple[int, int]:
+        """(position, total) of the current question among the ones that apply now."""
+        visible = [q for q in flow.questions if q.applicable(self.store)]
+        position = visible.index(flow.questions[flow.index]) + 1 if visible else 1
+        return position, len(visible)
+
     def _question_text(self, flow: Flow, question: Question) -> str:
-        step = f"{flow.index + 1}/{len(flow.questions)} · {STAGE_TITLES.get(question.stage, '')}"
+        position, total = self._visible_count(flow)
+        step = f"{position}/{total} · {STAGE_TITLES.get(question.stage, '')}"
         lines = [f"<b>{escape(question.text(self.store))}</b>", f"<i>{step}</i>"]
         help_text = question.help_text(self.store)
         if help_text:
@@ -608,6 +706,10 @@ class BotService:
                 [
                     {"text": "🎭 لحن", "callback_data": "cmd:style"},
                     {"text": "🧪 پیش‌نمایش", "callback_data": "cmd:preview"},
+                ],
+                [
+                    {"text": "🌐 سایت‌ها", "callback_data": "cmd:sites"},
+                    {"text": "🔑 حساب سایت", "callback_data": "cmd:market"},
                 ],
                 [
                     {"text": "📊 وضعیت", "callback_data": "cmd:status"},

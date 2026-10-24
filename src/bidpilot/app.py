@@ -66,11 +66,13 @@ class Application:
     async def setup(self) -> None:
         await self.db.init()
         for source in self.sources.values():
-            if getattr(source, "name", "") == "parscoders":
-                try:
-                    await source.login()  # type: ignore[attr-defined]
-                except Exception as exc:  # pragma: no cover - network
-                    log.warning("Login check failed: %s", exc)
+            login = getattr(source, "login", None)
+            if login is None:
+                continue
+            try:
+                await login()
+            except Exception as exc:  # pragma: no cover - network
+                log.warning("%s login check failed: %s", source.name, exc)
 
     async def close(self) -> None:
         for source in self.sources.values():

@@ -114,6 +114,15 @@ sources:
     enabled: true
     settings: {}      # defaults come from src/bidpilot/sources/parscoders/config.yaml
 
+  # The other supported Iranian marketplaces. Only one source is active at a
+  # time: the one you choose from Telegram (/site) or in `bidpilot settings use`.
+  - type: "ponisha"
+    enabled: false
+    settings: {}      # defaults: src/bidpilot/sources/ponisha/config.yaml
+  - type: "karlancer"
+    enabled: false
+    settings: {}      # defaults: src/bidpilot/sources/karlancer/config.yaml
+
   # Example: enable the mock source to test the whole flow without any network
   - type: "mock"
     enabled: false

@@ -225,21 +225,34 @@ def llm_questions(store: SettingsStore) -> list[Question]:
     ]
 
 
+#: Persian labels/descriptions for the built-in marketplaces.
+SITE_LABELS: dict[str, tuple[str, str]] = {
+    "parscoders": ("پارس‌کدرز (parscoders.com)", "بزرگ‌ترین بازار پروژه‌های برنامه‌نویسی ایران"),
+    "ponisha": ("پونیشا (ponisha.ir)", "پروژه‌های متنوع، از طراحی تا برنامه‌نویسی"),
+    "karlancer": ("کارلنسر (karlancer.com)", "پروژه‌های کوچک و متوسط، تسویه سریع"),
+    "mock": ("سایت آزمایشی (بدون شبکه)", "برای تست کامل بدون هیچ حساب واقعی"),
+}
+DEFAULT_SITE = "parscoders"
+
+
+def site_label(site: str) -> str:
+    return SITE_LABELS.get(site, (site, ""))[0]
+
+
 def _marketplace_choices() -> list[Choice]:
     from .sources import available_sources
 
-    labels = {
-        "parscoders": "پارس‌کدرز (parscoders.com)",
-        "mock": "سایت آزمایشی (بدون شبکه، برای تست)",
-    }
-    return [
-        Choice(name, labels.get(name, name), "بدون محدودیت؛ افزودن سایت جدید در YAML ممکن است.")
-        for name in available_sources()
-    ]
+    choices: list[Choice] = []
+    for name in available_sources():
+        label, description = SITE_LABELS.get(name, (name, "افزودن سایت جدید فقط با یک فایل YAML."))
+        choices.append(Choice(name, label, description))
+    # the mock source is useful first, the real ones after
+    choices.sort(key=lambda c: (c.value == "mock", c.value))
+    return choices
 
 
 def _current_marketplace(store: SettingsStore) -> str:
-    return str(store.get("marketplace.name") or "parscoders")
+    return str(store.get("marketplace.name") or DEFAULT_SITE)
 
 
 def _market_default(store: SettingsStore) -> str:
@@ -251,7 +264,17 @@ def _needs_account(store: SettingsStore) -> bool:
 
 
 def _cred_key(field_name: str) -> Callable[[SettingsStore], str]:
+    """Credentials are per site: credentials.<site>.<field>."""
     return lambda store: f"credentials.{_current_marketplace(store)}.{field_name}"
+
+
+def site_credential(store: SettingsStore, field_name: str, site: str | None = None) -> Any:
+    return store.get(f"credentials.{site or _current_marketplace(store)}.{field_name}")
+
+
+def site_method(store: SettingsStore, site: str | None = None) -> str:
+    """Login method of a site — the question default counts as "not answered yet"."""
+    return str(site_credential(store, "method", site) or "cookie")
 
 
 def marketplace_questions(store: SettingsStore) -> list[Question]:
@@ -269,6 +292,7 @@ def marketplace_questions(store: SettingsStore) -> list[Question]:
             prompt="ورود به سایت چطور انجام شود؟",
             kind="choice",
             stage="market",
+            key_fn=_cred_key("method"),
             choices=[
                 Choice(
                     "credentials",
@@ -281,7 +305,7 @@ def marketplace_questions(store: SettingsStore) -> list[Question]:
                     "از مرورگر، بعد از لاگین، مقدار PHPSESSID را کپی کن.",
                 ),
             ],
-            default="credentials",
+            default="cookie",
             when=_needs_account,
         ),
         Question(
@@ -290,7 +314,7 @@ def marketplace_questions(store: SettingsStore) -> list[Question]:
             stage="market",
             key_fn=_cred_key("username"),
             help="فقط برای لاگین ربات استفاده می‌شود.",
-            when=lambda s: _needs_account(s) and s.get("credentials.method") != "cookie",
+            when=lambda s: _needs_account(s) and site_method(s) != "cookie",
         ),
         Question(
             key="credentials",
@@ -298,7 +322,7 @@ def marketplace_questions(store: SettingsStore) -> list[Question]:
             kind="secret",
             stage="market",
             key_fn=_cred_key("password"),
-            when=lambda s: _needs_account(s) and s.get("credentials.method") != "cookie",
+            when=lambda s: _needs_account(s) and site_method(s) != "cookie",
         ),
         Question(
             key="credentials",
@@ -307,10 +331,11 @@ def marketplace_questions(store: SettingsStore) -> list[Question]:
             stage="market",
             key_fn=_cred_key("cookie"),
             help=(
-                "در مرورگر لاگین کن → DevTools → Application → Cookies → مقدار PHPSESSID را "
-                "کپی و همین‌جا بفرست. اگر کوکی منقضی شد، دوباره /market را بزن."
+                "در مرورگر لاگین کن → DevTools → Application → Cookies → کوکی نشست "
+                "(معمولاً PHPSESSID) را کپی و همین‌جا بفرست. "
+                "اگر منقضی شد، دوباره /market را بزن — برای هر سایت، حساب جداست."
             ),
-            when=lambda s: _needs_account(s) and s.get("credentials.method") == "cookie",
+            when=lambda s: _needs_account(s) and site_method(s) == "cookie",
         ),
     ]
 
@@ -604,6 +629,43 @@ def save_chat_id(store: SettingsStore, chat_id: str | int) -> None:
         store.set("telegram.chat_ids", [*current, chat_id])
 
 
+def switch_site(store: SettingsStore, site: str) -> str:
+    """Make ``site`` the active marketplace (credentials stay per site)."""
+    from .sources import available_sources
+
+    name = str(site).strip().lower()
+    known = available_sources()
+    if name not in known:
+        options = "، ".join(f"{site_label(item)} = {item}" for item in known if item != "mock")
+        raise QuestionError(f"سایت «{site}» ثبت نشده است.\nسایت‌های موجود: {options}")
+    store.set("marketplace.name", name)
+    reset_secret_cache()
+    return name
+
+
+def sites_overview(store: SettingsStore) -> list[dict[str, Any]]:
+    """One row per registered marketplace, for /sites and /status."""
+    from .credentials import site_credentials
+    from .sources import available_sources
+
+    active = _current_marketplace(store)
+    rows: list[dict[str, Any]] = []
+    for name in available_sources():
+        creds = site_credentials(name, store)
+        rows.append(
+            {
+                "site": name,
+                "label": site_label(name),
+                "active": name == active,
+                "ready": name == "mock" or creds.ready,
+                "method": creds.method,
+                "summary": "بدون نیاز به ورود" if name == "mock" else creds.summary,
+            }
+        )
+    rows.sort(key=lambda row: (not row["active"], row["site"]))
+    return rows
+
+
 def mark_setup_complete(store: SettingsStore, *, complete: bool = True) -> None:
     store.set("setup.completed", bool(complete))
     if complete:
@@ -620,17 +682,14 @@ def readiness(store: SettingsStore) -> dict[str, Any]:
     preset = PRESETS[provider]
     has_key = bool(store.get("llm.api_key") or store.get(f"llm.keys.{provider}"))
     marketplace = _current_marketplace(store)
-    method = str(store.get("credentials.method") or "credentials")
     if marketplace == "mock":
         creds_ok = True
-    elif method == "cookie":
-        creds_ok = bool(store.get(f"credentials.{marketplace}.cookie"))
     else:
-        creds_ok = bool(
-            store.get(f"credentials.{marketplace}.username")
-            and store.get(f"credentials.{marketplace}.password")
-        )
+        from .credentials import site_credentials
+
+        creds_ok = site_credentials(marketplace, store).ready
     return {
+        "site": marketplace,
         "telegram": bool(store.get("telegram.bot_token") and store.get("telegram.chat_ids")),
         "llm": bool(has_key or not preset.requires_key),
         "llm_provider": provider,
@@ -673,7 +732,7 @@ def status_text(store: SettingsStore) -> str:
             else "توکن/chat_id ثبت نشده"
         ),
         f"{mark(state['llm'])} هوش مصنوعی: {state['llm_title']} — {state['llm_model']}",
-        f"{mark(state['credentials'])} سایت: {state['marketplace']}",
+        f"{mark(state['credentials'])} سایت فعال: {site_label(state['marketplace'])}",
         f"{mark(bool(state['tone']))} لحن: {state['tone'] or 'تعیین نشده'}",
         f"{mark(state['style'])} دستورهای سبک: " + ("ثبت شده" if state["style"] else "ثبت نشده (اختیاری)"),
         f"حالت ارسال: {'🔴 واقعی' if state['mode'] == 'live' else '🧪 آزمایشی'}",
@@ -777,7 +836,10 @@ def run_terminal_wizard(
     from rich.table import Table
 
     pool = list(questions) if questions is not None else all_questions(store)
-    applicable = [q for q in pool if (stages is None or q.stage in stages) and q.applicable(store)]
+    pool = [q for q in pool if stages is None or q.stage in stages]
+    # conditions are re-checked per question: answering "cookie" reveals the
+    # cookie field, answering "credentials" reveals username/password.
+    applicable = [q for q in pool if q.applicable(store)]
     if not applicable:
         console.print("[yellow]چیزی برای پرسیدن نیست — همه‌چیز تنظیم شده است.[/yellow]")
         return True
@@ -793,10 +855,12 @@ def run_terminal_wizard(
 
     answered = 0
     try:
-        for position, question in enumerate(applicable, 1):
+        for question in pool:
             if not question.applicable(store):
                 continue
-            value = _prompt_question(console, question, store, position, len(applicable))
+            visible = [q for q in pool if q.applicable(store)]
+            position = visible.index(question) + 1
+            value = _prompt_question(console, question, store, position, len(visible))
             apply_answer(store, question, value)
             answered += 1
     except (KeyboardInterrupt, EOFError):
@@ -827,7 +891,10 @@ def run_terminal_wizard(
     table.add_column("وضعیت")
     table.add_row("تلگرام", "✅" if state["telegram"] else "❌")
     table.add_row("هوش مصنوعی", f"{'✅' if state['llm'] else '❌'} {state['llm_title']}")
-    table.add_row("سایت", f"{'✅' if state['credentials'] else '❌'} {state['marketplace']}")
+    table.add_row(
+        "سایت",
+        f"{'✅' if state['credentials'] else '❌'} {site_label(state['marketplace'])}",
+    )
     table.add_row("لحن", state["tone"] or "—")
     table.add_row("حالت ارسال", "واقعی" if state["mode"] == "live" else "آزمایشی")
     console.print(table)

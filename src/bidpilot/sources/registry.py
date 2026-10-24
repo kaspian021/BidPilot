@@ -50,7 +50,7 @@ def _load_builtin() -> None:
     if _BUILTINS_LOADED:
         return
     _BUILTINS_LOADED = True
-    from . import mock, parscoders  # noqa: F401
+    from . import karlancer, mock, parscoders, ponisha  # noqa: F401
 
 
 __all__ = [

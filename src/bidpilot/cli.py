@@ -15,7 +15,9 @@ from rich.table import Table
 from . import __version__
 from .app import Application, build_application, configure_logging
 from .config import AppConfig, get_secrets, load_config, reset_secret_cache
+from .credentials import site_credentials
 from .notifications.telegram import TelegramNotifier
+from .onboarding import site_label
 from .pricing.strategy import PricingConfig
 from .proposals.generator import ProposalGenerator
 from .settings_store import SettingsStore, get_store
@@ -37,6 +39,29 @@ def _load(config_path: str) -> AppConfig:
     cfg = load_config(path)
     configure_logging(cfg.log_level)
     return cfg
+
+
+def _site_settings(cfg: AppConfig, site: str) -> dict[str, Any]:
+    """YAML defaults of a site, merged with whatever the user stored for it."""
+    from .sources import get_source_class
+    from .sources.html_market import load_yaml_settings, merge_settings
+
+    cls = get_source_class(site)
+    defaults: dict[str, Any] = {}
+    config_file = getattr(cls, "config_file", None)
+    if config_file:
+        defaults = load_yaml_settings(Path(config_file))
+    entry = cfg.source(site)
+    merged = merge_settings(defaults, (entry.settings if entry else {}) or {})
+    if not merged.get("base_url") and getattr(cls, "default_base_url", ""):
+        merged["base_url"] = cls.default_base_url
+    return merged
+
+
+def _active_site(store: SettingsStore) -> str:
+    from .onboarding import DEFAULT_SITE
+
+    return str(store.get("marketplace.name") or DEFAULT_SITE)
 
 
 def _run(coro):
@@ -81,7 +106,7 @@ def setup(
 
 @app.command()
 def settings(
-    action: str = typer.Argument("show", help="show | set | unset | path"),
+    action: str = typer.Argument("show", help="show | set | unset | path | sites | use"),
     key: str | None = typer.Argument(None, help="کلید نقطه‌ای، مثل proposal.tone"),
     value: str | None = typer.Option(None, "--value", "-v", help="مقدار برای set"),
     reveal: bool = typer.Option(False, "--reveal", help="نمایش کامل مقادیر حساس"),
@@ -97,6 +122,22 @@ def settings(
         return
     if action == "show":
         _print_settings_status(store, reveal=reveal)
+        return
+    if action == "sites":
+        _print_sites(store)
+        return
+    if action == "use":
+        from .onboarding import QuestionError, switch_site
+
+        if not key:
+            raise typer.BadParameter(
+                "نام سایت را بده: bidpilot settings use ponisha  (ببین: bidpilot settings sites)"
+            )
+        try:
+            active = switch_site(store, key)
+        except QuestionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        console.print(f"[green]سایت فعال شد:[/green] {active}")
         return
     if action in {"set", "unset"} and not key:
         raise typer.BadParameter('کلید را بده: bidpilot settings set proposal.tone -v "رسمی"')
@@ -119,7 +160,30 @@ def settings(
         reset_secret_cache()
         console.print(f"[green]ذخیره شد:[/green] {key}")
         return
-    raise typer.BadParameter("دستور نامعتبر. یکی از: show | set | unset | path")
+    raise typer.BadParameter("دستور نامعتبر. یکی از: show | set | unset | path | sites | use")
+
+
+def _print_sites(store: SettingsStore) -> None:
+    """One row per registered marketplace, with the active one marked."""
+    from .onboarding import sites_overview
+
+    table = Table(title="سایت‌های فریلنسری")
+    table.add_column("سایت")
+    table.add_column("فعال")
+    table.add_column("ورود")
+    table.add_column("وضعیت حساب")
+    for row in sites_overview(store):
+        table.add_row(
+            row["label"],
+            "🟢" if row["active"] else "—",
+            row["method"],
+            row["summary"],
+        )
+    console.print(table)
+    console.print(
+        "[dim]عوض کردن سایت فعال:[/dim] bidpilot settings use ponisha "
+        "[dim]— یا از تلگرام:[/dim] /site ponisha"
+    )
 
 
 def _print_settings_status(store: SettingsStore, *, reveal: bool = False) -> None:
@@ -296,16 +360,13 @@ def doctor(config: str = CONFIG_OPTION) -> None:
         )
 
         store = get_store()
-        creds_ok = bool(
-            application.secrets.parscoders_cookie
-            or (application.secrets.parscoders_username and application.secrets.parscoders_password)
-            or (store.get("marketplace.name") == "mock")
-        )
+        active_site = _active_site(store)
+        creds = site_credentials(active_site, store)
+        creds_ok = creds.ready or active_site == "mock"
         row(
             "حساب سایت",
             creds_ok,
-            f"{store.get('marketplace.name') or 'parscoders'} — "
-            + ("اعتبارنامه ثبت شده" if creds_ok else "در bidpilot setup وارد کن"),
+            f"{site_label(active_site)} — " + (creds.summary if creds_ok else "در تلگرام /market وارد کن"),
         )
         row(
             "تنظیمات ذخیره‌شده",
@@ -343,10 +404,15 @@ def selftest(
       bidpilot selftest --offline          # فقط سلامت خود برنامه (بدون شبکه)
       bidpilot selftest                    # تست واقعی با همان تنظیمات ذخیره‌شده
       bidpilot selftest -s parscoders      # فقط پارس‌کدرز
+      bidpilot selftest -s ponisha         # سایت دیگر، با حساب خودش
     """
     from .bot import BotAPIError, TelegramAPI
     from .config import Secrets, SourceConfig
     from .llm_providers import resolve_chain, verify_provider
+    from .sources import available_sources
+
+    if source and source not in available_sources():
+        raise typer.BadParameter(f"سایت «{source}» ثبت نشده است. یکی از: {', '.join(available_sources())}")
 
     OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
     results: list[tuple[str, str, str]] = []
@@ -434,7 +500,21 @@ def selftest(
         generated: tuple[Any, Any, Any] | None = None
         delivery = int(cfg.pricing.get("delivery_days", 14))
         try:
-            name = source or next(iter(application.sources), None)
+            if source:
+                name = source
+                stored = get_store().get("marketplace.name")
+                if stored and stored != source:
+                    add(
+                        "سایت فعال",
+                        WARN,
+                        f"سایت فعال «{stored}» است؛ این تست فقط «{source}» را بررسی می‌کند",
+                    )
+                else:
+                    add("سایت فعال", OK, source)
+            else:
+                name = _active_site(get_store())
+                if name not in application.sources:
+                    name = next(iter(application.sources), None)
             if not name:
                 add("سایت", FAIL, "هیچ منبعی فعال نیست — /market یا bidpilot setup")
             else:
@@ -450,6 +530,14 @@ def selftest(
                         Secrets() if offline else secrets,
                     )
                     application.sources[name] = src
+                from .credentials import site_credentials
+
+                creds = site_credentials(name)
+                add(
+                    f"حساب {name}",
+                    OK if creds.ready else WARN,
+                    creds.summary if creds.ready else f"{creds.summary} — در تلگرام /market",
+                )
                 try:
                     ok, detail = await src.healthcheck()
                 except Exception as exc:
@@ -671,7 +759,9 @@ def preview(
         cfg = _load(config)
         application = build_application(cfg)
         await application.setup()
-        name = source or next(iter(application.sources), None)
+        name = source or _active_site(get_store())
+        if name not in application.sources:
+            name = next(iter(application.sources), None)
         if not name:
             console.print("[red]هیچ منبعی فعال نیست.[/red]")
             return
@@ -744,13 +834,16 @@ def demo(
 def inspect(
     url: str | None = typer.Option(None, "--url", "-u", help="آدرس صفحه برای بررسی"),
     file: str | None = typer.Option(None, "--file", "-f", help="فایل HTML ذخیره‌شده از مرورگر"),
+    site: str | None = typer.Option(None, "--site", "-s", help="سایت (پیش‌فرض: سایت فعال)"),
     config: str = CONFIG_OPTION,
     save: bool = typer.Option(True, "--save/--no-save", help="ذخیره‌ی HTML در data/debug"),
 ) -> None:
     """دیباگ سلکتورها: کدام سلکتور چند مورد پیدا می‌کند؟ (وقتی ظاهر سایت عوض می‌شود)
 
     مثال:
-      bidpilot inspect -u https://parscoders.com/project
+      bidpilot inspect                      # سایت فعال
+      bidpilot inspect -s ponisha           # سایت دیگر، با همان کوکی خودش
+      bidpilot inspect -u https://ponisha.ir/search/projects
       bidpilot inspect -f ~/Downloads/project.html
     """
 
@@ -758,17 +851,16 @@ def inspect(
         import httpx
         from bs4 import BeautifulSoup
 
-        cfg = _load(config)
-        from .config import get_secrets
-        from .sources.parscoders.adapter import load_default_settings
+        from .credentials import site_credentials
+        from .sources import available_sources, get_source_class
 
-        settings = cfg.source("parscoders").settings if cfg.source("parscoders") else {}
-        defaults = load_default_settings()
-        for key, value in (settings or {}).items():
-            if isinstance(value, dict) and isinstance(defaults.get(key), dict):
-                defaults[key] = {**defaults[key], **value}
-            else:
-                defaults[key] = value
+        cfg = _load(config)
+        active = site or _active_site(get_store())
+        if active not in available_sources():
+            raise typer.BadParameter(
+                f"سایت «{active}» ثبت نشده است. یکی از: {', '.join(available_sources())}"
+            )
+        defaults = _site_settings(cfg, active)
         list_cfg = defaults.get("list", {})
 
         if file:
@@ -780,10 +872,9 @@ def inspect(
                 or f"{defaults.get('base_url', 'https://parscoders.com')}{list_cfg.get('path', '/project')}"
             )
             shown_url = target
-            secrets = get_secrets()
-            from .sources.parscoders.adapter import parse_cookie_header
-
-            cookies = parse_cookie_header(secrets.parscoders_cookie)
+            cookies = site_credentials(active).cookies
+            if cookies:
+                console.print(f"[dim]با کوکی ذخیره‌شده‌ی {active} درخواست می‌شود.[/dim]")
             async with httpx.AsyncClient(
                 headers={"User-Agent": cfg.runtime.user_agent, "Accept-Language": "fa-IR,fa;q=0.9"},
                 cookies=cookies,
@@ -804,6 +895,7 @@ def inspect(
             console.print(f"HTML ذخیره شد: [cyan]{out}[/cyan]")
 
         soup = BeautifulSoup(html, "lxml")
+        console.print(f"[bold]سایت:[/bold] {active}")
         table = Table(title=f"Card selectors — {shown_url}")
         table.add_column("selector")
         table.add_column("matches", justify="right")
@@ -816,6 +908,8 @@ def inspect(
             table.add_row(escape(selector), f"[green]{count}[/green]" if count else "[dim]0[/dim]")
         console.print(table)
 
+        from .sources.html_parser import fallback_cards, parse_list_page
+
         id_regex = list_cfg.get("id_regex", r"/projects?/(\d+)")
         import re as _re
 
@@ -823,6 +917,16 @@ def inspect(
         console.print(f"لینک‌های پروژه‌مانند: [bold]{len(links)}[/bold]")
         for link in links[:5]:
             console.print(f"  • {link}")
+
+        detected = parse_list_page(html, list_cfg, active, str(defaults.get("base_url") or ""))
+        console.print(f"\nتشخیص خودکار کارت‌ها: [bold]{len(detected)}[/bold] پروژه")
+        if not detected and fallback_cards(soup, list_cfg):
+            console.print(
+                "[yellow]سلکتورها چیزی پیدا نکردند؛ فقط fallback محتوایی جواب داد — "
+                "یک سلکتور کارت از DevTools بردار.[/yellow]"
+            )
+        for project in detected[:3]:
+            console.print(f"  • {escape(project.title)}  →  {escape(project.url)}")
 
         for label, field in (("بودجه", "budget"), ("عنوان", "title")):
             sel = (list_cfg.get("fields") or {}).get(field) or []
@@ -841,9 +945,10 @@ def inspect(
             fields = [inp.get("name") for inp in form.select("input,textarea,select") if inp.get("name")]
             console.print(f"  form#{i} action={form.get('action')} fields={fields}")
 
+        config_file = getattr(get_source_class(active), "config_file", None)
         console.print(
-            "\n[dim]اگر همه‌ی سلکتورها ۰ بودند: سلکتورهای درست را از DevTools بردار و در "
-            "src/bidpilot/sources/parscoders/config.yaml جایگزین کن.[/dim]"
+            "\n[dim]اگر همه‌ی سلکتورها ۰ بودند: سلکتور درست را از DevTools بردار و در "
+            f"{config_file or 'config.yaml'} همان سایت جایگزین کن.[/dim]"
         )
 
     _run(main())
@@ -904,16 +1009,15 @@ def go_live(
             True,
         )
     )
-    cookie_ok = bool(
-        secrets.parscoders_cookie
-        or (secrets.parscoders_username and secrets.parscoders_password)
-        or store.get("marketplace.name") == "mock"
-    )
+    active_site = _active_site(store)
+    cookie_ok = site_credentials(active_site, store).ready or active_site == "mock"
     checks.append(
         (
-            "حساب سایت",
+            f"حساب سایت ({active_site})",
             cookie_ok,
-            "تنظیم شده." if cookie_ok else "در bidpilot setup نام کاربری/رمز یا کوکی سایت را وارد کنید.",
+            "تنظیم شده."
+            if cookie_ok
+            else "در تلگرام /market یا bidpilot setup کوکی/نام کاربری سایت را وارد کنید.",
             True,
         )
     )

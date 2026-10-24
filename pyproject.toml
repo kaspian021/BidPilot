@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bidpilot"
-version = "0.2.0"
+version = "0.3.0"
 description = "Scalable, pluggable bid-automation agent for freelance marketplaces (Parscoders first)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -46,7 +46,11 @@ bidpilot = "bidpilot.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-bidpilot = ["proposals/templates/*.j2", "sources/mock/fixtures/*.json", "sources/parscoders/*.yaml"]
+bidpilot = [
+  "proposals/templates/*.j2",
+  "sources/mock/fixtures/*.json",
+  "sources/*/*.yaml",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

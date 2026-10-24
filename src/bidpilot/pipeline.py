@@ -28,7 +28,7 @@ from .pricing.strategy import PricingConfig, PricingStrategy
 from .proposals.generator import ProposalError, ProposalGenerator
 from .ratelimit import RateLimiter
 from .repositories import Repository
-from .sources.base import Source
+from .sources.base import Source, SourceError
 from .text import parse_days
 
 log = logging.getLogger(__name__)

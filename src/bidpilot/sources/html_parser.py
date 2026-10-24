@@ -8,6 +8,7 @@ in order; the first selector that matches something wins.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import datetime
 from typing import Any
@@ -18,6 +19,19 @@ from bs4 import BeautifulSoup, Tag
 from ..models import Budget, Project
 from ..pricing.budget import parse_budget
 from ..text import clean_text, has_any
+
+log = logging.getLogger(__name__)
+
+
+def _budget_debug(budget: Budget | None) -> str:
+    if budget is None:
+        return "none"
+    return (
+        f"known={budget.is_known} min={budget.min} max={budget.max} "
+        f"negotiable={budget.negotiable} currency={budget.currency} "
+        f"source_text={budget.source_text!r}"
+    )
+
 
 DEFAULT_ID_REGEX = r"/projects?/(\d+)"
 #: tried in order when a site has no selectors yet — lets an unknown site be
@@ -219,14 +233,35 @@ def parse_project_card(
     budget = _parse_amount(budget_text)
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(card, fields.get("skills"))]
     description = _text(card, fields.get("description"))
+    card_text = clean_text(card.get_text(" ", strip=True)) if isinstance(card, Tag) else ""
     if budget is None or not budget.is_known:
-        # The budget is often just a line of the card ("بودجه: ۵۰۰,۰۰۰ تومان")
-        # without its own class — read it from the card's text.
-        card_text = clean_text(card.get_text(" ", strip=True)) if isinstance(card, Tag) else ""
+        # The budget is often just a line of the card without its own class.
         found = find_budget(card_text, settings.get("budget_regex"))
         if found is not None and found.is_known:
             budget = found
             budget_text = budget.source_text or budget.as_text()
+
+    log.info(
+        "[PARSER][CARD] source=%s id=%s title=%r url=%s budget_selector_text=%r "
+        "budget_final={%s} skills=%r category=%r employer=%r",
+        source_name,
+        external_id,
+        title,
+        link,
+        budget_text,
+        _budget_debug(budget),
+        [s for s in skills if s][:12],
+        _text(card, fields.get("category")) or None,
+        _text(card, fields.get("employer")) or None,
+    )
+    if settings.get("_diagnostics"):
+        log.info(
+            "[PARSER][CARD-TEXT] source=%s id=%s chars=%s text=%s",
+            source_name,
+            external_id,
+            len(card_text),
+            card_text[:8_000],
+        )
 
     return Project(
         source=source_name,
@@ -311,17 +346,55 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(soup, detail.get("skills"))]
     category = _text(soup, detail.get("category"))
     employer = _text(soup, detail.get("employer"))
+    page_text = clean_text(soup.get_text(" ", strip=True))[:20_000]
+
+    budget = _parse_amount(budget_text)
+    budget_origin = "detail_selector" if budget_text else "detail_selector_miss"
+    if budget is None or not budget.is_known:
+        # no budget selector matched: look for a labeled amount or currency on the page
+        found = find_budget(page_text, settings.get("budget_regex"))
+        if found is not None and found.is_known:
+            budget = found
+            budget_text = found.source_text or budget_text
+            budget_origin = "detail_page_text"
+        else:
+            budget_origin = "not_found"
+    log.info(
+        "[PARSER][DETAIL] source=%s id=%s title=%r url=%s "
+        "budget_selector_text=%r budget_origin=%s budget_final={%s} "
+        "description_chars=%s skills=%r category=%r employer=%r",
+        project.source,
+        project.external_id,
+        project.title,
+        project.url,
+        budget_text,
+        budget_origin,
+        _budget_debug(budget),
+        len(description),
+        skills[:12],
+        category or None,
+        employer or None,
+    )
+    if settings.get("_diagnostics"):
+        log.info(
+            "[PARSER][DETAIL-TEXT] source=%s id=%s chars=%s text=%s",
+            project.source,
+            project.external_id,
+            len(page_text),
+            page_text[:20_000],
+        )
+        if description:
+            log.info(
+                "[PARSER][DESCRIPTION] source=%s id=%s chars=%s text=%s",
+                project.source,
+                project.external_id,
+                len(description),
+                description[:12_000],
+            )
 
     update: dict[str, Any] = {}
     if description and len(description) > len(project.description):
         update["description"] = description
-    budget = _parse_amount(budget_text)
-    if budget is None or not budget.is_known:
-        # no budget selector matched: look for a labeled amount on the page
-        page_text = clean_text(soup.get_text(" ", strip=True))[:20_000]
-        found = find_budget(page_text, settings.get("budget_regex"))
-        if found is not None and found.is_known:
-            budget = found
     if budget and budget.is_known:
         update["budget"] = budget
     if skills:

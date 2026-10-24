@@ -89,6 +89,9 @@ class HtmlMarketSource(Source):
         #: cannot burn a free tier with the same pages over and over
         self._last_projects: list[Project] = []
         self._last_fetch_at: float = 0.0
+        #: no AI attempts until then (a blocked provider must not be hammered
+        #: every poll interval: Groq's 403 for Iranian IPs is not transient)
+        self._discovery_blocked_until: float = 0.0
         legacy = secrets.model_dump() if hasattr(secrets, "model_dump") else {}
         self.credentials: SiteCredentials = site_credentials(
             self.name,
@@ -249,6 +252,8 @@ class HtmlMarketSource(Source):
     def ai_discovery_enabled(self) -> bool:
         if self.discovery_mode() in {"selectors", "off"}:
             return False
+        if time.monotonic() < self._discovery_blocked_until:
+            return False
         return bool(self._discovery_providers())
 
     async def _discover_with_ai(self) -> list[Project]:
@@ -284,11 +289,20 @@ class HtmlMarketSource(Source):
                 log.warning("%s: AI discovery via %s failed: %s", self.name, provider.id, exc)
                 continue
             self.last_discovery = result
+            self._discovery_blocked_until = 0.0
             if result.projects:
                 self.last_discovery_error = ""
                 return result.projects
             failures.append(f"{provider.id}: هیچ پروژه‌ای پیدا نشد")
         self.last_discovery_error = "؛ ".join(failures) or "جست‌وجوی هوشمند نتیجه نداد"
+        cooldown = float(cfg.get("failure_cooldown_seconds", 900) or 0)
+        if cooldown:
+            self._discovery_blocked_until = time.monotonic() + cooldown
+            log.info(
+                "%s: AI discovery paused for %ss after a failure (selectors keep working)",
+                self.name,
+                int(cooldown),
+            )
         raise DiscoveryError(self.last_discovery_error)
 
     # ------------------------------------------------------------- fetching

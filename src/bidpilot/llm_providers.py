@@ -222,11 +222,23 @@ def resolve_chain(
     return chain
 
 
+#: models that "think" before answering: they need output room and a low effort
+REASONING_MARKERS: tuple[str, ...] = ("gpt-oss", "qwen3", "o1", "o3", "o4", "deepseek-r1", "think")
+
+
+def is_reasoning_model(model: str) -> bool:
+    lowered = str(model or "").lower()
+    return any(marker in lowered for marker in REASONING_MARKERS)
+
+
 def build_client(provider: LLMProvider, llm_config: Any):
     from .proposals.llm_client import LLMClient
 
     # an explicit llm.tokens_per_minute always wins over the preset's default
     budget = int(getattr(llm_config, "tokens_per_minute", 0) or 0) or provider.tokens_per_minute
+    effort = str(getattr(llm_config, "reasoning_effort", "") or "").strip().lower()
+    if not effort and is_reasoning_model(provider.model):
+        effort = "low"  # the decision/extraction prompts are short by design
     return LLMClient(
         base_url=provider.base_url,
         api_key=provider.api_key,
@@ -236,12 +248,23 @@ def build_client(provider: LLMProvider, llm_config: Any):
         timeout=float(getattr(llm_config, "timeout_seconds", 45.0)),
         extra_headers=provider.extra_headers,
         tokens_per_minute=budget,
+        proxy=str(getattr(llm_config, "proxy", "") or ""),
+        reasoning_effort=effort,
     )
 
 
-async def verify_provider(provider: LLMProvider, *, timeout: float = 25.0) -> tuple[bool, str]:
+async def verify_provider(
+    provider: LLMProvider,
+    *,
+    timeout: float = 25.0,
+    proxy: str = "",
+    reasoning_effort: str = "",
+) -> tuple[bool, str]:
     """Send a tiny request so the wizard can tell the user *now* if a key works."""
-    client = httpx.AsyncClient(timeout=timeout)
+    kwargs: dict[str, Any] = {"timeout": timeout}
+    if proxy:
+        kwargs["proxy"] = proxy
+    client = httpx.AsyncClient(**kwargs)
     try:
         response = await client.post(
             f"{provider.base_url.rstrip('/')}/chat/completions",
@@ -253,8 +276,9 @@ async def verify_provider(provider: LLMProvider, *, timeout: float = 25.0) -> tu
             json={
                 "model": provider.model,
                 "messages": [{"role": "user", "content": "فقط بنویس: سلام"}],
-                "max_tokens": 64,
+                "max_tokens": 256,
                 "temperature": 0,
+                **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
             },
         )
     except httpx.HTTPError as exc:
@@ -262,8 +286,15 @@ async def verify_provider(provider: LLMProvider, *, timeout: float = 25.0) -> tu
     finally:
         await client.aclose()
 
-    if response.status_code in (401, 403):
-        return False, "کلید رد شد (HTTP 401/403). مطمئن شوید کلید کامل و مربوط به همین سرویس است."
+    if response.status_code == 401:
+        return False, "کلید رد شد (HTTP 401). مطمئن شوید کلید کامل و مربوط به همین سرویس است."
+    if response.status_code == 403:
+        return (
+            False,
+            "سرویس ۴۰۳ Forbidden داد — کلید خراب نیست، اتصال شما رد شده "
+            "(Groq برای برخی کشورها از جمله ایران این کار را می‌کند). "
+            "با VPN/پروکسی تست کن: /proxy",
+        )
     if response.status_code == 429:
         return False, "کلید معتبر است اما سهمیه‌ی رایگان همین لحظه پر شده؛ کمی بعد امتحان کنید."
     if response.status_code >= 400:
@@ -274,7 +305,13 @@ async def verify_provider(provider: LLMProvider, *, timeout: float = 25.0) -> tu
     except ValueError:
         return False, "پاسخ سرویس قابل خواندن نبود."
     if not text:
-        return False, "سرویس پاسخ خالی داد."
+        finished = (data.get("choices") or [{}])[0].get("finish_reason")
+        return (
+            False,
+            "سرویس پاسخ خالی داد"
+            + (f" (finish_reason={finished} — مدل استدلالی بودجه‌ی خروجی را خورد)" if finished else "")
+            + "؛ با /llm مدل دیگری مثل gpt-oss-20b را امتحان کن.",
+        )
     return True, f"کلید سالم است ✅ ({provider.model})"
 
 

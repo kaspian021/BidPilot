@@ -148,10 +148,15 @@ class TelegramAPI:
             try:
                 await self.call("sendMessage", **params)
             except BotAPIError as exc:
-                log.warning("sendMessage failed (%s); retrying as plain text", exc)
-                params.pop("parse_mode", None)
-                params.pop("reply_markup", None)
-                await self.call("sendMessage", **params)
+                # A 400 is usually our HTML; a network error is not — retrying the
+                # same dead connection just doubles the wait.
+                if "اتصال" not in str(exc) and "connect" not in str(exc).lower():
+                    log.warning("sendMessage failed (%s); retrying as plain text", exc)
+                    params.pop("parse_mode", None)
+                    params.pop("reply_markup", None)
+                    await self.call("sendMessage", **params)
+                else:
+                    raise
 
     async def get_file(self, file_id: str) -> dict[str, Any]:
         return await self.call("getFile", file_id=file_id) or {}
@@ -184,6 +189,7 @@ class TelegramAPI:
             {"command": "sites", "description": "سایت‌های فریلنسری و سوییچ"},
             {"command": "market", "description": "حساب سایت فعال (کوکی/رمز)"},
             {"command": "preview", "description": "دیدن یک پیشنهاد نمونه"},
+            {"command": "proxy", "description": "پروکسی هوش مصنوعی (برای خطای ۴۰۳)"},
             {"command": "mode", "description": "آزمایشی / ارسال واقعی"},
             {"command": "help", "description": "راهنما"},
         ]
@@ -214,6 +220,7 @@ HELP_TEXT = """<b>BidPilot — راهنما</b>
 /style — لحن، دستورهای نوشتن و درصد قیمت
 /profile — ساخت پروفایل از رزومه PDF، گیت‌هاب یا پورتفولیو (یا ورود دستی)
 /llm — انتخاب سرویس هوش مصنوعی رایگان و کلید آن
+/proxy — پروکسی برای هوش مصنوعی (وقتی سرویس ۴۰۳/Forbidden می‌دهد)
 /sites — همه‌ی سایت‌های فریلنسری و وضعیت هرکدام
 /site <name> — عوض کردن سایت فعال (مثلاً /site ponisha)
 /market — حساب سایت فعال: روش ورود + کوکی یا نام کاربری/رمز
@@ -245,6 +252,8 @@ class BotService:
         self.api = api
         self.config_path = config_path
         self._flows: dict[str, Flow] = {}
+        #: the last transport error, surfaced by /status so a silent outage is visible
+        self._last_send_error: str = ""
         self._log = log_fn or (lambda message: log.info("%s", message))
         #: background bidder, started from the chat with «شروع فعالیت»
         self.automation = automation or Automation(
@@ -252,8 +261,24 @@ class BotService:
         )
 
     # ------------------------------------------------------------- transport
-    async def send(self, chat_id: str | int, text: str, reply_markup: dict | None = None) -> None:
-        await self.api.send_message(chat_id, text, reply_markup=reply_markup)
+    async def send(self, chat_id: str | int, text: str, reply_markup: dict | None = None) -> bool:
+        """Send one message; a network hiccup must never kill the command.
+
+        A flaky connection used to bubble ``BotAPIError`` out of ``/preview``
+        (or any long handler), aborting it half-way and printing a traceback.
+        The message is logged instead, and the caller keeps working.
+        """
+        try:
+            await self.api.send_message(chat_id, text, reply_markup=reply_markup)
+            return True
+        except BotAPIError as exc:
+            self._last_send_error = str(exc)
+            log.warning("Telegram send failed for %s: %s", chat_id, exc)
+            return False
+        except Exception as exc:  # pragma: no cover - defensive
+            self._last_send_error = str(exc)
+            log.warning("Telegram send failed for %s: %s", chat_id, exc)
+            return False
 
     async def notify_owner(self, text: str) -> None:
         """Used by the scheduler/CLI to push a message to the configured chats."""
@@ -377,6 +402,17 @@ class BotService:
         if data.startswith("dep:"):
             await self._install_dep(chat, data.split(":", 1)[1])
             return
+        if data == "llm:proxy":
+            from .onboarding import proxy_questions
+
+            await self._start_flow(chat, "proxy", proxy_questions(self.store))
+            return
+        if data == "llm:test":
+            await self._cmd_test(chat)
+            return
+        if data == "cmd:llm":
+            await self.handle_command(chat, "/llm", "")
+            return
         if data == "profile:retry":
             await self._retry_profile_import(chat)
             return
@@ -432,6 +468,10 @@ class BotService:
             await self._cmd_profile(chat_id)
         elif command == "/llm":
             await self._start_flow(chat_id, "llm", llm_questions(self.store))
+        elif command == "/proxy":
+            from .onboarding import proxy_questions
+
+            await self._start_flow(chat_id, "proxy", proxy_questions(self.store))
         elif command == "/market":
             await self._start_flow(chat_id, "market", marketplace_questions(self.store))
         elif command == "/sites":
@@ -967,6 +1007,13 @@ class BotService:
             text += "\n\n<b>باقی‌مانده:</b>\n" + "\n".join(f"• {escape(s)}" for s in steps)
         text += "\n\n" + tone_summary(self.store)
 
+        if self._last_send_error:
+            text += (
+                "\n⚠️ آخرین ارسال به تلگرام ناموفق بود ("
+                + escape(self._last_send_error[:120])
+                + ") — اتصال/VPN را بررسی کن."
+            )
+
         from .runtime_info import install_info
 
         info = install_info()
@@ -1053,16 +1100,36 @@ class BotService:
             await self.send(chat_id, f"❌ ارائه‌دهنده‌ی ناشناخته: {escape(provider)}")
             return
         await self.send(chat_id, "⏳ در حال تست کلید هوش مصنوعی…")
+        from .llm_providers import is_reasoning_model
+
+        model = str(self.store.get("llm.model") or preset.model)
+        proxy = str(self.store.get("llm.proxy") or "")
         ok, message = await verify_provider(
             LLMProvider(
                 id=preset.id,
                 base_url=str(self.store.get("llm.base_url") or preset.base_url),
-                model=str(self.store.get("llm.model") or preset.model),
+                model=model,
                 api_key=str(key),
                 extra_headers=dict(preset.extra_headers),
-            )
+            ),
+            proxy=proxy,
+            reasoning_effort="low" if is_reasoning_model(model) else "",
         )
         await self.send(chat_id, ("✅ " if ok else "❌ ") + escape(message))
+        if not ok:
+            blocked = any(token in message for token in ("403", "۴۰۳", "Forbidden", "پروکسی"))
+            hint = "🔌 پروکسی بده" if blocked else "⚙️ انتخاب سرویس/مدل"
+            await self.send(
+                chat_id,
+                "<i>اگر خطا مربوط به کلید نیست (۴۰۳/Forbidden یا خالی بودن پاسخ)، "
+                "اول پروکسی یا مدل را عوض کن.</i>",
+                {
+                    "inline_keyboard": [
+                        [{"text": hint, "callback_data": "llm:proxy" if blocked else "cmd:llm"}],
+                        [{"text": "🔁 تست دوباره", "callback_data": "llm:test"}],
+                    ]
+                },
+            )
         check = await check_site(self.store, config_path=self.config_path)
         await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
 
@@ -1086,6 +1153,19 @@ class BotService:
         mark_preview_ok(self.store, "preview", note=messages[-1][:200])
         for message in messages:
             await self.send(chat_id, message)
+        if any("403" in message or "۴۰۳" in message or "Forbidden" in message for message in messages):
+            # a blocked IP is not something the user can fix by reading the log
+            await self.send(
+                chat_id,
+                "🔌 سرویس هوش مصنوعی به این اتصال ۴۰۳ داد. با یک پروکسی/VPN محلی درست می‌شود؛ "
+                "آدرسش را همین‌جا بده.",
+                {
+                    "inline_keyboard": [
+                        [{"text": "🔌 تنظیم پروکسی", "callback_data": "llm:proxy"}],
+                        [{"text": "⚙️ عوض کردن سرویس/مدل", "callback_data": "cmd:llm"}],
+                    ]
+                },
+            )
         if self.store.get("runtime.submit_mode") == "live":
             await self.send(
                 chat_id,
@@ -1345,6 +1425,17 @@ class BotService:
                 + f"\n💰 قیمت: {bid_percent(self.store)}٪ بودجه‌ی کارفرما"
                 + "\n\nبرای دیدن نتیجه: /preview",
             )
+            return
+        if flow.name == "proxy":
+            proxy = str(self.store.get("llm.proxy") or "")
+            if not proxy:
+                await self.send(chat_id, "✅ پروکسی خاموش شد؛ مستقیم وصل می‌شوم.")
+                return
+            await self.send(
+                chat_id,
+                f"🔌 پروکسی ذخیره شد: <code>{escape(proxy)}</code>\nدارم با همین پروکسی تست می‌کنم…",
+            )
+            await self._cmd_test(chat_id)
             return
         if flow.name == "mode":
             live = str(self.store.get("runtime.submit_mode")) == "live"

@@ -487,3 +487,86 @@ def test_the_install_button_actually_installs(tmp_path, monkeypatch):
 
     assert installed == ["pypdf"]
     assert any("نصب شد" in text for _, text, _ in api.sent)
+
+
+# ---------------------------------------------------------------------------
+# 403 Forbidden (country block) — actionable, not a dead end
+# ---------------------------------------------------------------------------
+def test_test_command_offers_a_proxy_when_the_ip_is_blocked(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    store.update({"llm.api_key": "gsk_test", "llm.provider": "groq"})
+
+    async def blocked(provider, **_kwargs):
+        return False, (
+            "سرویس ۴۰۳ Forbidden داد — کلید خراب نیست، اتصال شما رد شده. با VPN/پروکسی تست کن: /proxy"
+        )
+
+    monkeypatch.setattr("bidpilot.bot.verify_provider", blocked)
+
+    asyncio.run(service.handle_command("777", "/test", ""))
+
+    assert any("۴۰۳" in text for _, text, _ in api.sent)
+    callbacks = [
+        row[0]["callback_data"] for _, _, markup in api.sent if markup for row in markup["inline_keyboard"]
+    ]
+    assert "llm:proxy" in callbacks
+    assert "llm:test" in callbacks
+
+
+def test_proxy_flow_saves_a_usable_address(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    store.set("llm.api_key", "gsk_test")
+
+    asyncio.run(service.handle_command("777", "/proxy", ""))
+    assert "پروکسی" in api.last_text
+
+    asyncio.run(service.handle_text("777", "127.0.0.1:10809"))
+
+    assert store.get("llm.proxy") == "http://127.0.0.1:10809"
+    joined = "\n".join(text for _, text, _ in api.sent)
+    assert "پروکسی ذخیره شد" in joined
+
+
+def test_proxy_flow_validates_garbage(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+
+    asyncio.run(service.handle_command("777", "/proxy", ""))
+    asyncio.run(service.handle_text("777", "ftp://example.com:21"))
+
+    assert store.get("llm.proxy") in (None, "")
+    assert "پروکسی" in api.last_text
+
+
+def test_proxy_off_clears_it(tmp_path, monkeypatch):
+    import asyncio
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    store.set("llm.proxy", "http://127.0.0.1:10809")
+
+    asyncio.run(service.handle_command("777", "/proxy", ""))
+    asyncio.run(service.handle_text("777", "off"))
+
+    assert store.get("llm.proxy") in (None, "")
+
+
+def test_a_telegram_outage_does_not_kill_the_command(tmp_path, monkeypatch):
+    import asyncio
+
+    from bidpilot.bot import BotAPIError
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    store.set("telegram.chat_ids", ["777"])
+
+    async def dead(*args, **kwargs):
+        raise BotAPIError("اتصال به تلگرام برقرار نشد: All connection attempts failed")
+
+    monkeypatch.setattr(service.api, "send_message", dead)
+
+    asyncio.run(service.handle_command("777", "/status", ""))  # must not raise
+    assert "All connection attempts failed" in service._last_send_error

@@ -61,6 +61,11 @@ MAX_LINKS = 45
 #: a page with this many project links is a list: its prose is noise for the model
 LIST_PAGE_MIN_LINKS = 3
 LIST_PAGE_TEXT_CHARS = 350
+#: Reasoning models (Groq gpt-oss) think before answering: with a tiny output
+#: budget they return *empty* content with finish_reason=length. These are the
+#: floor values; the client doubles them automatically if it still runs out.
+STEP_MAX_TOKENS = 700
+EXTRACT_MAX_TOKENS = 1_000
 
 _STATIC_SUFFIXES = (
     ".css",
@@ -499,7 +504,7 @@ class DiscoveryAgent:
             text=text + ("\n(این صفحه فهرست پروژه است.)" if list_like else ""),
             links=render_links(page.links),
         )
-        answer = await self._complete_json(AGENT_SYSTEM, prompt, max_tokens=220)
+        answer = await self._complete_json(AGENT_SYSTEM, prompt, max_tokens=STEP_MAX_TOKENS)
         data = parse_json_object(getattr(answer, "text", answer))
         if not data:
             raise DiscoveryError("مدل JSON معتبر برنگرداند.")
@@ -519,7 +524,7 @@ class DiscoveryAgent:
             return None
         prompt = EXTRACT_PROMPT.format(url=url, text=page.text)
         try:
-            answer = await self._complete_json(EXTRACT_SYSTEM, prompt, max_tokens=700)
+            answer = await self._complete_json(EXTRACT_SYSTEM, prompt, max_tokens=EXTRACT_MAX_TOKENS)
         except Exception as exc:
             log.debug("discovery: extraction failed for %s (%s)", url, exc)
             return None
@@ -573,8 +578,20 @@ def friendly_llm_error(message: str) -> str:
             "برنامه خودش فاصله‌ها را رعایت می‌کند و از سلکتورها ادامه داد؛ "
             "یک دقیقه بعد دوباره /preview یا explore بزن."
         )
-    if "401" in text or "403" in text or "invalid api key" in lowered:
+    if "403" in text and "forbidden" in lowered:
+        return (
+            "سرویس هوش مصنوعی به این اتصال «۴۰۳ Forbidden» داد — Groq از برخی کشورها "
+            "(از جمله ایران) درخواست را در سطح IP رد می‌کند. با VPN روشن دوباره امتحان کن "
+            "یا با /proxy آدرس پروکسی محلی را بده، یا در /llm سرویس دیگری انتخاب کن."
+        )
+    if "401" in text or "invalid api key" in lowered:
         return "کلید هوش مصنوعی رد شد. در /llm کلید را دوباره ثبت کن یا /test بگیر."
+    if "استدلال" in text and "خالی" in text:
+        return (
+            "مدل پیش از پاسخ، سهمیه‌ی خروجی را با استدلال داخلی تمام کرد و متن خالی فرستاد. "
+            "برنامه خودش با فضای بیشتر دوباره تلاش می‌کند؛ اگر ادامه داشت در /llm مدل را "
+            "عوض کن (مثلاً gpt-oss-20b) یا reasoning_effort را low بگذار."
+        )
     if "404" in text or "model" in lowered and "not found" in lowered:
         return "مدل انتخاب‌شده در دسترس نیست؛ در /llm مدل را عوض کن."
     return truncate(text, 500)

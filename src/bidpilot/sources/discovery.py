@@ -394,11 +394,11 @@ def digest_html(
             break
 
     # Keep menu links above, but remove repetitive/hidden UI from the text sent to the model.
-    for tag in soup(["script", "style", "noscript", "svg", "head", "iframe", "footer", "aside", "form", "button", "input", "select", "textarea"]):
+    for tag in soup(["script", "style", "noscript", "svg", "head", "iframe", "footer", "form", "button", "input", "select", "textarea"]):
         tag.decompose()
     for node in list(
         soup.select(
-            'nav, [role="navigation"], [role="complementary"], [aria-hidden="true"], [hidden], '
+            'nav, [role="navigation"], [aria-hidden="true"], [hidden], '
             '[style*="display:none"], [style*="display: none"], [style*="visibility:hidden"]'
         )
     ):

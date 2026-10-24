@@ -543,7 +543,6 @@ async def test_a_failed_search_is_not_retried_every_cycle(monkeypatch):
         await source.aclose()
 
 
-
 def test_digest_keeps_page_navigation_and_late_labeled_metadata():
     html = """
     <html><head><title>صفحه پروژه</title></head><body>

@@ -509,3 +509,43 @@ def test_ponisha_header_budget_never_uses_recommended_project_budget_after_skill
 
     assert enriched.budget is None
     assert enriched.raw["detail_budget_source"] == "not_found"
+
+
+def test_proposal_action_link_to_login_is_detected():
+    from bidpilot.sources.html_parser import find_bid_form, find_proposal_login_link
+
+    html = """
+    <html><head><title>Project</title></head><body>
+      <a href="/login">ارسال پیشنهاد</a>
+      <form id="search-form">
+        <input type="text" name="q">
+        <button type="submit">جستجو</button>
+      </form>
+    </body></html>
+    """
+    form, _payload = find_bid_form(html, SETTINGS["bid"])
+    assert form is None
+    assert find_proposal_login_link(html, "https://parscoders.com/project/123") == "/login"
+
+
+def test_detail_page_extracts_explicit_employer_deadline():
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    project = parser.parse_list_page(
+        (FIXTURES / "sample_list.html").read_text(encoding="utf-8"),
+        SETTINGS["list"],
+        "parscoders",
+        "https://parscoders.com",
+    )[0]
+    html = f"""
+    <html><body><main>
+      <h1>{project.title}</h1>
+      <p>مهلت برای انجام 1روز وضعیت مناقصه باز (آماده دریافت پیشنهاد)</p>
+    </main></body></html>
+    """
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {"detail_fields": {"description": [], "budget": [], "skills": []}},
+    )
+    assert enriched.employer_deadline == "1 روز"

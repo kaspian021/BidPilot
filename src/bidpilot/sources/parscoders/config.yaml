@@ -181,5 +181,7 @@ auth:
   # --- checking the saved session (used by /test and after setup) -------------
   # صفحه‌ای که فقط کاربر لاگین‌شده می‌بیند؛ اگر پیدا نشد، صفحه‌ی اصلی امتحان می‌شود.
   check_path: "/dashboard"
-  logged_in_markers: ["خروج از حساب", "داشبورد", "پروفایل من", "پنل کاربری", "حساب کاربری"]
+  # «حساب کاربری» is also present on login pages, so it is not proof of authentication.
+  logged_in_markers: ["خروج از حساب", "داشبورد", "پروفایل من", "پنل کاربری"]
   login_markers: ["ورود به حساب", "فراموشی رمز", "بازیابی رمز"]
+  require_auth_markers: true

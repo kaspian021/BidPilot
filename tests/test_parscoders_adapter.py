@@ -10,6 +10,7 @@ import httpx
 import respx
 
 from bidpilot.config import AppConfig, Profile, RuntimeConfig, Secrets
+from bidpilot.credentials import SiteCredentials
 from bidpilot.models import Budget, Project, Proposal
 from bidpilot.sources.parscoders.adapter import ParscodersSource
 
@@ -143,4 +144,51 @@ async def test_healthcheck_reports_when_selectors_find_nothing():
     source = make_source()
     ok, message = await source.healthcheck()
     assert ok is False and "سلکتور" in message
+    await source.aclose()
+
+
+@respx.mock
+async def test_submit_bid_detects_proposal_action_gated_by_login():
+    page = """
+    <html><head><title>Project</title></head><body>
+      <a href="/login">ارسال پیشنهاد</a>
+      <form id="search-form">
+        <input type="text" name="q">
+        <button type="submit">جستجو</button>
+      </form>
+    </body></html>
+    """
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
+    post_route = respx.post("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text="unexpected")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "session-value"}
+
+    project = Project(source="parscoders", external_id="12345", title="تست")
+    result = await source.submit_bid(project, Proposal(text="سلام"), 500_000, 14)
+
+    assert result.status.value == "failed"
+    assert "مسیر ورود" in result.message
+    assert post_route.call_count == 0
+    await source.aclose()
+
+
+@respx.mock
+async def test_verify_session_does_not_treat_generic_account_text_as_login_proof():
+    login_page = """
+    <html><body>
+      <a>حساب کاربری</a>
+      <a>ورود به حساب</a>
+      <div>فراموشی رمز</div>
+    </body></html>
+    """
+    respx.get("https://parscoders.com/dashboard").mock(return_value=httpx.Response(200, text=login_page))
+    source = make_source()
+    source.credentials = SiteCredentials(site="parscoders", method="cookie", cookie="PHPSESSID=session-value")
+
+    ok, message = await source.verify_session()
+
+    assert ok is False
+    assert "ورود" in message or "کوکی" in message
     await source.aclose()

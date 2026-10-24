@@ -318,11 +318,31 @@ class HtmlMarketSource(Source):
             return []
 
     def ai_discovery_enabled(self) -> bool:
-        if self.discovery_mode() in {"selectors", "off"}:
+        mode = self.discovery_mode()
+        if mode in {"selectors", "off"}:
+            log.info("[DISCOVERY][DISABLED] source=%s reason=mode_%s", self.name, mode)
             return False
-        if time.monotonic() < self._discovery_blocked_until:
+
+        remaining = self._discovery_blocked_until - time.monotonic()
+        if remaining > 0:
+            log.info(
+                "[DISCOVERY][DISABLED] source=%s reason=failure_cooldown remaining_seconds=%.1f",
+                self.name,
+                remaining,
+            )
             return False
-        return bool(self._discovery_providers())
+
+        providers = self._discovery_providers()
+        if not providers:
+            log.warning(
+                "[DISCOVERY][DISABLED] source=%s reason=no_llm_provider llm_enabled=%s "
+                "any_api_key_configured=%s",
+                self.name,
+                bool(getattr(self.config.llm, "enabled", False)),
+                bool(self.secrets.llm_keys or self.secrets.llm_api_key),
+            )
+            return False
+        return True
 
     async def _discover_with_ai(self) -> list[Project]:
         """Let the model read the site (inside this account) and bring back projects."""
@@ -461,7 +481,11 @@ class HtmlMarketSource(Source):
                     )
                 self.last_discovery_error = str(exc)
         else:
-            log.info("[DISCOVERY][DISABLED] source=%s reason=mode_or_cooldown_or_missing_key", self.name)
+            log.info(
+                "[FETCH][AI-BYPASSED] source=%s mode=%s reason=see_DISCOVERY_DISABLED",
+                self.name,
+                mode,
+            )
 
         list_cfg = dict(self.settings.get("list") or {})
         list_cfg["_diagnostics"] = bool(cfg.get("log_extraction_details"))

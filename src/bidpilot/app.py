@@ -154,10 +154,14 @@ def build_application(config: AppConfig, secrets: Secrets | None = None) -> Appl
 
 
 def configure_logging(level: str = "INFO") -> None:
+    level_value = getattr(logging, str(level or "INFO").upper(), logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=level_value,
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # basicConfig is a no-op when an embedding host already installed a handler;
+    # still apply the requested level so INFO diagnostics are not silently hidden.
+    logging.getLogger().setLevel(level_value)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

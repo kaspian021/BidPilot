@@ -47,8 +47,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "== 6) تست سلامت ==" -ForegroundColor Cyan
+& $venvPython -m bidpilot version
 & $venvPython -m bidpilot selftest --offline
 Write-Host "`nآماده است:" -ForegroundColor Green
 Write-Host "  .\.venv\Scripts\activate"
 Write-Host "  bidpilot setup"
 Write-Host "  bidpilot selftest"
+Write-Host ""
+Write-Host "همیشه ربات را با همین پایتون اجرا کن (نه «python» یا «bidpilot» سراسری):" -ForegroundColor Yellow
+Write-Host "  .\.venv\Scripts\python.exe -m bidpilot bot --run"

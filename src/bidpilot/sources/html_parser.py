@@ -12,13 +12,13 @@ import logging
 import re
 from datetime import datetime
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
 from ..models import Budget, Project
 from ..pricing.budget import parse_budget
-from ..text import clean_text, has_any
+from ..text import clean_text, has_any, parse_days
 
 log = logging.getLogger(__name__)
 
@@ -169,6 +169,31 @@ def _labeled_range_budget(text: str, value_start: int) -> Budget | None:
     ):
         return None
     return budget
+
+
+def _find_employer_deadline(root: Tag | BeautifulSoup) -> str:
+    """Extract an explicitly labeled project duration, never use a profile default here."""
+    labels = (
+        r"مهلت\s+برای\s+انجام",
+        r"مدت\s+زمان(?:\s+انجام)?(?:\s+پروژه)?",
+        r"زمان\s+تحویل(?:\s+پروژه)?",
+        r"delivery\s+time",
+        r"project\s+duration",
+    )
+    tags = ["p", "li", "span", "small", "label", "dt", "dd", "td", "strong", "b", "div", "section"]
+    for node in root.find_all(tags):
+        text = clean_text(node.get_text(" ", strip=True))
+        if not text or len(text) > 220:
+            continue
+        for label in labels:
+            match = re.search(label, text, re.IGNORECASE)
+            if not match:
+                continue
+            tail = text[match.end() :].strip(" :：-")
+            days = parse_days(tail)
+            if days is not None:
+                return f"{days} روز"
+    return ""
 
 
 def _node_text_candidates(node: Tag) -> list[str]:
@@ -1067,9 +1092,28 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
         }
     )
     update["raw"] = raw
+    deadline = project.employer_deadline or _find_employer_deadline(scoped_root)
+    if deadline:
+        update["employer_deadline"] = deadline
+
     if not update:
         return project
     return project.model_copy(update=update)
+
+
+def find_proposal_login_link(html: str, base_url: str = "") -> str | None:
+    """Return a safe path when a proposal CTA sends the user to a login page."""
+    soup = BeautifulSoup(html, "lxml")
+    proposal_labels = ("ارسال پیشنهاد", "ثبت پیشنهاد", "submit proposal", "place bid")
+    login_path = re.compile(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", re.IGNORECASE)
+    for anchor in soup.find_all("a", href=True):
+        label = clean_text(anchor.get_text(" ", strip=True)).casefold()
+        if not label or not any(term in label for term in proposal_labels):
+            continue
+        target = urlsplit(urljoin(base_url or "https://invalid.local/", str(anchor.get("href") or "")))
+        if login_path.search(target.path):
+            return target.path
+    return None
 
 
 def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict[str, Any]]:
@@ -1104,9 +1148,52 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
             "just a moment",
         )
         marker_hits = [marker for marker in marker_candidates if marker.casefold() in lowered]
+
+        form_summaries: list[dict[str, Any]] = []
+        for candidate in soup.find_all("form")[:8]:
+            controls: list[dict[str, Any]] = []
+            for control in candidate.select("input, textarea, select, button")[:16]:
+                controls.append(
+                    {
+                        "tag": control.name,
+                        "name": str(control.get("name") or "")[:80],
+                        "type": str(control.get("type") or "")[:30],
+                        "required": control.has_attr("required"),
+                        "text": clean_text(control.get_text(" ", strip=True))[:60]
+                        if control.name in {"button", "select"}
+                        else "",
+                    }
+                )
+            action = str(candidate.get("action") or "")
+            action_path = urlsplit(action).path if action else ""
+            form_summaries.append(
+                {
+                    "id": str(candidate.get("id") or "")[:80],
+                    "class": (candidate.get("class") or [])[:6],
+                    "action_path": action_path[:160],
+                    "method": str(candidate.get("method") or "get").lower(),
+                    "controls": controls,
+                }
+            )
+
+        proposal_links = []
+        proposal_labels = ("ارسال پیشنهاد", "ثبت پیشنهاد", "submit proposal", "place bid")
+        for anchor in soup.find_all("a", href=True):
+            label = clean_text(anchor.get_text(" ", strip=True))
+            if label and any(term in label.casefold() for term in proposal_labels):
+                proposal_links.append(
+                    (
+                        label[:80],
+                        urlsplit(urljoin("https://invalid.local/", str(anchor.get("href") or ""))).path[:160],
+                    )
+                )
+                if len(proposal_links) >= 12:
+                    break
+
         log.warning(
             "[BID][FORM-NOT-FOUND] title=%r selectors=%r forms=%s textareas=%s "
-            "inputs=%s buttons=%s scripts=%s page_markers=%r body_chars=%s",
+            "inputs=%s buttons=%s scripts=%s page_markers=%r body_chars=%s "
+            "form_summaries=%r proposal_links=%r",
             title,
             form_selectors,
             len(soup.find_all("form")),
@@ -1116,6 +1203,8 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
             len(soup.find_all("script")),
             marker_hits,
             len(body_text),
+            form_summaries,
+            proposal_links,
         )
         return None, {}
 
@@ -1177,6 +1266,7 @@ __all__ = [
     "extract_external_id",
     "fallback_id",
     "find_bid_form",
+    "find_proposal_login_link",
     "map_bid_fields",
     "parse_list_page",
     "parse_project_card",

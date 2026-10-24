@@ -221,7 +221,9 @@ def _find_budget_in_markup(
     # Last, only accept an explicit budget label and value in the same short
     # text block. Do not run the old amount regex over flattened body text: that
     # can combine an ordinary sentence with an unrelated amount below it.
-    for node in root.find_all(["dt", "dd", "th", "td", "li", "p", "span", "small", "label", "div", "section"]):
+    for node in root.find_all(
+        ["dt", "dd", "th", "td", "li", "p", "span", "small", "label", "div", "section"]
+    ):
         if id(node) in seen:
             continue
         evidence = clean_text(node.get_text(" ", strip=True))

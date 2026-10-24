@@ -913,9 +913,17 @@ class DiscoveryAgent:
             # Use a visible page heading/title rather than accepting a model-invented one.
             title = clean_text(page.title)
         if not title:
+            log.warning(
+                "[AI-EXTRACT][NORMALIZE-FAILED] source=%s url=%s reason=missing_title model_title=%r page_title=%r",
+                self.source_name,
+                url,
+                data.get("title"),
+                page.title,
+            )
             return None
 
-        budget_text = clean_text(str(data.get("budget_text") or ""))[:160]
+        model_budget_text = clean_text(str(data.get("budget_text") or ""))[:160]
+        budget_text = model_budget_text
         page_budget = parser.find_budget(page.text)
         description_budget = parser.find_budget(source_description) if source_description else None
         verified_budget = (
@@ -930,7 +938,7 @@ class DiscoveryAgent:
             budget_source = "page_text" if verified_budget is page_budget else "description_text"
         else:
             candidate = " ".join(budget_text.split()).casefold()
-            if candidate and candidate in page_text:
+            if candidate and candidate in evidence_text:
                 budget = parser.parse_budget_text(budget_text)
                 budget_source = "model_value_verified_in_page" if budget else "missing"
             else:
@@ -973,9 +981,18 @@ class DiscoveryAgent:
             employer = ""
 
         if len(description) < 40 or (not source_description and len(page.text.strip()) < 40):
+            log.warning(
+                "[AI-EXTRACT][NORMALIZE-FAILED] source=%s url=%s reason=description_too_short "
+                "description_chars=%s visible_text_chars=%s html_description_chars=%s",
+                self.source_name,
+                url,
+                len(description),
+                len(page.text),
+                len(source_description),
+            )
             return None
 
-        return Project(
+        project = Project(
             source=self.source_name,
             external_id=_external_id(url, title),
             title=title,
@@ -994,8 +1011,46 @@ class DiscoveryAgent:
                 "description_source": "html_selector" if source_description else "page_text",
                 "visible_page_chars": len(page.text),
                 "verified_skill_count": len(verified_skills),
+                "model_budget_text": model_budget_text,
             },
         )
+        log.info(
+            "[AI-EXTRACT][NORMALIZED] source=%s id=%s title=%r url=%s "
+            "model_budget_text=%r chosen_budget_text=%r budget_source=%s budget=%r "
+            "model_deadline=%r chosen_deadline=%r skills=%r category=%r employer=%r "
+            "description_chars=%s description=%r",
+            project.source,
+            project.external_id,
+            project.title,
+            project.url,
+            model_budget_text,
+            budget_text,
+            budget_source,
+            project.budget.model_dump() if project.budget else None,
+            data.get("deadline_text"),
+            project.employer_deadline,
+            project.skills,
+            project.category,
+            project.employer,
+            len(project.description),
+            project.description[:12_000],
+        )
+        if not project.budget or not project.budget.is_known:
+            marker_lines = [
+                line
+                for line in (source_description or page.text).splitlines()
+                if re.search(r"بودجه|مبلغ|قیمت|حق.?الزحمه|تومان|تومن|ریال|میلیون|هزار", line, re.I)
+            ]
+            log.warning(
+                "[AI-EXTRACT][BUDGET-NOT-FOUND] source=%s id=%s url=%s "
+                "model_budget_text=%r marker_lines=%r",
+                self.source_name,
+                project.external_id,
+                project.url,
+                model_budget_text,
+                marker_lines[:30],
+            )
+        return project
 
 
 def friendly_llm_error(message: str) -> str:

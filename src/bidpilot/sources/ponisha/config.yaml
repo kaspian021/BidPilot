@@ -110,6 +110,8 @@ list:
 
 detail:
   path: "/project/{external_id}"
+  # برای بودجه، اگر محدوده‌ی همین پروژه از صفحه جدا نشود، از قیمت‌های سایر پروژه‌ها استفاده نکن.
+  require_project_scope_for_budget: true
   detail_fields:
     description:
       - "#project-description"

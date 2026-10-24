@@ -115,7 +115,29 @@ class Application:
 
     async def _dispatch_digest(self, reports: list[RunReport]) -> None:
         """One grouped message per cycle (see ``runtime.notify_digest``)."""
-        if not self.config.runtime.notify_digest or self.notifiers is None:
+        if self.notifiers is None:
+            return
+        auth_failures = [r for r in reports if getattr(r, "authentication_failed", False)]
+        if auth_failures:
+            source = auth_failures[0].source or "marketplace"
+            detail = next(
+                (str(error) for report in auth_failures for error in report.errors if str(error).strip()),
+                "نشست ورود معتبر نیست.",
+            )
+            await self.notifiers.dispatch(
+                Event(
+                    kind=EventKind.ERROR,
+                    title="ورود به حساب کاربری لازم است",
+                    body=(
+                        f"⛔ ورود به حساب «{source}» تأیید نشد؛ جست‌وجو و ارسال پیشنهاد متوقف شد.\\n"
+                        f"دلیل: {detail}\\n"
+                        "برای ادامه، از /market کوکی/ورود را به‌روزرسانی و با /test بررسی کن؛ "
+                        "سپس دوباره /run را بزن."
+                    ),
+                )
+            )
+            return
+        if not self.config.runtime.notify_digest:
             return
         interesting = [r for r in reports if r.has_news()]
         if not interesting:

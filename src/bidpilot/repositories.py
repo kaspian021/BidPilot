@@ -27,6 +27,53 @@ class Repository:
         stmt = select(ProjectRow.id).where(ProjectRow.source == source, ProjectRow.external_id == external_id)
         return (await self.session.execute(stmt)).first() is not None
 
+    async def get_project_row_by_uid(self, source: str, external_id: str) -> ProjectRow | None:
+        stmt = select(ProjectRow).where(
+            ProjectRow.source == source,
+            ProjectRow.external_id == external_id,
+        )
+        return (await self.session.execute(stmt)).scalars().first()
+
+    async def latest_bid_for_project(self, project_id: int) -> BidRow | None:
+        stmt = (
+            select(BidRow)
+            .where(BidRow.project_id == project_id)
+            .order_by(BidRow.id.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalars().first()
+
+    async def refresh_project_row(self, row: ProjectRow, project: Project) -> ProjectRow:
+        """Merge fresher scraped evidence without erasing previously known fields."""
+        if project.title:
+            row.title = project.title
+        if project.url:
+            row.url = project.url
+        if project.description and len(project.description) >= len(row.description or ""):
+            row.description = project.description
+        budget = project.budget
+        if budget is not None and budget.is_known:
+            row.budget_min = budget.min
+            row.budget_max = budget.max
+            row.budget_text = budget.as_text()
+        if project.skills:
+            row.skills = json.dumps(project.skills, ensure_ascii=False)
+        if project.category:
+            row.category = project.category
+        if project.employer:
+            row.employer = project.employer
+        if project.published_at is not None:
+            row.published_at = project.published_at
+        row.fetched_at = project.fetched_at
+        try:
+            old_raw = json.loads(row.raw_json or "{}")
+        except (TypeError, ValueError):
+            old_raw = {}
+        old_raw.update(project.raw or {})
+        row.raw_json = json.dumps(old_raw, ensure_ascii=False, default=str)
+        await self.session.flush()
+        return row
+
     async def save_project(self, project: Project) -> ProjectRow:
         budget = project.budget
         row = ProjectRow(

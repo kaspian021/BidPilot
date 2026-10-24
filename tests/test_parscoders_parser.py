@@ -575,9 +575,7 @@ def test_parscoders_skill_links_are_extracted_from_listing_cards():
 def test_budget_range_with_negotiable_prefix_keeps_both_bounds():
     from bidpilot.sources.html_parser import find_budget
 
-    budget = find_budget(
-        "بودجه دلخواه بازه قیمت: 30,000,000 تومان تا 60,000,000 تومان مهلت: 65 روز"
-    )
+    budget = find_budget("بودجه دلخواه بازه قیمت: 30,000,000 تومان تا 60,000,000 تومان مهلت: 65 روز")
     assert budget is not None and budget.is_known
     assert (budget.min, budget.max) == (30_000_000, 60_000_000)
 
@@ -586,10 +584,7 @@ def test_freelancer_earnings_are_never_used_as_employer_budget():
     from bidpilot.models import Budget, Project
     from bidpilot.sources.html_parser import enrich_from_detail, find_budget
 
-    earnings = (
-        "مبلغ عایدی شما: 8,500,000 تومان (حساب کاربریت را ارتقاء بده تا "
-        "9,000,000 تومان دریافت کنی)"
-    )
+    earnings = "مبلغ عایدی شما: 8,500,000 تومان (حساب کاربریت را ارتقاء بده تا 9,000,000 تومان دریافت کنی)"
     assert find_budget(earnings) is None
     title = "بات مدیریت درخواست‌های واحد نظارت بر صدور بیمه"
     project = Project(

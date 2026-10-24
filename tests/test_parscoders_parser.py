@@ -372,7 +372,6 @@ def test_detail_description_fallback_uses_ponisha_markers():
     assert "سرویس‌های مرتبط" not in enriched.description
 
 
-
 def test_ponisha_header_budget_is_found_outside_title_scope_and_excluded_from_description():
     from bidpilot.models import Project
     from bidpilot.sources.html_parser import enrich_from_detail

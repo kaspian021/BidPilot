@@ -95,7 +95,9 @@ class Project(BaseModel):
         if self.key_requirements:
             parts.append("نیازمندی‌ها و الزامات کلیدی کارفرما:\n- " + "\n- ".join(self.key_requirements))
         if self.employer_questions:
-            parts.append("سؤالات یا خواسته‌های صریح کارفرما از فریلنسر:\n- " + "\n- ".join(self.employer_questions))
+            parts.append(
+                "سؤالات یا خواسته‌های صریح کارفرما از فریلنسر:\n- " + "\n- ".join(self.employer_questions)
+            )
         if self.description:
             parts.append(f"توضیحات کامل کارفرما:\n{self.description}")
         return "\n".join(parts)

@@ -312,11 +312,11 @@ _DESCRIPTION_SELECTORS = (
     ".job-description",
     ".description",
 )
-_UNTRUSTED_MARKER = re.compile(r"</?UNTRUSTED_PAGE_CONTENT\s*>", re.IGNORECASE)
+_UNTRUSTED_MARKER = re.compile(r"</?UNTRUSTED_PAGE_(?:CONTENT|LINKS)\s*>", re.IGNORECASE)
 
 
 def _sanitize_page_text(text: str) -> str:
-    """Prevent page text from closing the prompt's explicit untrusted-data boundary."""
+    """Prevent page text or link labels from closing an untrusted-data boundary."""
     return _UNTRUSTED_MARKER.sub("[علامت مرزی حذف شد]", text or "")
 
 
@@ -362,7 +362,18 @@ def digest_html(
     """
     soup = BeautifulSoup(html or "", "lxml")
     document_title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")[:200]
-    heading = soup.find(["h1", "h2"])
+    heading = soup.find("h1")
+    if heading is None:
+        for selector in _CONTENT_SELECTORS:
+            try:
+                candidates = soup.select(selector)
+            except Exception:
+                continue
+            heading = next((node.find(["h1", "h2"]) for node in candidates if node.find(["h1", "h2"])), None)
+            if heading is not None:
+                break
+    if heading is None:
+        heading = soup.find("h2")
     title = clean_text(heading.get_text(" ", strip=True))[:200] if heading else document_title
     # A password field alone means nothing: many pages contain a login modal.
     raw_text_length = len(clean_text(soup.get_text(" ", strip=True)))
@@ -674,7 +685,7 @@ class DiscoveryAgent:
             url=page.url,
             title=page.title or "—",
             text=_sanitize_page_text(text + ("\n(این صفحه فهرست پروژه است.)" if list_like else "")),
-            links=render_links(page.links),
+            links=_sanitize_page_text(render_links(page.links)),
         )
         answer = await self._complete_json(AGENT_SYSTEM, prompt, max_tokens=STEP_MAX_TOKENS)
         data = parse_json_object(getattr(answer, "text", answer))
@@ -715,6 +726,8 @@ class DiscoveryAgent:
     ) -> Project | None:
         """Normalize extracted fields and reject facts without evidence on this page."""
         page_text = " ".join(clean_text(page.text).split()).casefold()
+        description_evidence = " ".join(clean_text(source_description).split()).casefold()
+        evidence_text = f"{page_text} {description_evidence}".strip()
 
         title = clean_text(str(data.get("title") or ""))
         normalized_title = " ".join(title.split()).casefold()
@@ -726,11 +739,16 @@ class DiscoveryAgent:
 
         budget_text = clean_text(str(data.get("budget_text") or ""))[:160]
         page_budget = parser.find_budget(page.text)
-        if page_budget is not None and (page_budget.is_known or page_budget.negotiable):
-            # Prefer deterministic extraction from the page itself to the model's claim.
-            budget = page_budget
-            budget_text = page_budget.source_text or budget_text
-            budget_source = "page_text"
+        description_budget = parser.find_budget(source_description) if source_description else None
+        verified_budget = (
+            page_budget if page_budget is not None and (page_budget.is_known or page_budget.negotiable)
+            else description_budget
+        )
+        if verified_budget is not None and (verified_budget.is_known or verified_budget.negotiable):
+            # Prefer deterministic extraction from page evidence to the model's claim.
+            budget = verified_budget
+            budget_text = verified_budget.source_text or budget_text
+            budget_source = "page_text" if verified_budget is page_budget else "description_text"
         else:
             candidate = " ".join(budget_text.split()).casefold()
             if candidate and candidate in page_text:
@@ -743,7 +761,7 @@ class DiscoveryAgent:
 
         deadline = clean_text(str(data.get("deadline_text") or ""))[:100]
         deadline_key = " ".join(deadline.split()).casefold()
-        if not deadline_key or deadline_key not in page_text:
+        if not deadline_key or deadline_key not in evidence_text:
             deadline = ""
 
         # Prefer the actual HTML description node; otherwise retain the visible page
@@ -756,19 +774,19 @@ class DiscoveryAgent:
         for item in skills:
             skill = clean_text(str(item))[:60]
             skill_key = skill.casefold()
-            if skill and skill_key in page_text and skill not in verified_skills:
+            if skill and skill_key in evidence_text and skill not in verified_skills:
                 verified_skills.append(skill)
             if len(verified_skills) >= 20:
                 break
 
         category = clean_text(str(data.get("category") or ""))[:120]
-        if category and category.casefold() not in page_text:
+        if category and category.casefold() not in evidence_text:
             category = ""
         employer = clean_text(str(data.get("employer") or ""))[:120]
-        if employer and employer.casefold() not in page_text:
+        if employer and employer.casefold() not in evidence_text:
             employer = ""
 
-        if len(description) < 15:
+        if len(description) < 40 or (not source_description and len(page.text.strip()) < 40):
             return None
 
         return Project(

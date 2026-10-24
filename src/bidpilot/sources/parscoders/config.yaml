@@ -160,16 +160,14 @@ bid:
       - "select[name*='day']"
   include_hidden: true
   success_text_contains:
-    - "با موفقیت"
-    - "ثبت شد"
-    - "درخواست شما"
-    - "پیشنهاد شما"
+    - "پیشنهاد شما با موفقیت ثبت شد"
+    - "پیشنهاد با موفقیت ثبت شد"
+    - "پیشنهاد شما ثبت شد"
   failure_text_contains:
     - "قبلاً پیشنهاد"
     - "قبلا پیشنهاد"
     - "اعتبار کافی"
     - "امکان ارسال"
-    - "خطا"
     - "مجاز نیست"
     - "وارد شوید"
   # optional: a URL to GET before submitting (e.g. a CSRF-refresh endpoint)

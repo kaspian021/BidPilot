@@ -41,11 +41,13 @@ from .onboarding import (
     apply_answer,
     bid_percent,
     llm_questions,
+    mark_preview_ok,
     mark_setup_complete,
     marketplace_questions,
     missing_steps,
     mode_questions,
     parse_answer,
+    preview_is_fresh,
     pricing_questions,
     profile_questions,
     readiness,
@@ -217,6 +219,7 @@ HELP_TEXT = """<b>BidPilot — راهنما</b>
 /market — حساب سایت فعال: روش ورود + کوکی یا نام کاربری/رمز
 /status — چه چیزهایی تنظیم شده است؟
 /preview — یک پیشنهاد نمونه از یک پروژه‌ی واقعی (بدون ارسال)
+/filters — کدام پروژه‌ها بررسی می‌شوند؟ (بودجه، مهارت، کلیدواژه‌ها)
 /mode — جابه‌جایی بین حالت آزمایشی و واقعی
 /test — تست کلید هوش مصنوعی و تلگرام
 /settings — دیدن مقادیر ذخیره‌شده
@@ -388,6 +391,8 @@ class BotService:
             await self.handle_command(chat, "/style", "")
         elif data == "cmd:preview":
             await self.handle_command(chat, "/preview", "")
+        elif data == "cmd:filters":
+            await self.handle_command(chat, "/filters", "")
         elif data == "cmd:sites":
             await self.handle_command(chat, "/sites", "")
         elif data == "cmd:market":
@@ -426,6 +431,8 @@ class BotService:
             await self._cmd_status(chat_id)
         elif command == "/preview":
             await self._cmd_preview(chat_id)
+        elif command == "/filters":
+            await self._cmd_filters(chat_id)
         elif command == "/test":
             await self._cmd_test(chat_id)
         elif command == "/run":
@@ -572,6 +579,9 @@ class BotService:
             return
 
         live = state["mode"] == "live"
+        if live and not preview_is_fresh(self.store):
+            await self.send(chat_id, self._need_test_text(), self._need_test_keyboard())
+            return
         mode_line = (
             "🔴 <b>واقعی</b> — پیشنهادها روی سایت ثبت می‌شوند."
             if live
@@ -614,9 +624,34 @@ class BotService:
         except Exception:  # pragma: no cover - broken config
             return {"interval": 120, "per_day": 0, "per_hour": 0}
 
+    def _need_test_text(self) -> str:
+        return (
+            "<b>اول یک آزمایش بی‌خطر لازم است</b>\n\n"
+            "حالت فعلی 🔴 <b>واقعی</b> است؛ یعنی هر پیشنهاد روی سایت ثبت می‌شود. "
+            "تا وقتی یک پیش‌نمایش موفق یا یک دور 🧪 آزمایشی نبینم، ارسال واقعی را باز نمی‌کنم — "
+            "این‌طور پیشنهادِ ناقص یا ناموفق روی حساب تو ثبت نمی‌شود.\n\n"
+            "یکی از این دو را انتخاب کن:\n"
+            "• 🧪 <b>پیش‌نمایش</b> — همین حالا یک پروژه گرفته می‌شود و پیشنهادش را می‌بینی (چیزی ارسال نمی‌شود).\n"
+            "• 🔁 <b>حالت آزمایشی</b> — یک دور کامل بدون ارسال اجرا می‌شود.\n\n"
+            "بعد از آن /run در حالت واقعی باز است."
+        )
+
+    @staticmethod
+    def _need_test_keyboard() -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "🧪 پیش‌نمایش همین حالا", "callback_data": "cmd:preview"}],
+                [{"text": "🔁 اجرای یک دور آزمایشی", "callback_data": "cmd:mode"}],
+                [{"text": "📊 وضعیت", "callback_data": "cmd:status"}],
+            ]
+        }
+
     async def _start_work(self, chat_id: str) -> None:
         if self.automation.running:
             await self.send(chat_id, self.automation.status_text(), self._run_keyboard())
+            return
+        if self.store.get("runtime.submit_mode") == "live" and not preview_is_fresh(self.store):
+            await self.send(chat_id, self._need_test_text(), self._need_test_keyboard())
             return
         await self.send(chat_id, "🔐 یک‌بار ورود به حساب را بررسی می‌کنم…")
         check = await check_site(self.store, config_path=self.config_path)
@@ -633,6 +668,96 @@ class BotService:
     async def _cmd_stop(self, chat_id: str) -> None:
         ok, message = await self.automation.stop()
         await self.send(chat_id, ("⏸ " if ok else "ℹ️ ") + escape(message), self._run_keyboard())
+
+    # ---------------------------------------------------------------- filters
+    def _filter_view(self) -> tuple[Any, Any]:
+        """(config.filters, ProjectFilter) built exactly like the pipeline does."""
+        from .config import load_config
+        from .filters import ProjectFilter
+
+        cfg = load_config(self.config_path, store=self.store)
+        flt = ProjectFilter(
+            cfg.filters,
+            profile_skills=list(cfg.profile.stack),
+            profile_role=cfg.profile.role,
+        )
+        return cfg.filters, flt
+
+    @staticmethod
+    def _rule_line(enabled: bool, title: str, why: str) -> str:
+        return f"{'✅' if enabled else '⬜️'} <b>{escape(title)}</b>\n<i>{escape(why)}</i>"
+
+    def _filters_text(self) -> str:
+        try:
+            cfg, flt = self._filter_view()
+        except Exception as exc:  # broken config must not look like a crash
+            return f"❌ فیلترها خوانده نشد: {escape(str(exc))}"
+        lines = [
+            "<b>🧹 فیلتر پروژه‌ها</b>",
+            "",
+            self._rule_line(
+                bool(cfg.require_budget),
+                "بودجه اجباری",
+                "پروژه‌ای که بودجه‌اش اعلام نشده باشد بررسی نمی‌شود (قیمت حدسی نمی‌دهم).",
+            ),
+            "",
+            self._rule_line(
+                bool(cfg.require_skill_match),
+                "تطابق مهارت",
+                "پروژه باید دست‌کم یکی از مهارت‌های پروفایل تو را داشته باشد.",
+            ),
+            "",
+            f"🧠 <b>مهارت‌هایی که از پروفایل خواندم:</b> {escape(flt.describe_keywords())}",
+        ]
+        if cfg.min_budget or cfg.max_budget:
+            low = f"{cfg.min_budget:,}" if cfg.min_budget else "—"
+            high = f"{cfg.max_budget:,}" if cfg.max_budget else "—"
+            lines.append(f"💰 بازه‌ی بودجه: {low} تا {high} تومان")
+        if cfg.exclude_keywords:
+            lines.append("🚫 ممنوعه‌ها: " + escape("، ".join(cfg.exclude_keywords[:8])))
+        if not flt.skill_keywords:
+            lines += [
+                "",
+                "⚠️ پروفایل مهارتی خالی است؛ تا وقتی /profile را کامل نکنی هیچ پروژه‌ای قبول نمی‌شود.",
+            ]
+        lines += [
+            "",
+            "<i>مهارت‌ها از /profile می‌آیند؛ با دکمه‌ی زیر دوباره از پروفایل ساخته می‌شوند.</i>",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _filters_keyboard() -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "🔁 بودجه اجباری", "callback_data": "flt:budget"}],
+                [{"text": "🔁 تطابق مهارت", "callback_data": "flt:skill"}],
+                [{"text": "♻️ بازسازی از پروفایل", "callback_data": "flt:derive"}],
+                [{"text": "📊 وضعیت", "callback_data": "cmd:status"}],
+            ]
+        }
+
+    async def _cmd_filters(self, chat_id: str) -> None:
+        await self.send(chat_id, self._filters_text(), self._filters_keyboard())
+
+    async def _toggle_filter(self, chat_id: str, name: str) -> None:
+        if name == "derive":
+            self.store.set("filters.skill_keywords", [])
+            await self.send(chat_id, "♻️ کلیدواژه‌ها دوباره از پروفایل ساخته شد.")
+        elif name in {"budget", "skill"}:
+            key = "filters.require_budget" if name == "budget" else "filters.require_skill_match"
+            stored = self.store.get(key)
+            current = True if stored is None else bool(stored)
+            self.store.set(key, not current)
+            await self.send(
+                chat_id,
+                f"{'✅ روشن' if not current else '⬜️ خاموش'} شد — "
+                + ("بودجه اجباری" if name == "budget" else "تطابق مهارت"),
+            )
+        else:
+            await self.send(chat_id, "این گزینه را نمی‌شناسم.")
+            return
+        await self.send(chat_id, self._filters_text(), self._filters_keyboard())
 
     async def _cmd_check(self, chat_id: str) -> None:
         await self.send(chat_id, "🔐 دارم ورود به حساب سایت را بررسی می‌کنم…")
@@ -778,10 +903,20 @@ class BotService:
             await self.send(chat_id, f"❌ پیش‌نمایش ناموفق بود: {escape(str(exc))}")
             return
         if not messages:
-            await self.send(chat_id, "پروژه‌ای برای پیش‌نمایش پیدا نشد (یا همه با فیلترها رد شدند).")
+            await self.send(
+                chat_id,
+                "پروژه‌ای برای پیش‌نمایش پیدا نشد (یا همه با فیلترها/بودجه رد شدند).\n"
+                "برای دیدن دلیل رد شدن‌ها: /filters",
+            )
             return
+        mark_preview_ok(self.store, "preview", note=messages[-1][:200])
         for message in messages:
             await self.send(chat_id, message)
+        if self.store.get("runtime.submit_mode") == "live":
+            await self.send(
+                chat_id,
+                "✅ آزمایش انجام شد؛ حالا /run در حالت واقعی باز است.",
+            )
 
     async def _generate_preview(self, limit: int = 1) -> list[str]:
         """Build a throw-away Application and generate real proposals."""
@@ -824,6 +959,15 @@ class BotService:
                     f"<b>{escape(project.title)}</b>\n"
                     f"💵 {price.amount:,} تومان | ⏱ {delivery} روز | 🤖 {escape(proposal.generated_by)}\n\n"
                     f"<pre>{escape(proposal.text)}</pre>"
+                )
+            reason = str(getattr(generator, "last_llm_error", "") or "")
+            if messages and reason:
+                # The template fallback is silent by design; the *reason* must not be.
+                messages.insert(
+                    0,
+                    "⚠️ <b>هوش مصنوعی جواب نداد</b> — پیشنهاد زیر از قالب آماده ساخته شد.\n"
+                    f"<pre>{escape(reason[:700])}</pre>"
+                    "🔧 کلید را با /test تست کن یا در /llm عوضش کن.",
                 )
             return messages
         finally:
@@ -957,6 +1101,17 @@ class BotService:
                 + "\n\nبرای دیدن نتیجه: /preview",
             )
             return
+        if flow.name == "mode":
+            live = str(self.store.get("runtime.submit_mode")) == "live"
+            if live and not preview_is_fresh(self.store):
+                await self.send(
+                    chat_id,
+                    "🔴 حالت واقعی ثبت شد — ولی تا یک آزمایش موفق، /run واقعی را باز نمی‌کند.\n"
+                    "همین حالا /preview را بزن.",
+                )
+                return
+            await self.send(chat_id, "✅ حالت ذخیره شد.")
+            return
         if flow.name == "market":
             # right after the account is entered: prove the login and offer «شروع فعالیت»
             await self.send(chat_id, "✅ حساب ذخیره شد.")
@@ -993,9 +1148,10 @@ class BotService:
     def _menu_hint() -> str:
         return (
             "چه کاری می‌خواهی؟\n"
-            "• /run شروع فعالیت (ارسال پیشنهادها)\n"
+            "• /run شروع فعالیت (اول یک /preview یا دور آزمایشی لازم است)\n"
             "• /style تغییر لحن، سبک و درصد قیمت\n"
             "• /preview دیدن یک پیشنهاد نمونه\n"
+            "• /filters تنظیم اینکه چه پروژه‌هایی بررسی شوند\n"
             "• /stop توقف ارسال\n"
             "• /mode آزمایشی یا ارسال واقعی\n"
             "• /settings دیدن مقادیر ذخیره‌شده\n"
@@ -1019,6 +1175,7 @@ class BotService:
                     {"text": "👤 پروفایل", "callback_data": "cmd:profile"},
                     {"text": "📊 وضعیت", "callback_data": "cmd:status"},
                 ],
+                [{"text": "🧹 فیلتر پروژه‌ها", "callback_data": "cmd:filters"}],
                 [{"text": "⚙️ تنظیم مجدد", "callback_data": "cmd:setup"}],
             ]
         }

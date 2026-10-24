@@ -83,6 +83,8 @@ class RuntimeConfig(BaseModel):
     min_seconds_between_bids: int = 90
     max_projects_per_poll: int = 30
     notify_on_skip: bool = True
+    #: one grouped message per cycle instead of one message per project
+    notify_digest: bool = True
     notify_error_cooldown_seconds: int = 1_800
     request_timeout_seconds: float = 25.0
     user_agent: str = (
@@ -102,6 +104,16 @@ class FiltersConfig(BaseModel):
     max_budget: int | None = None
     categories_allow: list[str] = Field(default_factory=list)
     skip_negotiable: bool = False
+    #: bid only on projects that state a budget (no guessing at a fair price)
+    require_budget: bool = True
+    #: bid only when the project mentions something the user can actually do
+    require_skill_match: bool = True
+    #: extra skill words; empty = derived from the user's profile (stack + role)
+    skill_keywords: list[str] = Field(default_factory=list)
+
+
+#: greeting + price/delivery sentence + signature do not fit below this
+PROPOSAL_MIN_MAX_CHARS = 700
 
 
 class ProposalConfig(BaseModel):
@@ -188,6 +200,22 @@ class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     sources: list[SourceConfig] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _sane_proposal_limits(self) -> AppConfig:
+        """A proposal that cannot hold its own price is not a proposal.
+
+        The greeting + price + delivery sentence + signature already need ~450
+        characters, so a smaller ``max_chars`` is raised to the floor instead of
+        failing every bid at validation time.
+        """
+        proposal = self.proposal
+        if proposal.max_chars < PROPOSAL_MIN_MAX_CHARS:
+            proposal.max_chars = PROPOSAL_MIN_MAX_CHARS
+        ceiling = max(proposal.max_chars - 100, 120)
+        if proposal.min_chars < 120 or proposal.min_chars > ceiling:
+            proposal.min_chars = min(max(proposal.min_chars, 300), ceiling)
+        return self
+
     def source(self, type_name: str) -> SourceConfig | None:
         for src in self.sources:
             if src.type == type_name:
@@ -273,7 +301,23 @@ STORE_CONFIG_SECTIONS: dict[str, tuple[str, ...]] = {
         "max_emoji",
     ),
     "llm": ("provider", "base_url", "model", "fallbacks"),
-    "runtime": ("submit_mode", "poll_interval_seconds", "max_bids_per_hour", "max_bids_per_day"),
+    "filters": (
+        "include_keywords",
+        "exclude_keywords",
+        "min_budget",
+        "max_budget",
+        "require_budget",
+        "require_skill_match",
+        "skill_keywords",
+    ),
+    "runtime": (
+        "submit_mode",
+        "poll_interval_seconds",
+        "max_bids_per_hour",
+        "max_bids_per_day",
+        "notify_digest",
+        "notify_on_skip",
+    ),
 }
 
 
@@ -289,7 +333,7 @@ def _stored_section(store: SettingsStore, section: str) -> dict[str, Any]:
 def apply_store_to_raw(raw: dict[str, Any], store: SettingsStore) -> dict[str, Any]:
     """Overlay persisted user settings on top of the YAML configuration."""
     raw = dict(raw or {})
-    for section in ("profile", "proposal", "llm", "runtime"):
+    for section in ("profile", "proposal", "llm", "runtime", "filters"):
         stored = _stored_section(store, section)
         if stored:
             raw[section] = deep_merge(raw.get(section) or {}, stored)

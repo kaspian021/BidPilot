@@ -96,8 +96,9 @@ async def check_site(
             try:
                 health_ok, health_detail = await source.healthcheck()
                 if health_ok:
+                    # only the count line below is shown — appending the raw
+                    # healthcheck text used to print the same sentence twice
                     projects = _project_count_from_detail(health_detail)
-                    detail = f"{detail}\n📄 {health_detail}"
                 else:
                     ok, detail = False, f"{detail}\n⚠️ {health_detail}"
             except Exception as exc:  # network hiccup on the listing page

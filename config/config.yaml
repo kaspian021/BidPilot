@@ -25,6 +25,8 @@ runtime:
   max_bids_per_day: 25
   min_seconds_between_bids: 180
   max_projects_per_poll: 30
+  #: one grouped «گزارش دور» per cycle instead of one message per project
+  notify_digest: true
   notify_on_skip: true
   request_timeout_seconds: 25.0
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -58,6 +60,12 @@ filters:
   max_budget: null
   categories_allow: []
   skip_negotiable: false
+  # only bid when the posting states a budget (no guessing at a fair price)
+  require_budget: true
+  # only bid when the project mentions a skill from profile.stack / profile.role
+  require_skill_match: true
+  # extra words; empty = derived from the profile (editable from /filters in Telegram)
+  skill_keywords: []
 
 # ---------------------------------------------------------------------------
 # Proposal text

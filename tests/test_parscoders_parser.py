@@ -80,3 +80,55 @@ def test_extract_external_id_and_fallback():
     assert parser.extract_external_id("https://parscoders.com/project/98765/slug") == "98765"
     assert parser.extract_external_id("https://parscoders.com/about") is None
     assert parser.fallback_id("a", "b").startswith("h")
+
+
+def test_budget_is_read_from_the_card_text_when_the_selector_is_empty():
+    html = """
+    <html><body>
+      <div class="project-list-item">
+        <h2><a href="/project/555">ساخت اپلیکیشن فلاتر</a></h2>
+        <p class="project-description">نیاز به برنامه‌نویس Flutter</p>
+        <div class="meta">بودجه: ۵۰۰,۰۰۰ تا ۱,۵۰۰,۰۰۰ تومان</div>
+        <div class="meta">۱٬۲۳۴ پروژه ثبت شده</div>
+      </div>
+    </body></html>
+    """
+    settings = {**SETTINGS["list"], "fields": {**SETTINGS["list"]["fields"]}}
+    settings["fields"]["budget"] = [".no-such-budget-element"]
+    projects = parser.parse_list_page(html, settings, "parscoders", "https://parscoders.com")
+
+    assert len(projects) == 1
+    budget = projects[0].budget
+    assert budget is not None and budget.is_known
+    # the page counter (۱۲۳۴ پروژه) must never become the budget
+    assert (budget.min, budget.max) == (500_000, 1_500_000)
+
+
+def test_find_budget_handles_labels_and_rejects_counters():
+    from bidpilot.sources.html_parser import find_budget
+
+    assert find_budget("حق‌الزحمه: ۲ میلیون تومان").min == 2_000_000
+    labeled = find_budget("بودجه‌ی پروژه ۳۰۰ تا ۷۰۰ هزار تومان است")
+    assert labeled is not None and (labeled.min, labeled.max) == (300_000, 700_000)
+    assert find_budget("۱٬۲۳۴ پروژه ثبت شده") is None
+    assert find_budget("سلام، پروژه‌ی ساده‌ای است") is None
+
+
+def test_detail_page_budget_fallback():
+    html = """
+    <html><body>
+      <div class="project-description">توضیح کامل پروژه</div>
+      <div class="side">بودجه: ۱٬۰۰۰٬۰۰۰ تا ۲٬۰۰۰٬۰۰۰ تومان</div>
+    </body></html>
+    """
+    project = parser.parse_list_page(
+        (FIXTURES / "sample_list.html").read_text(encoding="utf-8"),
+        SETTINGS["list"],
+        "parscoders",
+        "https://parscoders.com",
+    )[2]
+    settings = {**SETTINGS["detail"], "detail_fields": {**SETTINGS["detail"]["detail_fields"]}}
+    settings["detail_fields"]["budget"] = [".no-such-budget-element"]
+    enriched = parser.enrich_from_detail(html, project, settings)
+    assert enriched.budget is not None and enriched.budget.is_known
+    assert enriched.budget.min == 1_000_000 and enriched.budget.max == 2_000_000

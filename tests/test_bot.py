@@ -191,9 +191,11 @@ async def test_preview_generates_a_real_proposal_without_network(tmp_path, monke
 
     messages = await service._generate_preview(limit=1)
 
-    assert len(messages) == 1
-    assert "پیش‌نمایش پیشنهاد" in messages[0]
-    assert "تومان" in messages[0]
+    proposals = [m for m in messages if "پیش‌نمایش پیشنهاد" in m]
+    assert len(proposals) == 1
+    assert "تومان" in proposals[0]
+    # the real reason the AI was not used is never hidden from the user
+    assert any("هوش مصنوعی" in m for m in messages)
     assert Path(workdir / "data").exists()
 
 
@@ -266,3 +268,97 @@ async def test_full_setup_from_telegram_end_to_end(tmp_path, monkeypatch):
     # after setup the bot proves the login and offers the start button
     assert any("وارد حساب" in text for _, text, _ in api.sent)
     assert "شروع فعالیت" in str(api.sent[-1][2])  # the start button is attached
+
+
+def ready_store(store: SettingsStore) -> None:
+    """Everything /run needs, with the site set to mock (no network)."""
+    store.update(
+        {
+            "telegram.bot_token": TOKEN,
+            "telegram.chat_ids": ["777"],
+            "marketplace.name": "mock",
+            "profile.full_name": "علی اقبالی",
+            "proposal.tone": "فنی و مستقیم",
+        }
+    )
+
+
+async def test_live_run_is_blocked_until_a_preview_or_dry_run(tmp_path, monkeypatch):
+    service, api, store = make_service(tmp_path, monkeypatch)
+    ready_store(store)
+    store.set("runtime.submit_mode", "live")
+
+    await service.handle_command("777", "/run")
+
+    assert "آزمایش بی‌خطر" in api.last_text
+    assert "run:confirm" not in str(api.sent[-1][2])
+    assert not service.automation.running
+
+
+async def test_confirm_callback_is_blocked_too(tmp_path, monkeypatch):
+    service, api, store = make_service(tmp_path, monkeypatch)
+    ready_store(store)
+    store.set("runtime.submit_mode", "live")
+
+    await service.handle_update(
+        {
+            "update_id": 2,
+            "callback_query": {
+                "id": "cb",
+                "data": "run:confirm",
+                "from": {"id": 777},
+                "message": {"chat": {"id": 777}},
+            },
+        }
+    )
+
+    assert "آزمایش بی‌خطر" in api.last_text
+    assert not service.automation.running
+
+
+async def test_a_finished_dry_run_unlocks_live_mode(tmp_path, monkeypatch):
+    from bidpilot.onboarding import mark_preview_ok, preview_is_fresh
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    ready_store(store)
+    store.set("runtime.submit_mode", "live")
+    assert not preview_is_fresh(store)
+
+    mark_preview_ok(store, "dry_run")
+
+    assert preview_is_fresh(store)
+    # /status now shows the proof
+    await service.handle_command("777", "/status")
+    assert "آزمایش بی‌خطر: انجام شده" in api.last_text
+
+
+async def test_preview_marks_the_proof_for_the_active_site(tmp_path, monkeypatch):
+    from bidpilot.onboarding import preview_proof
+
+    service, api, store = make_service(tmp_path, monkeypatch)
+    ready_store(store)
+    await service.handle_command("777", "/preview")
+
+    proof = preview_proof(store)
+    assert proof.get("ok") is True
+    assert proof.get("site") == "mock"
+
+
+async def test_filters_command_shows_profile_skills_and_toggles_rules(tmp_path, monkeypatch):
+    service, api, store = make_service(tmp_path, monkeypatch)
+    ready_store(store)
+    store.set("profile.stack", ["Flutter", "Dart", "FastAPI"])
+    store.set("profile.role", "برنامه‌نویس موبایل")
+
+    await service.handle_command("777", "/filters")
+    assert "بودجه اجباری" in api.last_text
+    assert "flutter" in api.last_text
+    assert "تطابق مهارت" in api.last_text
+
+    await service._toggle_filter("777", "budget")
+    assert store.get("filters.require_budget") is False
+    assert "⬜️" in api.last_text or "✅" in api.last_text
+
+    await service._toggle_filter("777", "derive")
+    # an empty list is stored as "removed", which means "rebuild from /profile"
+    assert not store.get("filters.skill_keywords")

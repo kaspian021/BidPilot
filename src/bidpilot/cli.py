@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from .proposals.generator import ProposalGenerator
 from .settings_store import SettingsStore, get_store
 from .sources import available_sources
 from .text import to_persian_digits
+
+log = logging.getLogger(__name__)
 
 app = typer.Typer(
     add_completion=False, help="BidPilot — automated, human-quality bids for freelance marketplaces."
@@ -575,6 +578,10 @@ def selftest(
         finally:
             await application.close()
 
+        if generated is not None and not offline:
+            # only a test of the *active* site unlocks live mode for it
+            if not source or source == _active_site(get_store()):
+                _mark_safe_test("selftest")
         if generated is not None:
             project, price, proposal = generated
             source_name = proposal.generated_by
@@ -630,6 +637,16 @@ def selftest(
             )
 
     _run(main())
+
+
+def _mark_safe_test(kind: str) -> None:
+    """A real proposal was generated without sending it -> unlock 🔴 live in /run."""
+    try:
+        from .onboarding import mark_preview_ok
+
+        mark_preview_ok(get_store(), "dry_run" if "dry" in kind else "preview", note=kind)
+    except Exception as exc:  # a read-only store must not break the command
+        log.debug("Could not store the safe-test proof: %s", exc)
 
 
 def delivery_days_label(cfg: AppConfig) -> str:
@@ -714,6 +731,8 @@ def once(
                 str(r.failed),
             )
         console.print(table)
+        if any(r.dry_run for r in reports) and not any(r.submitted for r in reports):
+            _mark_safe_test("once --dry-run")
         await application.close()
 
     _run(main())

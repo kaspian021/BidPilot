@@ -81,6 +81,19 @@ class Scheduler:
             pass
         return True
 
+    def _remember_safe_test(self, reports: list[Any]) -> None:
+        """A dry-run cycle that produced bids unlocks 🔴 live for the same site."""
+        if self.app.config.runtime.live:
+            return
+        if not any(int(getattr(r, "dry_run", 0) or 0) > 0 for r in reports or []):
+            return
+        try:
+            from .onboarding import mark_preview_ok
+
+            mark_preview_ok(self._store, "dry_run", note="دور آزمایشی کامل شد")
+        except Exception as exc:  # pragma: no cover - never break the loop
+            log.warning("Could not store the dry-run proof: %s", exc)
+
     async def _emit_report(self, reports: list[Any]) -> None:
         if self._on_report is None:
             return
@@ -110,6 +123,7 @@ class Scheduler:
                 await self.reload_if_settings_changed()
                 reports = await self.app.cycle(self.sources)
                 self.consecutive_errors = 0
+                self._remember_safe_test(reports)
                 await self._emit_report(reports)
                 for report in reports:
                     log.info(report.summary())

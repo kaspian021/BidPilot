@@ -297,3 +297,19 @@ def test_terminal_wizard_imports_a_resume_pdf(tmp_path, monkeypatch):
     assert store.get("profile.years_experience") == 7
     assert store.get("profile.source") == "resume"
     assert Path(store.get("profile.resume_path")).exists()
+
+
+def test_preview_proof_is_site_scoped(tmp_path):
+    from bidpilot.onboarding import mark_preview_ok, preview_is_fresh, preview_proof
+
+    store = SettingsStore(str(tmp_path / "settings.json"))
+    store.set("marketplace.name", "parscoders")
+
+    assert preview_is_fresh(store) is False
+    mark_preview_ok(store, "preview")
+    assert preview_is_fresh(store) is True
+    assert preview_proof(store)["site"] == "parscoders"
+
+    # switching marketplace invalidates the proof: it was never tested there
+    store.set("marketplace.name", "ponisha")
+    assert preview_is_fresh(store) is False

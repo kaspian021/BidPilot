@@ -82,8 +82,81 @@ def fallback_id(*parts: str) -> str:
     return "h" + hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+#: Labels an employer's budget carries on Iranian marketplaces. The capture
+#: group is the short text *after* the label, which is then parsed normally.
+BUDGET_LABELS = (
+    r"بودجه",
+    r"بودجهٔ",
+    r"بودجه‌ی",
+    r"مبلغ",
+    r"حق‌?الزحمه",
+    r"حقوق",
+    r"هزینه",
+    r"قیمت",
+    r"پرداختی",
+    r"سقف بودجه",
+)
+#: generic "labeled amount" patterns, used when a site has no budget selector
+DEFAULT_BUDGET_REGEXES: tuple[str, ...] = tuple(
+    rf"{label}\s*[:：]?\s*([^\n]{{2,60}})" for label in BUDGET_LABELS
+)
+
+#: amounts in this range are plausible bids (1,000 toman … 1 billion toman)
+_MIN_PLAUSIBLE = 1_000
+_MAX_PLAUSIBLE = 1_000_000_000
+
+
 def _parse_amount(text: str) -> Budget | None:
     return parse_budget(text)
+
+
+def parse_budget_text(text: str | None) -> Budget | None:
+    """Parse an amount and keep only plausible values (no page counters)."""
+    budget = parse_budget(text)
+    if budget is None or not budget.is_known:
+        return budget
+    low, high = budget.lower or 0, budget.upper or 0
+    if low < _MIN_PLAUSIBLE or high > _MAX_PLAUSIBLE:
+        return Budget(negotiable=True, source_text=(text or "")[:200])
+    return budget
+
+
+def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None = None) -> Budget | None:
+    """Look for a *labeled* budget inside free text ("بودجه: …", "حق‌الزحمه …").
+
+    Falls back to a bare amount only when it carries a currency unit, so page
+    counters ("۱٬۲۳۴ پروژه") are not mistaken for money.
+    """
+    cleaned = clean_text(text or "")
+    if not cleaned:
+        return None
+
+    for pattern in patterns or DEFAULT_BUDGET_REGEXES:
+        try:
+            match = re.search(pattern, cleaned, re.I)
+        except re.error:
+            continue
+        if not match:
+            continue
+        candidate = match.group(1) if match.groups() else match.group(0)
+        # A label such as «بودجه: توافقی» is followed by other card text; only a
+        # candidate that names a currency may be read as an amount, and nothing
+        # after that unit belongs to the budget.
+        unit = re.search(r"تومان|تومن|ریال|هزار|میلیون|میلیارد", candidate)
+        if unit is None:
+            if any(token in candidate for token in ("توافق", "مذاکره", "negotiable")):
+                return Budget(negotiable=True, source_text=candidate[:200])
+            continue
+        candidate = candidate[: unit.end()]
+        budget = parse_budget_text(candidate)
+        if budget is not None and budget.is_known:
+            return budget
+
+    for match in re.finditer(r"([^\n]{0,30}?)(\d[\d,.٬،]*)\s*(تومان|تومن|ریال|هزار تومان|میلیون)", cleaned):
+        budget = parse_budget_text(match.group(0))
+        if budget is not None and budget.is_known:
+            return budget
+    return None
 
 
 def parse_published(text: str) -> datetime | None:
@@ -143,8 +216,17 @@ def parse_project_card(
         return None
 
     budget_text = _text(card, fields.get("budget"))
+    budget = _parse_amount(budget_text)
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(card, fields.get("skills"))]
     description = _text(card, fields.get("description"))
+    if budget is None or not budget.is_known:
+        # The budget is often just a line of the card ("بودجه: ۵۰۰,۰۰۰ تومان")
+        # without its own class — read it from the card's text.
+        card_text = clean_text(card.get_text(" ", strip=True)) if isinstance(card, Tag) else ""
+        found = find_budget(card_text, settings.get("budget_regex"))
+        if found is not None and found.is_known:
+            budget = found
+            budget_text = budget.source_text or budget.as_text()
 
     return Project(
         source=source_name,
@@ -152,7 +234,7 @@ def parse_project_card(
         title=title or "(بدون عنوان)",
         url=link,
         description=description,
-        budget=_parse_amount(budget_text),
+        budget=budget,
         skills=[s for s in skills if s][:12],
         category=_text(card, fields.get("category")) or None,
         employer=_text(card, fields.get("employer")) or None,
@@ -234,6 +316,12 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     if description and len(description) > len(project.description):
         update["description"] = description
     budget = _parse_amount(budget_text)
+    if budget is None or not budget.is_known:
+        # no budget selector matched: look for a labeled amount on the page
+        page_text = clean_text(soup.get_text(" ", strip=True))[:20_000]
+        found = find_budget(page_text, settings.get("budget_regex"))
+        if found is not None and found.is_known:
+            budget = found
     if budget and budget.is_known:
         update["budget"] = budget
     if skills:

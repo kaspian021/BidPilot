@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .llm_providers import (
@@ -857,6 +858,48 @@ def mark_setup_complete(store: SettingsStore, *, complete: bool = True) -> None:
 # ---------------------------------------------------------------------------
 # Readiness / status helpers
 # ---------------------------------------------------------------------------
+#: One successful dry-run/preview is required before 🔴 live submission.
+PROOF_KEY = "run.proof"
+
+
+def preview_proof(store: SettingsStore) -> dict[str, Any]:
+    """The stored proof that a proposal was already built without sending it."""
+    raw = store.get(PROOF_KEY)
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def preview_is_fresh(store: SettingsStore) -> bool:
+    """True when a preview/dry-run succeeded *for the site that is active now*."""
+    proof = preview_proof(store)
+    if not proof.get("ok"):
+        return False
+    site = str(proof.get("site") or "")
+    return not site or site == _current_marketplace(store)
+
+
+def mark_preview_ok(store: SettingsStore, kind: str = "preview", *, note: str = "") -> None:
+    """Remember that a real proposal was generated (``preview`` or ``dry_run``)."""
+    store.set(
+        PROOF_KEY,
+        {
+            "ok": True,
+            "kind": kind,
+            "site": _current_marketplace(store),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "note": note[:300],
+        },
+    )
+
+
+def preview_proof_text(store: SettingsStore) -> str:
+    """Short Persian line for /status — empty when nothing proved yet."""
+    if not preview_is_fresh(store):
+        return ""
+    proof = preview_proof(store)
+    kind = "پیش‌نمایش" if proof.get("kind") != "dry_run" else "دور آزمایشی"
+    return f"🎯 یک {kind} موفق ثبت شده — حالت واقعی باز است"
+
+
 def readiness(store: SettingsStore) -> dict[str, Any]:
     provider = _current_provider(store)
     preset = PRESETS[provider]
@@ -883,6 +926,7 @@ def readiness(store: SettingsStore) -> dict[str, Any]:
         "profile_source": str(store.get("profile.source") or ""),
         "profile_imported_at": store.get("profile.imported_at"),
         "bid_percent": bid_percent(store),
+        "preview": preview_is_fresh(store),
         "setup_completed": bool(store.get("setup.completed")),
     }
 
@@ -923,6 +967,8 @@ def status_text(store: SettingsStore) -> str:
         + (" (از " + _profile_source_label(state["profile_source"]) + ")" if state["profile_source"] else ""),
         f"💰 قیمت: {to_persian_digits(str(state['bid_percent']))}٪ بودجه‌ی کارفرما",
         f"حالت ارسال: {'🔴 واقعی' if state['mode'] == 'live' else '🧪 آزمایشی'}",
+        f"{mark(state['preview'])} آزمایش بی‌خطر: "
+        + ("انجام شده" if state["preview"] else "هنوز انجام نشده — /preview"),
         f"تنظیمات اولیه: {'کامل ✅' if state['setup_completed'] else 'ناتمام ⚠️'}",
     ]
     return "\n".join(lines)
@@ -1151,10 +1197,14 @@ __all__ = [
     "apply_answer",
     "llm_questions",
     "marketplace_questions",
+    "mark_preview_ok",
     "mark_setup_complete",
     "missing_steps",
     "mode_questions",
     "parse_answer",
+    "preview_is_fresh",
+    "preview_proof",
+    "preview_proof_text",
     "profile_questions",
     "readiness",
     "run_terminal_wizard",

@@ -644,8 +644,7 @@ class HtmlMarketSource(Source):
         # Keep the target URL query-free in logs; the HTML size and final path
         # are enough to diagnose an empty/changed form or a login/challenge page.
         log.info(
-            "[BID][PAGE-RESPONSE] source=%s id=%s status=%s final_url=%s "
-            "html_chars=%s content_type=%r",
+            "[BID][PAGE-RESPONSE] source=%s id=%s status=%s final_url=%s html_chars=%s content_type=%r",
             self.name,
             project.external_id,
             page.status_code,

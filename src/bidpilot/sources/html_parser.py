@@ -364,7 +364,8 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     detail: dict[str, list[str]] = settings.get("detail_fields", {}) or {}
 
     description = _text(soup, detail.get("description"))
-    budget_text = _text(soup, detail.get("budget"))
+    budget_selector_text = _text(soup, detail.get("budget"))
+    budget_text = budget_selector_text
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(soup, detail.get("skills"))]
     category = _text(soup, detail.get("category"))
     employer = _text(soup, detail.get("employer"))
@@ -383,12 +384,13 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
             budget_origin = "not_found"
     log.info(
         "[PARSER][DETAIL] source=%s id=%s title=%r url=%s "
-        "budget_selector_text=%r budget_origin=%s budget_final={%s} "
+        "budget_selector_text=%r budget_text_used=%r budget_origin=%s budget_final={%s} "
         "description_chars=%s skills=%r category=%r employer=%r",
         project.source,
         project.external_id,
         project.title,
         project.url,
+        budget_selector_text,
         budget_text,
         budget_origin,
         _budget_debug(budget),
@@ -425,6 +427,19 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
         update["category"] = category
     if employer:
         update["employer"] = employer
+    # Preserve evidence about what was (or was not) found, so the final project
+    # record explains why a bid was skipped even after a detail-page attempt.
+    raw = dict(project.raw or {})
+    raw.update(
+        {
+            "detail_budget_selector_text": budget_selector_text,
+            "detail_budget_text_used": budget_text,
+            "detail_budget_source": budget_origin,
+            "detail_budget_parsed": _budget_debug(budget),
+            "detail_page_text_chars": len(page_text),
+        }
+    )
+    update["raw"] = raw
     if not update:
         return project
     return project.model_copy(update=update)

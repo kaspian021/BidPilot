@@ -60,7 +60,12 @@ def make_config(tmp_path, **runtime_overrides) -> AppConfig:
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.sqlite3'}",
         profile=Profile(first_name="محمد", full_name="محمد رضایی"),
         runtime=RuntimeConfig(**runtime),
-        filters=FiltersConfig(exclude_keywords=["هک", "کپی سایت"]),
+        # the pipeline tests exercise pacing/submission, not the new relevance rules
+        filters=FiltersConfig(
+            exclude_keywords=["هک", "کپی سایت"],
+            require_budget=False,
+            require_skill_match=False,
+        ),
         sources=[SourceConfig(type="mock", settings={"projects": PROJECTS, "latency": 0})],
         llm={"enabled": False},
     )
@@ -180,4 +185,74 @@ async def test_error_notifications_are_throttled(tmp_path):
 
     # DB logs the error both times, Telegram only once per cooldown window
     assert len(notifier.kinds(EventKind.ERROR)) == 1
+    await application.close()
+
+
+def make_digest_config(tmp_path, **runtime_overrides) -> AppConfig:
+    runtime = dict(notify_digest=True, notify_on_skip=True)
+    runtime.update(runtime_overrides)
+    config = make_config(tmp_path, **runtime)
+    # only one project matters for the digest assertions
+    config.sources = [SourceConfig(type="mock", settings={"projects": PROJECTS[:1], "latency": 0})]
+    return config
+
+
+async def test_one_digest_per_cycle_instead_of_one_message_per_project(tmp_path):
+    application, notifier = await build_app(make_digest_config(tmp_path, submit_mode="dry_run"))
+    report = (await application.cycle())[0]
+
+    digests = notifier.kinds(EventKind.DIGEST)
+    assert len(digests) == 1
+    assert "گزارش mock" in digests[0].body
+    assert "پروژه بررسی شد" in digests[0].body
+    # no per-project «پروژه جدید» ping any more
+    assert not notifier.kinds(EventKind.NEW_PROJECT)
+    assert report.dry_run == 1
+    await application.close()
+
+
+async def test_digest_lists_why_projects_were_skipped(tmp_path):
+    config = make_digest_config(tmp_path)
+    config.sources = [SourceConfig(type="mock", settings={"projects": PROJECTS[2:], "latency": 0})]
+    application, notifier = await build_app(config)
+    report = (await application.cycle())[0]
+
+    assert report.skipped == 1
+    assert report.skip_reasons  # «کلیدواژهی ممنوعه پیدا شد: …»
+    digest = notifier.kinds(EventKind.DIGEST)[0]
+    assert "⏭" in digest.body
+    assert any(reason in digest.body for reason in report.skip_reasons)
+    await application.close()
+
+
+async def test_digest_is_silent_when_nothing_happened(tmp_path):
+    application, notifier = await build_app(make_digest_config(tmp_path))
+    await application.cycle()
+    notifier.events.clear()
+    await application.cycle()  # everything is a duplicate now
+
+    assert not notifier.kinds(EventKind.DIGEST)
+    await application.close()
+
+
+async def test_llm_failure_reason_reaches_the_report(tmp_path):
+    from bidpilot.proposals.llm_client import LLMClient, LLMError
+
+    class FailingClient(LLMClient):
+        async def complete(self, system, user):  # type: ignore[override]
+            raise LLMError("429 rate limit")
+
+    config = make_config(tmp_path, submit_mode="dry_run")
+    config.proposal.on_generation_failure = "template"
+    config.llm.enabled = True
+    application = Application.build(config, Secrets())
+    notifier = MemoryNotifier()
+    application.notifiers.notifiers = [notifier]
+    application.generator = application.generator.__class__(
+        config, llm=FailingClient("https://llm.test/v1", "k", "m")
+    )
+    await application.setup()
+    report = (await application.cycle())[0]
+
+    assert "429 rate limit" in report.llm_error
     await application.close()

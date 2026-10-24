@@ -54,6 +54,8 @@ def test_filter_rules():
             exclude_keywords=["هک"],
             min_budget=400_000,
             max_budget=5_000_000,
+            require_budget=False,
+            require_skill_match=False,
         )
     )
     assert flt.evaluate(make_project(budget=Budget(min=500_000, max=1_500_000))).allowed

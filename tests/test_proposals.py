@@ -187,3 +187,30 @@ def test_greeting_is_configurable_in_the_template():
     generator = ProposalGenerator(config)
     text = generator.generate_from_template(make_project(), 1_000_000, 14).text
     assert text.startswith("درود و وقت بخیر")
+
+
+@pytest.mark.parametrize("max_chars", [200, 400, 620, 700, 900, 1_500])
+def test_template_bid_is_always_valid_even_with_a_tiny_max_chars(max_chars):
+    """A short ``proposal.max_chars`` must never cut the price or the signature."""
+    generator = ProposalGenerator(make_config(max_chars=max_chars))
+    proposal = generator.generate_from_template(make_project(), 1_000_000, 14)
+
+    assert "۱,۰۰۰,۰۰۰ تومان" in proposal.text
+    assert "تومان" in proposal.text
+    assert "با احترام" in proposal.text
+    assert len(proposal.text) <= max(700, max_chars)
+    assert validate_proposal(proposal.text, generator.settings, 1_000_000).ok
+
+
+class FailingClient(LLMClient):
+    async def complete(self, system, user):  # type: ignore[override]
+        raise LLMError("401 invalid api key")
+
+
+async def test_llm_failure_reason_is_kept_for_the_user():
+    config = make_config(on_generation_failure="template")  # fall back, but remember why
+    generator = ProposalGenerator(config, llm=FailingClient("https://llm.test/v1", "k", "m"))
+    proposal = await generator.generate(make_project(), 1_000_000, 14)
+
+    assert proposal.generated_by == "template"
+    assert "401 invalid api key" in generator.last_llm_error

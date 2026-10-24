@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from .config import AppConfig, Secrets, get_secrets
 from .db import Database
 from .filters import ProjectFilter
+from .models import Event, EventKind
 from .notifications import ConsoleNotifier, NotifierDispatcher, TelegramNotifier
 from .pipeline import BidPipeline, RunReport
 from .pricing.strategy import PricingConfig
@@ -106,9 +107,30 @@ class Application:
             max_projects=max_projects,
         )
         try:
-            return await pipeline.run_once(source_names)
+            reports = await pipeline.run_once(source_names)
+            await self._dispatch_digest(reports)
+            return reports
         finally:
             await session.close()
+
+    async def _dispatch_digest(self, reports: list[RunReport]) -> None:
+        """One grouped message per cycle (see ``runtime.notify_digest``)."""
+        if not self.config.runtime.notify_digest or self.notifiers is None:
+            return
+        interesting = [r for r in reports if r.has_news()]
+        if not interesting:
+            return
+        lines: list[str] = []
+        for report in interesting:
+            lines.extend(report.digest_lines())
+        mode = "🔴 واقعی" if self.config.runtime.live else "🧪 آزمایشی"
+        lines.append(f"حالت: {mode} · توقف: /stop")
+        try:
+            await self.notifiers.dispatch(
+                Event(kind=EventKind.DIGEST, title="گزارش دور", body="\n".join(lines))
+            )
+        except Exception as exc:  # a report must never break the bidder
+            log.warning("Could not send digest: %s", exc)
 
     async def healthcheck(self) -> dict[str, tuple[bool, str]]:
         results: dict[str, tuple[bool, str]] = {}
@@ -120,7 +142,11 @@ class Application:
         return results
 
     def filter_preview(self):
-        return ProjectFilter(self.config.filters)
+        return ProjectFilter(
+            self.config.filters,
+            profile_skills=list(self.config.profile.stack),
+            profile_role=self.config.profile.role,
+        )
 
 
 def build_application(config: AppConfig, secrets: Secrets | None = None) -> Application:

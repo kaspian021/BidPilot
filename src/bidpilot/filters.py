@@ -1,12 +1,72 @@
-"""Project filtering — cheap, explainable rules that run before any LLM call."""
+"""Project filtering — cheap, explainable rules that run before any LLM call.
+
+Two questions matter more than any keyword list:
+
+* does the posting state a budget? (otherwise the price is a guess)
+* does the posting mention something this user can actually do?
+
+Both are on by default and the skill vocabulary comes from the user's own
+profile (``profile.stack`` + ``profile.role``), so «طراحی لوگو» or «تدوین ریلز»
+never reaches the proposal generator for a Flutter/.NET developer.
+"""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .config import FiltersConfig
 from .models import Project
 from .text import has_any
+
+#: role words that are too generic to prove a project matches a skill
+_STOPWORDS = {
+    "برنامه",
+    "نویس",
+    "برنامه‌نویس",
+    "developer",
+    "engineer",
+    "مهندس",
+    "متخصص",
+    "کارشناس",
+    "فول",
+    "استک",
+    "full",
+    "stack",
+    "and",
+    "the",
+    "با",
+    "و",
+}
+
+#: Persian equivalents that should also match, e.g. "موبایل" for "Flutter"
+_SKILL_ALIASES: dict[str, tuple[str, ...]] = {
+    "flutter": ("فلاتر", "اپلیکیشن موبایل", "اپ موبایل"),
+    "react native": ("ری‌اکت نیتیو", "اپلیکیشن موبایل"),
+    "unity": ("یونیتی", "بازی"),
+    "asp.net": ("ای اس پی", "دات نت", "dotnet", "asp net"),
+    ".net": ("دات نت", "dotnet"),
+    "c#": ("سی شارپ", "c sharp"),
+    "wordpress": ("وردپرس",),
+    "woocommerce": ("ووکامرس",),
+    "laravel": ("لاراول",),
+    "python": ("پایتون",),
+    "django": ("جنگو",),
+    "fastapi": ("فست ای پی آی",),
+    "react": ("ری اکت",),
+    "node.js": ("نود", "nodejs"),
+    "javascript": ("جاوا اسکریپت",),
+    "typescript": ("تایپ اسکریپت",),
+    "postgresql": ("پستگرس", "postgres"),
+    "mysql": ("مای اس کیو ال",),
+    "docker": ("داکر",),
+    "ui/ux": ("یو آی", "طراحی رابط کاربری", "طراحی ui"),
+    "php": ("پی اچ پی",),
+    "java": ("جاوا",),
+    "android": ("اندروید",),
+    "ios": ("آی او اس",),
+    "seo": ("سئو",),
+}
 
 
 @dataclass
@@ -18,13 +78,53 @@ class FilterDecision:
         return self.allowed
 
 
-class ProjectFilter:
-    def __init__(self, config: FiltersConfig) -> None:
-        self.config = config
+def normalise_keyword(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("‌", " ").replace("ي", "ی").replace("ك", "ک")
+    return re.sub(r"\s+", " ", text)
 
+
+def derive_skill_keywords(stack: list[str], role: str = "") -> list[str]:
+    """Skill words taken from the profile — short, concrete, deduplicated."""
+    words: list[str] = []
+    for item in [*stack, role]:
+        for chunk in re.split(r"[,،/|+]", str(item or "")):
+            cleaned = normalise_keyword(chunk)
+            if not cleaned or len(cleaned) < 2 or cleaned in _STOPWORDS:
+                continue
+            if cleaned not in words:
+                words.append(cleaned)
+    return words
+
+
+def _matches(haystack: str, keyword: str) -> bool:
+    needle = normalise_keyword(keyword)
+    if not needle:
+        return False
+    if needle in haystack:
+        return True
+    for alias in _SKILL_ALIASES.get(needle, ()):
+        if normalise_keyword(alias) in haystack:
+            return True
+    return False
+
+
+class ProjectFilter:
+    def __init__(
+        self,
+        config: FiltersConfig,
+        *,
+        profile_skills: list[str] | None = None,
+        profile_role: str = "",
+    ) -> None:
+        self.config = config
+        configured = [normalise_keyword(k) for k in (config.skill_keywords or []) if str(k).strip()]
+        self.skill_keywords = configured or derive_skill_keywords(profile_skills or [], profile_role)
+
+    # ------------------------------------------------------------------ rules
     def evaluate(self, project: Project) -> FilterDecision:
         cfg = self.config
-        haystack = (
+        haystack = normalise_keyword(
             f"{project.title}\n{project.description}\n{' '.join(project.skills)}\n{project.category or ''}"
         )
 
@@ -40,7 +140,13 @@ class ProjectFilter:
                 return FilterDecision(False, f"دسته‌بندی {project.category or 'نامشخص'} در لیست مجاز نیست.")
 
         budget = project.budget
-        if budget and budget.is_known:
+        known = bool(budget and budget.is_known)
+
+        if cfg.require_budget and not known:
+            return FilterDecision(False, "بودجه‌ی پروژه اعلام نشده است؛ بدون بودجه قیمت‌گذاری نمی‌کنم.")
+
+        if known:
+            assert budget is not None
             low = budget.lower or 0
             high = budget.upper or low
             if cfg.min_budget is not None and high < cfg.min_budget:
@@ -49,4 +155,25 @@ class ProjectFilter:
                 return FilterDecision(False, "بودجه‌ی پروژه از حداکثر تعیین‌شده بیشتر است.")
             if cfg.skip_negotiable and budget.negotiable:
                 return FilterDecision(False, "بودجه توافقی است و رد کردن توافقی فعال شده.")
+
+        if cfg.require_skill_match:
+            if not self.skill_keywords:
+                return FilterDecision(
+                    False,
+                    "فهرست مهارت‌های پروفایل خالی است؛ در /profile مهارت‌ها را کامل کن.",
+                )
+            if not any(_matches(haystack, keyword) for keyword in self.skill_keywords):
+                return FilterDecision(
+                    False,
+                    "هیچ‌کدام از مهارت‌های پروفایل در این پروژه دیده نشد.",
+                )
+
         return FilterDecision(True)
+
+    # ------------------------------------------------------------------ view
+    def describe_keywords(self, limit: int = 12) -> str:
+        if not self.skill_keywords:
+            return "—"
+        head = "، ".join(self.skill_keywords[:limit])
+        extra = len(self.skill_keywords) - limit
+        return head + (f" و {extra} مورد دیگر" if extra > 0 else "")

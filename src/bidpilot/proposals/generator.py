@@ -13,7 +13,7 @@ from ..config import AppConfig, LLMConfig, Profile, ProposalConfig
 from ..llm_providers import LLMProvider, build_client, resolve_chain
 from ..models import Project, Proposal
 from ..pricing.budget import format_toman
-from ..text import count_emoji, persian_ratio, to_persian_digits, truncate
+from ..text import count_emoji, persian_ratio, to_persian_digits
 from .llm_client import LLMClient, LLMError
 from .playbook import insights_for
 from .prompts import REPAIR_PROMPT, build_prompts
@@ -100,6 +100,8 @@ class ProposalGenerator:
         self._llm_api_key = llm_api_key
         self._llm_keys = dict(llm_keys or {})
         self._clients: dict[str, LLMClient] = {}
+        #: why the last LLM attempt failed (empty when it worked or was not used)
+        self.last_llm_error: str = ""
         self._env = Environment(
             loader=FileSystemLoader(str(_TEMPLATE_DIR)),
             autoescape=select_autoescape(enabled_extensions=()),
@@ -154,13 +156,21 @@ class ProposalGenerator:
         *,
         force_template: bool = False,
     ) -> Proposal:
-        if not force_template and self.llm_ready:
-            try:
-                return await self._generate_with_llm(project, amount, delivery_days)
-            except LLMError as exc:
-                log.warning("LLM generation failed (%s); falling back", exc)
-                if self.settings.on_generation_failure == "skip":
-                    raise ProposalError(f"تولید پیشنهاد با LLM ناموفق بود: {exc}") from exc
+        self.last_llm_error = ""
+        if not force_template:
+            if not self.llm_ready:
+                # ``enabled: false`` is a deliberate choice, not a failure
+                if self.llm_config.enabled:
+                    self.last_llm_error = "برای هوش مصنوعی کلید یا مدلی تنظیم نشده است."
+            else:
+                try:
+                    return await self._generate_with_llm(project, amount, delivery_days)
+                except LLMError as exc:
+                    log.warning("LLM generation failed (%s); falling back", exc)
+                    # never swallow it: the bot shows this text verbatim
+                    self.last_llm_error = str(exc)
+                    if self.settings.on_generation_failure == "skip":
+                        raise ProposalError(f"تولید پیشنهاد با LLM ناموفق بود: {exc}") from exc
         return self.generate_from_template(project, amount, delivery_days)
 
     async def _generate_with_llm(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
@@ -212,8 +222,24 @@ class ProposalGenerator:
         raise LLMError(f"تولید متن با مدل زبانی ناموفق بود — {detail}")
 
     def generate_from_template(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
+        """Render the longest template that fits ``proposal.max_chars``.
+
+        The price sentence and the signature are *never* cut: they are what makes
+        a bid valid. When the full template does not fit we fall back to the
+        compact one, and only then drop extra bullet points. (Truncating the
+        rendered text used to remove the closing paragraph entirely, so every
+        template bid failed validation with "قیمت پیشنهادی … ذکر نشده است".)
+        """
         insights = insights_for(project, limit=3)
         challenges = "\n".join(f"• {challenge}؛ راه‌حل: {solution}" for challenge, solution in insights)
+        first_point, first_solution = (
+            insights[0]
+            if insights
+            else (
+                "شفاف بودن دامنه‌ی کار",
+                "تحویل مرحله‌ای با بازبینی در هر مرحله",
+            )
+        )
 
         relevance_bits: list[str] = []
         if project.skills:
@@ -226,34 +252,42 @@ class ProposalGenerator:
             relevance_bits.append("پروژه‌هایی با همین جنس کار و همین سطح از جزئیات را اجرا کرده‌ام")
         relevance = "، و ".join(relevance_bits) + "."
 
-        template = self._env.get_template("default_fa.j2")
-        text = template.render(
-            greeting=self.settings.greeting or "سلام و وقت بخیر",
-            profile=self.profile,
-            project=project,
-            years_fa=to_persian_digits(str(self.profile.years_experience)),
-            relevance=relevance,
-            challenges=challenges,
-            amount_fa=to_persian_digits(f"{amount:,}"),
-            delivery_fa=to_persian_digits(f"{delivery_days} روز") if delivery_days else "توافقی",
-            budget_fa=to_persian_digits(project.budget.as_text()) if project.budget else "توافقی",
-            signature=self.profile.signature
+        context = {
+            "greeting": self.settings.greeting or "سلام و وقت بخیر",
+            "profile": self.profile,
+            "project": project,
+            "years_fa": to_persian_digits(str(self.profile.years_experience)),
+            "relevance": relevance,
+            "challenges": challenges,
+            "first_point": first_point,
+            "first_solution": first_solution,
+            "amount_fa": to_persian_digits(f"{amount:,}"),
+            "delivery_fa": to_persian_digits(f"{delivery_days} روز") if delivery_days else "توافقی",
+            "budget_fa": to_persian_digits(project.budget.as_text()) if project.budget else "توافقی",
+            "signature": self.profile.signature
             or f"با احترام، {self.profile.full_name}"
             + (f"\n{self.profile.portfolio_url}" if self.profile.portfolio_url else ""),
-        )
-        text = self._tidy(text)
+        }
 
-        report = validate_proposal(text, self.settings, amount)
-        if report.ok:
-            return Proposal(text=text, generated_by="template", latency_ms=0)
+        limit = int(self.settings.max_chars)
+        full_text = self._tidy(self._env.get_template("default_fa.j2").render(**context))
+        compact_text = self._tidy(self._env.get_template("compact_fa.j2").render(**context))
 
-        # Length problems from the template are fixable deterministically.
-        if len(text) > self.settings.max_chars:
-            text = self._shrink(text, self.settings.max_chars)
-        report = validate_proposal(text, self.settings, amount, strict_length=False)
+        # 1) the full text, 2) the same text with extra bullets removed (the
+        # price paragraph and the signature always stay), 3) the compact text.
+        for candidate in (full_text, *self._bullet_trimmed(full_text, limit), compact_text):
+            if not candidate or len(candidate) > limit:
+                continue
+            if validate_proposal(candidate, self.settings, amount, strict_length=False).ok:
+                return Proposal(text=candidate, generated_by="template", latency_ms=0)
+
+        report = validate_proposal(compact_text, self.settings, amount, strict_length=False)
         if not report.ok:
             raise ProposalError("قالب پیشنهاد معتبر نیست: " + "؛ ".join(report.issues))
-        return Proposal(text=text, generated_by="template", latency_ms=0)
+        raise ProposalError(
+            f"متن پیشنهادی از سقف {limit} کاراکتر بلندتر است؛ "
+            "در /style مقدار «حداکثر طول» را بزرگ‌تر کن (حداقل ۷۰۰)."
+        )
 
     # ------------------------------------------------------------- helpers
     @staticmethod
@@ -263,15 +297,22 @@ class ProposalGenerator:
         return text.strip()
 
     @staticmethod
-    def _shrink(text: str, limit: int) -> str:
-        """Drop the least important bullet lines until the text fits."""
+    def _bullet_trimmed(text: str, limit: int) -> list[str]:
+        """Progressively shorter versions of ``text`` (one bullet fewer at a time).
+
+        The closing paragraph (price + delivery) and the signature are the parts
+        validation needs, so they are never cut — only bullet lines are removed.
+        """
         lines = text.split("\n")
-        while len("\n".join(lines)) > limit:
-            bullet_indexes = [i for i, line in enumerate(lines) if line.strip().startswith("•")]
-            if len(bullet_indexes) <= 2:
-                return truncate(text, limit)
-            del lines[bullet_indexes[-1]]
-        return "\n".join(lines)
+        versions: list[str] = []
+        while True:
+            bullets = [i for i, line in enumerate(lines) if line.strip().startswith("•")]
+            if len(bullets) <= 1:
+                return versions
+            del lines[bullets[-1]]
+            candidate = "\n".join(lines)
+            if len(candidate) <= limit:
+                versions.append(candidate)
 
 
 __all__ = ["ProposalGenerator", "ProposalError", "validate_proposal", "format_toman"]

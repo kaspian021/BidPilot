@@ -37,13 +37,18 @@ def _to_number(raw: str) -> float | None:
     raw = raw.strip()
     if not raw:
         return None
-    # 1.500.000 or 1,500,000 -> thousands
-    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", raw):
-        return float(raw.replace(".", "").replace(",", ""))
-    # 1.5 -> decimal
-    if re.fullmatch(r"\d+[.,]\d{1,2}", raw):
-        return float(raw.replace(",", "."))
-    return float(raw.replace(",", "").replace(".", ""))
+    # Persian/Arabic thousands separators (٬ U+066C, ، U+060C) are noise here
+    raw = raw.replace("\u066c", ",").replace("\u060c", ",")
+    try:
+        # 1.500.000 or 1,500,000 -> thousands
+        if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", raw):
+            return float(raw.replace(".", "").replace(",", ""))
+        # 1.5 -> decimal
+        if re.fullmatch(r"\d+[.,]\d{1,2}", raw):
+            return float(raw.replace(",", "."))
+        return float(raw.replace(",", "").replace(".", ""))
+    except ValueError:  # page counters, odd markup — never crash a scrape
+        return None
 
 
 def parse_budget(

@@ -263,3 +263,44 @@ def test_menu_links_alone_do_not_create_projects():
 
     html = '<a href="/page/1">1</a><a href="/page/2">2</a>'
     assert parse_list_page(html, {}, "unknown", "https://example.com") == []
+
+
+class _FakeHtmlSource:
+    """Minimal stand-in for an HTML marketplace (no network in tests)."""
+
+    name = "parscoders"
+
+    async def verify_session(self):
+        return True, "ورود تأیید شد."
+
+    async def healthcheck(self):
+        return True, "۲۴ پروژه در صفحه اول پیدا شد."
+
+    async def aclose(self):
+        return None
+
+
+async def test_site_check_prints_the_project_count_only_once(tmp_path, monkeypatch):
+    from bidpilot import sitecheck
+    from bidpilot.settings_store import SettingsStore, reset_store_cache
+
+    monkeypatch.setenv("BIDPILOT_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    reset_store_cache()
+    store = SettingsStore(str(tmp_path / "settings.json"))
+    store.update({"marketplace.name": "parscoders", "credentials.parscoders.method": "cookie"})
+    monkeypatch.setattr(sitecheck, "site_credentials", lambda name, store=None: _ReadyCreds())
+    monkeypatch.setattr(sitecheck, "create_source", lambda *a, **k: _FakeHtmlSource())
+
+    check = await sitecheck.check_site(store, config_path=str(ROOT / "config" / "config.yaml"))
+    message = check.message()
+
+    assert check.ok and check.projects == 24
+    assert message.count("پروژه") == 1
+    assert message.count("📋") == 1
+    assert "📄" not in message
+
+
+class _ReadyCreds:
+    method = "cookie"
+    ready = True
+    summary = "کوکی ثبت شده"

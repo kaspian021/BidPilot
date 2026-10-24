@@ -570,3 +570,149 @@ def test_parscoders_skill_links_are_extracted_from_listing_cards():
     assert ".NET" in projects[0].skills
     assert "برنامه نویسی با C#" in projects[0].skills
     assert "GIS" in projects[0].skills
+
+
+def test_budget_range_with_negotiable_prefix_keeps_both_bounds():
+    from bidpilot.sources.html_parser import find_budget
+
+    budget = find_budget(
+        "بودجه دلخواه بازه قیمت: 30,000,000 تومان تا 60,000,000 تومان مهلت: 65 روز"
+    )
+    assert budget is not None and budget.is_known
+    assert (budget.min, budget.max) == (30_000_000, 60_000_000)
+
+
+def test_freelancer_earnings_are_never_used_as_employer_budget():
+    from bidpilot.models import Budget, Project
+    from bidpilot.sources.html_parser import enrich_from_detail, find_budget
+
+    earnings = (
+        "مبلغ عایدی شما: 8,500,000 تومان (حساب کاربریت را ارتقاء بده تا "
+        "9,000,000 تومان دریافت کنی)"
+    )
+    assert find_budget(earnings) is None
+    title = "بات مدیریت درخواست‌های واحد نظارت بر صدور بیمه"
+    project = Project(
+        source="parscoders",
+        external_id="621245",
+        title=title,
+        description="شرح اولیه",
+        budget=Budget(min=45_000_000, max=45_000_000),
+        skills=["برنامه نویسی با C#"],
+    )
+    html = f"""
+    <html><body>
+      <main>
+        <h1>{title}</h1>
+        <div class="project-description">شرح کامل پروژه با جزئیات کافی برای توضیح نیازهای فنی.</div>
+        <div>{earnings}</div>
+        <h2>مهارت‌های مورد نیاز</h2>
+        <p>برنامه نویسی با C#</p>
+      </main>
+    </body></html>
+    """
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {
+            "detail_fields": {
+                "description": [".project-description"],
+                "budget": [".missing-budget-selector"],
+                "skills": [],
+            }
+        },
+    )
+    assert enriched.budget is not None
+    assert (enriched.budget.min, enriched.budget.max) == (45_000_000, 45_000_000)
+
+
+def test_listing_and_detail_skills_are_deduplicated():
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "ساخت API با C#"
+    html = f"""
+    <html><body>
+      <div class="project-list-item">
+        <h2><a href="/project/9001/api"> {title} </a></h2>
+        <p class="project-description">ساخت یک API کاربردی و مستند با جزئیات کافی.</p>
+        <div class="project-budget">بودجه: ۵,۰۰۰,۰۰۰ تومان</div>
+        <a href="/project/skills/dotnet">.NET</a>
+        <a href="/project/skills/dotnet">.NET</a>
+        <a href="/project/skills/c-sharp-programming">برنامه نویسی با C#</a>
+        <a href="/project/skills/c-sharp-programming">برنامه نویسی با C#</a>
+      </div>
+    </body></html>
+    """
+    settings = {
+        **SETTINGS["list"],
+        "card_selectors": ["div.project-list-item"],
+        "fields": {
+            **SETTINGS["list"]["fields"],
+            "skills": ["a[href*='/project/skills/']"],
+        },
+    }
+    projects = parser.parse_list_page(html, settings, "parscoders", "https://parscoders.com")
+    assert len(projects) == 1
+    assert projects[0].skills == [".NET", "برنامه نویسی با C#"]
+
+    detail_html = f"""
+    <html><body>
+      <main>
+        <h1>{title}</h1>
+        <div class="project-description">شرح کامل و طولانی‌تر پروژه برای آزمایش استخراج جزئیات.</div>
+        <a href="/project/skills/dotnet">.NET</a>
+        <a href="/project/skills/dotnet">.NET</a>
+        <a href="/project/skills/c-sharp-programming">برنامه نویسی با C#</a>
+        <a href="/project/skills/c-sharp-programming">برنامه نویسی با C#</a>
+      </main>
+    </body></html>
+    """
+    enriched = enrich_from_detail(
+        detail_html,
+        projects[0],
+        {
+            "detail_fields": {
+                "description": [".project-description"],
+                "budget": [".missing-budget-selector"],
+                "skills": ["a[href*='/project/skills/']"],
+            }
+        },
+    )
+    assert enriched.skills == [".NET", "برنامه نویسی با C#"]
+
+
+def test_plain_deadline_label_is_extracted_from_detail_page():
+    from bidpilot.models import Project
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "ساخت ابزار با Flutter"
+    project = Project(source="parscoders", external_id="9002", title=title)
+    html = f"""
+    <html><body>
+      <main>
+        <h1>{title}</h1>
+        <p class="project-description">شرح کامل پروژه با اطلاعات فنی کافی.</p>
+        <p>مهلت : 1 روز</p>
+      </main>
+    </body></html>
+    """
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {"detail_fields": {"description": [".project-description"], "budget": [], "skills": []}},
+    )
+    assert enriched.employer_deadline == "1 روز"
+
+
+def test_generic_error_word_in_project_text_is_not_a_submission_rejection():
+    body = "<main><p>در توضیح پروژه باید خطاهای برنامه را بررسی و رفع کرد.</p></main>"
+    ok, message = parser.detect_success(200, body, SETTINGS["bid"])
+    assert not ok
+    assert "نامشخص" in message
+
+    error_html = """
+    <div class="alert alert-danger">خطا: ثبت پیشنهاد انجام نشد؛ توکن CSRF نامعتبر است.</div>
+    """
+    ok, message = parser.detect_success(200, error_html, SETTINGS["bid"])
+    assert not ok
+    assert "CSRF" in message

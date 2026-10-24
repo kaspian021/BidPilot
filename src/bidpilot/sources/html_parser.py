@@ -708,9 +708,16 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     detail: dict[str, list[str]] = settings.get("detail_fields", {}) or {}
     scope = _project_scope(soup, project.title)
     scoped_root: Tag | BeautifulSoup = scope if scope is not None else soup
+    require_project_scope = bool(settings.get("require_project_scope_for_budget"))
 
     description = _text(scoped_root, detail.get("description"))
-    budget_selector_text = _text(scoped_root, detail.get("budget"))
+    # On Ponisha, do not trust broad price/budget selectors across the entire page
+    # if we could not isolate this project's own DOM section.
+    budget_selector_text = (
+        _text(scoped_root, detail.get("budget"))
+        if scope is not None or not require_project_scope
+        else ""
+    )
     budget_text = budget_selector_text
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(scoped_root, detail.get("skills"))]
     category = _text(scoped_root, detail.get("category"))
@@ -720,20 +727,25 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     budget = _parse_amount(budget_text)
     budget_origin = "detail_selector" if budget is not None and budget.is_known else "detail_selector_miss"
     if budget is None or not budget.is_known:
-        # Search only inside the project's DOM scope. Searching flattened body text
-        # can accidentally join "هزینه پیشنهادی..." with an amount in a related card.
+        # Searching flattened body text can combine "cost" wording with a number
+        # in a different recommended project. Ponisha can require a verified scope.
         if scope is not None:
             found, evidence, origin = _find_budget_in_markup(
                 scoped_root, detail.get("budget"), settings.get("budget_regex")
             )
-        else:
+        elif require_project_scope:
             found, evidence, origin = None, "", "no_project_scope"
+        else:
+            # Compatibility path for older sites whose detail HTML has no heading.
+            found, evidence, origin = _find_budget_in_markup(
+                soup, detail.get("budget"), settings.get("budget_regex")
+            )
         if found is not None and found.is_known:
             budget = found
             budget_text = evidence or found.source_text or budget_text
-            budget_origin = origin
+            budget_origin = "detail_page_text" if origin == "labeled_text_block" else origin
         else:
-            budget_origin = "not_found" if scope is not None else "no_project_scope"
+            budget_origin = "not_found" if scope is not None or not require_project_scope else "no_project_scope"
 
     if not description:
         fallback_cfg = settings.get("description_fallback") or {}

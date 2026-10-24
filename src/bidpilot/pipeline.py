@@ -228,8 +228,7 @@ class BidPipeline:
         # 3) pricing
         pricing = self.pricing.price(project, project.budget)
         log.info(
-            "[PIPELINE][PRICING] source=%s id=%s title=%r budget=%r "
-            "strategy=%s result=%r",
+            "[PIPELINE][PRICING] source=%s id=%s title=%r budget=%r strategy=%s result=%r",
             project.source,
             project.external_id,
             project.title,

@@ -21,7 +21,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import yaml
@@ -114,6 +114,73 @@ class HtmlMarketSource(Source):
         headers = super().headers()
         headers.update(self.credentials.headers or {})
         return headers
+
+    @staticmethod
+    def _safe_diagnostic_url(url: str) -> str:
+        """Strip query strings/fragments so diagnostic logs cannot expose tokens."""
+        parsed = urlsplit(str(url))
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+    async def get_html(self, path: str, **kwargs: Any) -> str:
+        """Fetch HTML and optionally log status, redirect chain, and response shape."""
+        diagnostics = bool(
+            (self.settings.get("discovery") or {}).get("log_extraction_details")
+            or (self.settings.get("discovery") or {}).get("log_http_details")
+        )
+        requested = str(path)
+        if not urlsplit(requested).scheme:
+            requested = urljoin(self.base_url + "/", requested.lstrip("/"))
+        safe_requested = self._safe_diagnostic_url(requested)
+        params = kwargs.get("params")
+        param_keys = sorted(str(key) for key in params.keys()) if hasattr(params, "keys") else []
+
+        if diagnostics:
+            log.info(
+                "[HTTP][REQUEST] source=%s url=%s params_keys=%r",
+                self.name,
+                safe_requested,
+                param_keys,
+            )
+
+        client = await self.client()
+        try:
+            response = await client.get(path, **kwargs)
+        except httpx.HTTPError as exc:
+            if diagnostics:
+                log.warning(
+                    "[HTTP][FAILED] source=%s requested=%s error_type=%s",
+                    self.name,
+                    safe_requested,
+                    type(exc).__name__,
+                )
+            raise
+
+        if diagnostics:
+            redirects = [
+                (item.status_code, self._safe_diagnostic_url(str(item.url))) for item in response.history
+            ]
+            log.info(
+                "[HTTP][RESPONSE] source=%s status=%s requested=%s final_url=%s "
+                "content_type=%r html_chars=%s redirects=%r",
+                self.name,
+                response.status_code,
+                safe_requested,
+                self._safe_diagnostic_url(str(response.url)),
+                response.headers.get("content-type", ""),
+                len(response.text or ""),
+                redirects,
+            )
+
+        if response.status_code >= 400:
+            if diagnostics:
+                log.warning(
+                    "[HTTP][FAILED] source=%s requested=%s status=%s",
+                    self.name,
+                    safe_requested,
+                    response.status_code,
+                )
+            raise SourceError(f"GET {path} -> HTTP {response.status_code}")
+        return response.text
 
     def credentials_present(self) -> bool:
         auth = self.settings.get("auth") or {}
@@ -250,11 +317,31 @@ class HtmlMarketSource(Source):
             return []
 
     def ai_discovery_enabled(self) -> bool:
-        if self.discovery_mode() in {"selectors", "off"}:
+        mode = self.discovery_mode()
+        if mode in {"selectors", "off"}:
+            log.info("[DISCOVERY][DISABLED] source=%s reason=mode_%s", self.name, mode)
             return False
-        if time.monotonic() < self._discovery_blocked_until:
+
+        remaining = self._discovery_blocked_until - time.monotonic()
+        if remaining > 0:
+            log.info(
+                "[DISCOVERY][DISABLED] source=%s reason=failure_cooldown remaining_seconds=%.1f",
+                self.name,
+                remaining,
+            )
             return False
-        return bool(self._discovery_providers())
+
+        providers = self._discovery_providers()
+        if not providers:
+            log.warning(
+                "[DISCOVERY][DISABLED] source=%s reason=no_llm_provider llm_enabled=%s "
+                "any_api_key_configured=%s",
+                self.name,
+                bool(getattr(self.config.llm, "enabled", False)),
+                bool(self.secrets.llm_keys or self.secrets.llm_api_key),
+            )
+            return False
+        return True
 
     async def _discover_with_ai(self) -> list[Project]:
         """Let the model read the site (inside this account) and bring back projects."""
@@ -393,7 +480,11 @@ class HtmlMarketSource(Source):
                     )
                 self.last_discovery_error = str(exc)
         else:
-            log.info("[DISCOVERY][DISABLED] source=%s reason=mode_or_cooldown_or_missing_key", self.name)
+            log.info(
+                "[FETCH][AI-BYPASSED] source=%s mode=%s reason=see_DISCOVERY_DISABLED",
+                self.name,
+                mode,
+            )
 
         list_cfg = dict(self.settings.get("list") or {})
         list_cfg["_diagnostics"] = bool(cfg.get("log_extraction_details"))

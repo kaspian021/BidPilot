@@ -76,8 +76,270 @@ def _all(card: Tag | BeautifulSoup, selectors: list[str] | None) -> list[Tag]:
 
 
 def _text(card: Tag | BeautifulSoup, selectors: list[str] | None) -> str:
-    node = _first(card, selectors)
-    return clean_text(node.get_text(" ", strip=True)) if node else ""
+    # A selector can match an empty wrapper before a later selector matches the
+    # actual text node. Keep trying until a non-empty value is found.
+    for selector in selectors or []:
+        try:
+            nodes = card.select(selector)
+        except Exception:
+            continue
+        for node in nodes:
+            value = clean_text(node.get_text(" ", strip=True))
+            if value:
+                return value
+    return ""
+
+
+_BUDGET_NODE_SELECTORS = (
+    "[data-budget]",
+    "[data-price]",
+    "[data-amount]",
+    "[class*='budget']",
+    "[class*='price']",
+    "[class*='amount']",
+    "[id*='budget']",
+    "[id*='price']",
+    "[aria-label*='بودجه']",
+    "[title*='بودجه']",
+)
+_SCOPED_BUDGET_LABELS = (
+    r"سقف\s+بودجه",
+    r"بودجه(?:[\u200c]?[یٔ])?(?:\s+پروژه)?",
+    r"مبلغ(?:\s+(?:پروژه|کل(?:\s+پروژه)?))?",
+    r"حق[\u200c-]?الزحمه(?:\s+پروژه)?",
+    r"هزینه\s+(?:پروژه|کل(?:\s+پروژه)?)",
+    r"قیمت\s+پروژه",
+    r"project\s+budget",
+    r"budget(?:\s+amount)?",
+)
+_SCOPED_BUDGET_REGEXES = tuple(rf"{label}\s*[:：]?\s*([^\n]{{2,100}})" for label in _SCOPED_BUDGET_LABELS)
+_DESCRIPTION_END_MARKERS = (
+    "مهارت‌های مورد نیاز",
+    "مهارت های مورد نیاز",
+    "مهارت‌های موردنیاز",
+    "مهارت های موردنیاز",
+    "مهارت‌ها:",
+    "مهارت ها:",
+    "سرویس‌های مرتبط",
+    "سرویس های مرتبط",
+    "خدمات مرتبط",
+    "توضیحات بیشتر",
+    "فریلنسرهایی که در این پروژه پیشنهاد ارسال کرده‌اند",
+    "آخرین پروژه‌های",
+    "آخرین پروژه های",
+    "فرصت انتخاب پیشنهادها",
+    "مشاهده‌ی پروژه",
+    "مشاهده پروژه",
+)
+
+
+def _node_text_candidates(node: Tag) -> list[str]:
+    """Read visible text plus a small allowlist of non-sensitive budget attributes."""
+    values: list[str] = []
+    visible = clean_text(node.get_text(" ", strip=True))
+    if visible:
+        values.append(visible)
+    for attr in ("data-budget", "data-price", "data-amount", "aria-label", "title", "content"):
+        value = clean_text(str(node.get(attr) or ""))
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _find_labeled_budget(text: str, patterns: list[str] | tuple[str, ...] | None = None) -> Budget | None:
+    """Parse a budget only when a budget-specific label and its value share a short block."""
+    cleaned = clean_text(text or "")
+    if not cleaned or len(cleaned) > 500:
+        return None
+    for pattern in patterns or _SCOPED_BUDGET_REGEXES:
+        try:
+            match = re.search(pattern, cleaned, re.I)
+        except re.error:
+            continue
+        if not match:
+            continue
+        candidate = match.group(1) if match.groups() else match.group(0)
+        # Never scan beyond the first amount unit in the same block.
+        unit = re.search(r"تومان|تومن|ریال|هزار|میلیون|میلیارد", candidate)
+        if unit:
+            candidate = candidate[: unit.end()]
+        elif any(token in candidate for token in ("توافق", "مذاکره", "negotiable")):
+            return Budget(negotiable=True, source_text=candidate[:200])
+        budget = parse_budget_text(candidate)
+        if budget is not None and budget.is_known:
+            return budget
+    return None
+
+
+def _find_budget_in_markup(
+    root: Tag | BeautifulSoup,
+    selectors: list[str] | None = None,
+    patterns: list[str] | tuple[str, ...] | None = None,
+) -> tuple[Budget | None, str, str]:
+    """Find budget evidence inside a project/card scope, never across the whole page."""
+    seen: set[int] = set()
+
+    # Prefer the configured budget selectors. Their context is strong enough to
+    # accept an unlabeled numeric value, including values stored in data-* attrs.
+    for selector in selectors or []:
+        try:
+            nodes = root.select(selector)
+        except Exception:
+            continue
+        for node in nodes:
+            seen.add(id(node))
+            for evidence in _node_text_candidates(node):
+                if len(evidence) > 500:
+                    continue
+                budget = parse_budget_text(evidence)
+                if budget is not None and budget.is_known:
+                    return budget, evidence, "configured_selector"
+                budget = _find_labeled_budget(evidence, patterns)
+                if budget is not None and budget.is_known:
+                    return budget, evidence, "configured_selector_label"
+
+    # Then inspect budget-shaped DOM nodes for a visible value or a data attribute.
+    for selector in _BUDGET_NODE_SELECTORS:
+        try:
+            nodes = root.select(selector)
+        except Exception:
+            continue
+        for node in nodes:
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            for evidence in _node_text_candidates(node):
+                if len(evidence) > 500:
+                    continue
+                budget = parse_budget_text(evidence)
+                if budget is not None and budget.is_known:
+                    return budget, evidence, "budget_node"
+                budget = _find_labeled_budget(evidence, patterns)
+                if budget is not None and budget.is_known:
+                    return budget, evidence, "budget_node_label"
+
+    # Last, only accept an explicit budget label and value in the same short
+    # text block. Do not run the old amount regex over flattened body text: that
+    # can combine an ordinary sentence with an unrelated amount below it.
+    for node in root.find_all(
+        ["dt", "dd", "th", "td", "li", "p", "span", "small", "label", "div", "section"]
+    ):
+        if id(node) in seen:
+            continue
+        evidence = clean_text(node.get_text(" ", strip=True))
+        if not evidence or len(evidence) > 180:
+            continue
+        budget = _find_labeled_budget(evidence, patterns)
+        if budget is not None and budget.is_known:
+            return budget, evidence, "labeled_text_block"
+    return None, "", "not_found"
+
+
+def _budget_node_summaries(
+    root: Tag | BeautifulSoup,
+    selectors: list[str] | None = None,
+    *,
+    limit: int = 20,
+) -> list[str]:
+    """Compact markup evidence for debugging; deliberately omits arbitrary attributes."""
+    summaries: list[str] = []
+    seen: set[int] = set()
+    for selector in [*(selectors or []), *_BUDGET_NODE_SELECTORS]:
+        try:
+            nodes = root.select(selector)
+        except Exception:
+            continue
+        for node in nodes:
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            classes = node.get("class") or []
+            if not isinstance(classes, list):
+                classes = [str(classes)]
+            attrs = {
+                key: str(node.get(key))[:120]
+                for key in ("data-budget", "data-price", "data-amount", "aria-label", "title", "content")
+                if node.get(key) is not None
+            }
+            text = clean_text(node.get_text(" ", strip=True))[:180]
+            if not (text or attrs):
+                continue
+            summaries.append(
+                f"<{node.name} id={str(node.get('id') or '')[:80]!r} "
+                f"class={classes[:6]!r} text={text!r} attrs={attrs!r}>"
+            )
+            if len(summaries) >= limit:
+                return summaries
+    return summaries
+
+
+def _project_scope(soup: BeautifulSoup, title: str) -> Tag | None:
+    """Return the largest ancestor around the matching project heading before related cards begin."""
+    normalized_title = clean_text(title).replace("\u200c", "").casefold()
+    if not normalized_title:
+        return None
+
+    heading: Tag | None = None
+    for candidate in soup.find_all(["h1", "h2", "h3", "h4"]):
+        text = clean_text(candidate.get_text(" ", strip=True)).replace("\u200c", "").casefold()
+        if text == normalized_title or (normalized_title in text and len(text) <= len(normalized_title) + 30):
+            heading = candidate
+            break
+    if heading is None:
+        return None
+
+    best: Tag | None = heading.parent if isinstance(heading.parent, Tag) else heading
+    current: Any = heading.parent
+    project_link_pattern = re.compile(r"/projects?/(\d+)(?:/|$)", re.I)
+    while isinstance(current, Tag):
+        text_len = len(clean_text(current.get_text(" ", strip=True)))
+        if text_len > 40_000:
+            break
+        ids = {
+            match.group(1)
+            for anchor in current.find_all("a", href=True)
+            if (match := project_link_pattern.search(str(anchor.get("href") or "")))
+        }
+        if len(ids) > 1:
+            break
+        if text_len >= len(normalized_title) + 30:
+            best = current
+        current = current.parent
+    return best
+
+
+def _extract_between_markers(
+    text: str,
+    start_markers: list[str] | tuple[str, ...] | None = None,
+    end_markers: list[str] | tuple[str, ...] | None = None,
+    *,
+    max_chars: int = 12_000,
+) -> str:
+    """Extract a bounded text section using site-specific heading markers."""
+    cleaned = clean_text(text or "")
+    if not cleaned:
+        return ""
+    start = 0
+    starts = [clean_text(marker) for marker in (start_markers or []) if clean_text(marker)]
+    if starts:
+        matches = [(cleaned.find(marker), marker) for marker in starts]
+        matches = [(pos, marker) for pos, marker in matches if pos >= 0]
+        if not matches:
+            return ""
+        pos, marker = min(matches)
+        start = pos + len(marker)
+    end = len(cleaned)
+    markers = [
+        clean_text(marker) for marker in (end_markers or _DESCRIPTION_END_MARKERS) if clean_text(marker)
+    ]
+    for marker in markers:
+        pos = cleaned.find(marker, start)
+        if pos >= 0:
+            end = min(end, pos)
+    result = cleaned[start:end].strip(" \t:-–—|")
+    if len(result) < 20:
+        return ""
+    return result[:max_chars]
 
 
 def _attr(card: Tag | BeautifulSoup, selectors: list[str] | None, attr: str, default: str = "") -> str:
@@ -232,31 +494,58 @@ def parse_project_card(
     budget_selector_text = _text(card, fields.get("budget"))
     budget_text = budget_selector_text
     budget = _parse_amount(budget_text)
+    budget_origin = "configured_selector" if budget is not None and budget.is_known else "not_found"
+    if budget is None or not budget.is_known:
+        found, evidence, origin = _find_budget_in_markup(
+            card, fields.get("budget"), settings.get("budget_regex")
+        )
+        if found is not None and found.is_known:
+            budget = found
+            budget_text = evidence or found.source_text or found.as_text()
+            budget_origin = origin
+
     skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(card, fields.get("skills"))]
     description = _text(card, fields.get("description"))
     card_text = clean_text(card.get_text(" ", strip=True)) if isinstance(card, Tag) else ""
-    if budget is None or not budget.is_known:
-        # The budget is often just a line of the card without its own class.
-        found = find_budget(card_text, settings.get("budget_regex"))
-        if found is not None and found.is_known:
-            budget = found
-            budget_text = budget.source_text or budget.as_text()
+    if not description:
+        description = _extract_between_markers(
+            card_text[card_text.find(title) + len(title) :] if title and title in card_text else "",
+            end_markers=settings.get("description_end_markers"),
+        )
 
     log.info(
         "[PARSER][CARD] source=%s id=%s title=%r url=%s budget_selector_text=%r "
-        "budget_text_used=%r budget_final={%s} skills=%r category=%r employer=%r",
+        "budget_text_used=%r budget_origin=%s budget_final={%s} skills=%r category=%r employer=%r",
         source_name,
         external_id,
         title,
         link,
         budget_selector_text,
         budget_text,
+        budget_origin,
         _budget_debug(budget),
         [s for s in skills if s][:12],
         _text(card, fields.get("category")) or None,
         _text(card, fields.get("employer")) or None,
     )
     if settings.get("_diagnostics"):
+        log.info(
+            "[PARSER][CARD-STRUCTURE] source=%s id=%s tag=%s id_attr=%r class=%r "
+            "project_links=%r text_chars=%s",
+            source_name,
+            external_id,
+            card.name,
+            card.get("id"),
+            (card.get("class") or [])[:8],
+            sorted(_project_link_ids(card)),
+            len(card_text),
+        )
+        log.info(
+            "[PARSER][BUDGET-NODES] source=%s id=%s scope=card nodes=%r",
+            source_name,
+            external_id,
+            _budget_node_summaries(card, fields.get("budget")),
+        )
         log.info(
             "[PARSER][CARD-TEXT] source=%s id=%s chars=%s text=%s",
             source_name,
@@ -280,6 +569,21 @@ def parse_project_card(
     )
 
 
+def _project_link_ids(root: Tag, pattern: str = DEFAULT_ID_REGEX) -> set[str]:
+    """Distinct project IDs under a node, excluding duplicate CTA/title links."""
+    try:
+        matcher = re.compile(pattern)
+    except re.error:
+        matcher = re.compile(DEFAULT_ID_REGEX)
+    ids: set[str] = set()
+    for anchor in root.find_all("a", href=True):
+        href = str(anchor.get("href") or "")
+        match = matcher.search(href)
+        if match:
+            ids.add(match.group(1) if match.groups() else match.group(0))
+    return ids
+
+
 def fallback_cards(soup: BeautifulSoup, settings: dict[str, Any]) -> list[Tag]:
     """Content-based fallback: find repeated project links without any selector.
 
@@ -300,7 +604,47 @@ def fallback_cards(soup: BeautifulSoup, settings: dict[str, Any]) -> list[Tag]:
             if not matcher.search(href) or href in seen:
                 continue
             seen.add(href)
-            parent = anchor.find_parent(["article", "li", "div"]) or anchor
+
+            # The nearest div often contains only the title while budget,
+            # skills and description live in sibling nodes. Prefer the best
+            # ancestor that contains this project link and no other project IDs.
+            ancestors = [
+                parent
+                for parent in anchor.find_parents(["article", "li", "section", "div"])
+                if isinstance(parent, Tag)
+            ]
+            candidates: list[tuple[int, int, Tag]] = []
+            for distance, parent in enumerate(ancestors):
+                ids = _project_link_ids(parent, pattern)
+                if len(ids) != 1:
+                    continue
+                text = clean_text(parent.get_text(" ", strip=True))
+                if len(text) < 20 or len(text) > 12_000:
+                    continue
+                attrs = " ".join(
+                    [str(parent.get("id") or ""), *[str(c) for c in (parent.get("class") or [])]]
+                ).casefold()
+                score = 0
+                if re.search(r"project|card|item|job|task|result|listing", attrs):
+                    score += 8
+                if parent.select_one(
+                    "[data-budget], [data-price], [data-amount], "
+                    "[class*='budget'], [class*='price'], [class*='amount']"
+                ):
+                    score += 10
+                if re.search(r"بودجه|حق.?الزحمه|تومان|تومن|میلیون|میلیارد", text):
+                    score += 6
+                if re.search(r"مهارت|skills?|category|دسته.?بندی", text, re.I):
+                    score += 2
+                # More complete cards win, while distance breaks ties in favor
+                # of the closest ancestor. All candidates remain project-local.
+                score += min(len(text) // 120, 8)
+                candidates.append((score, -distance, parent))
+
+            if candidates:
+                parent = max(candidates, key=lambda item: (item[0], item[1]))[2]
+            else:
+                parent = anchor
             if parent not in cards:
                 cards.append(parent)
         if len(cards) >= 3:
@@ -364,34 +708,66 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     """Merge detail-page data (full description, exact budget, skills) into a project."""
     soup = BeautifulSoup(html, "lxml")
     detail: dict[str, list[str]] = settings.get("detail_fields", {}) or {}
+    scope = _project_scope(soup, project.title)
+    scoped_root: Tag | BeautifulSoup = scope if scope is not None else soup
+    require_project_scope = bool(settings.get("require_project_scope_for_budget"))
 
-    description = _text(soup, detail.get("description"))
-    budget_selector_text = _text(soup, detail.get("budget"))
+    description = _text(scoped_root, detail.get("description"))
+    # On Ponisha, do not trust broad price/budget selectors across the entire page
+    # if we could not isolate this project's own DOM section.
+    budget_selector_text = (
+        _text(scoped_root, detail.get("budget")) if scope is not None or not require_project_scope else ""
+    )
     budget_text = budget_selector_text
-    skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(soup, detail.get("skills"))]
-    category = _text(soup, detail.get("category"))
-    employer = _text(soup, detail.get("employer"))
+    skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(scoped_root, detail.get("skills"))]
+    category = _text(scoped_root, detail.get("category"))
+    employer = _text(scoped_root, detail.get("employer"))
     page_text = clean_text(soup.get_text(" ", strip=True))[:20_000]
 
     budget = _parse_amount(budget_text)
-    budget_origin = "detail_selector" if budget_text else "detail_selector_miss"
+    budget_origin = "detail_selector" if budget is not None and budget.is_known else "detail_selector_miss"
     if budget is None or not budget.is_known:
-        # no budget selector matched: look for a labeled amount or currency on the page
-        found = find_budget(page_text, settings.get("budget_regex"))
+        # Searching flattened body text can combine "cost" wording with a number
+        # in a different recommended project. Ponisha can require a verified scope.
+        if scope is not None:
+            found, evidence, origin = _find_budget_in_markup(
+                scoped_root, detail.get("budget"), settings.get("budget_regex")
+            )
+        elif require_project_scope:
+            found, evidence, origin = None, "", "no_project_scope"
+        else:
+            # Compatibility path for older sites whose detail HTML has no heading.
+            found, evidence, origin = _find_budget_in_markup(
+                soup, detail.get("budget"), settings.get("budget_regex")
+            )
         if found is not None and found.is_known:
             budget = found
-            budget_text = found.source_text or budget_text
-            budget_origin = "detail_page_text"
+            budget_text = evidence or found.source_text or budget_text
+            budget_origin = "detail_page_text" if origin == "labeled_text_block" else origin
         else:
-            budget_origin = "not_found"
+            budget_origin = (
+                "not_found" if scope is not None or not require_project_scope else "no_project_scope"
+            )
+
+    if not description:
+        fallback_cfg = settings.get("description_fallback") or {}
+        description = _extract_between_markers(
+            page_text,
+            fallback_cfg.get("start_markers"),
+            fallback_cfg.get("end_markers"),
+        )
     log.info(
-        "[PARSER][DETAIL] source=%s id=%s title=%r url=%s "
-        "budget_selector_text=%r budget_text_used=%r budget_origin=%s budget_final={%s} "
-        "description_chars=%s skills=%r category=%r employer=%r",
+        "[PARSER][DETAIL] source=%s id=%s title=%r url=%s scope_found=%s scope_tag=%s "
+        "scope_id=%r scope_class=%r budget_selector_text=%r budget_text_used=%r "
+        "budget_origin=%s budget_final={%s} description_chars=%s skills=%r category=%r employer=%r",
         project.source,
         project.external_id,
         project.title,
         project.url,
+        scope is not None,
+        scope.name if scope is not None else None,
+        scope.get("id") if scope is not None else None,
+        (scope.get("class") or [])[:8] if scope is not None else [],
         budget_selector_text,
         budget_text,
         budget_origin,
@@ -402,6 +778,13 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
         employer or None,
     )
     if settings.get("_diagnostics"):
+        log.info(
+            "[PARSER][BUDGET-NODES] source=%s id=%s scope=detail scope_found=%s nodes=%r",
+            project.source,
+            project.external_id,
+            scope is not None,
+            _budget_node_summaries(scoped_root, detail.get("budget")),
+        )
         log.info(
             "[PARSER][DETAIL-TEXT] source=%s id=%s chars=%s text=%s",
             project.source,

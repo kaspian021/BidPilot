@@ -192,3 +192,181 @@ def test_diagnostics_log_raw_card_and_detail_budget_evidence(caplog):
     assert "[PARSER][DETAIL-TEXT]" in caplog.text
     assert "بودجه: 20,000,000 تا 40,000,000 تومان" in caplog.text
     assert "detail_budget_source" not in caplog.text or "detail_page_text" in caplog.text
+
+
+def test_fallback_cards_keeps_budget_and_description_siblings_together():
+    html = """
+    <html><body>
+      <section class="listing-row">
+        <div class="title"><h2><a href="/project/555">ساخت سامانه فروشگاهی</a></h2></div>
+        <div class="description"><p>یک فروشگاه آنلاین با پنل مدیریت لازم است.</p></div>
+        <div class="budget-label">بودجه: ۲ میلیون تومان</div>
+        <div class="skills">مهارت‌ها: Python</div>
+      </section>
+      <section class="listing-row">
+        <div class="title"><h2><a href="/project/556">ساخت وب‌سایت شرکتی</a></h2></div>
+        <div class="description"><p>طراحی چند صفحه‌ی شرکتی با نمایش مناسب موبایل.</p></div>
+      </section>
+      <section class="listing-row">
+        <div class="title"><h2><a href="/project/557">ساخت پنل مدیریتی</a></h2></div>
+        <div class="description"><p>پیاده‌سازی پنل مدیریت و گزارش‌های کاربردی.</p></div>
+      </section>
+    </body></html>
+    """
+    settings = {
+        "card_selectors": ["article.project-card"],
+        "id_regex": r"/project/(\d+)",
+        "fields": {
+            "title": ["h2 a"],
+            "link": ["h2 a"],
+            "description": [".description p"],
+            "budget": [".missing-budget-selector"],
+            "skills": [".missing-skill-selector"],
+        },
+    }
+
+    projects = parser.parse_list_page(html, settings, "ponisha", "https://ponisha.ir")
+
+    assert len(projects) == 3
+    assert projects[0].external_id == "555"
+    assert "پنل مدیریت" in projects[0].description
+    assert projects[0].budget is not None and projects[0].budget.is_known
+    assert projects[0].budget.min == 2_000_000
+
+
+def test_detail_budget_does_not_leak_from_recommended_projects():
+    from bidpilot.models import Project
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "طراحی قالب سبک وردپرس مشابه باسکول"
+    html = f"""
+    <html><body>
+      <nav><a href="/project/100">فهرست یک</a><a href="/project/101">فهرست دو</a></nav>
+      <main>
+        <article class="project-content">
+          <h1>{title}</h1>
+          <p>جزئیات قالب در ادامه با مجری هماهنگ می‌شود.</p>
+        </article>
+      </main>
+      <section class="related-projects">
+        <article><a href="/project/999">پروژه پیشنهادی اول</a>
+          <p>هزینه پیشنهادی مجری دیگر: ۱ میلیون تومان</p>
+        </article>
+        <article><a href="/project/998">پروژه پیشنهادی دوم</a></article>
+      </section>
+    </body></html>
+    """
+    project = Project(
+        source="ponisha",
+        external_id="555",
+        title=title,
+        url="https://ponisha.ir/project/555",
+    )
+
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {
+            "require_project_scope_for_budget": True,
+            "detail_fields": {
+                "description": [".missing-description"],
+                "budget": [".project-budget", ".budget", "[class*='price']"],
+                "skills": [],
+            },
+            "_diagnostics": True,
+        },
+    )
+
+    assert enriched.budget is None
+    assert enriched.raw["detail_budget_source"] == "not_found"
+
+
+def test_detail_budget_is_parsed_when_present_inside_project_scope():
+    from bidpilot.models import Project
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "ساخت اپلیکیشن فروشگاهی"
+    html = f"""
+    <html><body>
+      <main>
+        <article class="project-content">
+          <h1>{title}</h1>
+          <p>یک اپلیکیشن فروشگاهی با پنل مدیریت لازم است.</p>
+          <div class="budget-label">بودجه: ۲۰ میلیون تومان</div>
+        </article>
+      </main>
+      <section class="related-projects">
+        <article><a href="/project/777">پروژه دیگر</a><p>بودجه: ۱ میلیون تومان</p></article>
+        <article><a href="/project/778">پروژه دیگر دوم</a></article>
+      </section>
+    </body></html>
+    """
+    project = Project(
+        source="ponisha",
+        external_id="555",
+        title=title,
+        url="https://ponisha.ir/project/555",
+    )
+
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {
+            "require_project_scope_for_budget": True,
+            "detail_fields": {
+                "description": [".missing-description"],
+                "budget": [".project-budget"],
+                "skills": [],
+            },
+        },
+    )
+
+    assert enriched.budget is not None and enriched.budget.is_known
+    assert enriched.budget.min == 20_000_000
+    assert enriched.raw["detail_budget_source"] in {"budget_node", "budget_node_label", "labeled_text_block"}
+
+
+def test_detail_description_fallback_uses_ponisha_markers():
+    from bidpilot.models import Project
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "گویندگی و ضبط نریشن فارسی"
+    html = f"""
+    <html><body>
+      <h1>{title}</h1>
+      <p>زمان باقی‌مانده برای ارسال پیشنهاد</p>
+      <section>
+        برای داستان‌های سایت‌مان، نریشن فارسی با صدای گرم نیاز داریم.
+        شروع کار با پنج نریشن است و ادامه‌ی کار در بسته‌های پنج‌تایی انجام می‌شود.
+      </section>
+      <h2>مهارت‌های مورد نیاز</h2><p>گویندگی، خدمات صوتی</p>
+      <section>سرویس‌های مرتبط و پروژه‌های دیگر</section>
+    </body></html>
+    """
+    project = Project(
+        source="ponisha",
+        external_id="556",
+        title=title,
+        url="https://ponisha.ir/project/556",
+    )
+
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {
+            "require_project_scope_for_budget": True,
+            "detail_fields": {
+                "description": [".missing-description"],
+                "budget": [".missing-budget"],
+                "skills": [],
+            },
+            "description_fallback": {
+                "start_markers": ["زمان باقی‌مانده برای ارسال پیشنهاد"],
+                "end_markers": ["مهارت‌های مورد نیاز", "سرویس‌های مرتبط"],
+            },
+        },
+    )
+
+    assert "نریشن فارسی با صدای گرم" in enriched.description
+    assert "مهارت‌های مورد نیاز" not in enriched.description
+    assert "سرویس‌های مرتبط" not in enriched.description

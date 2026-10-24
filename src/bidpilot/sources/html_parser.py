@@ -1279,25 +1279,78 @@ def map_bid_fields(form: Tag, settings: dict[str, Any]) -> dict[str, str]:
     return mapping
 
 
-def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tuple[bool, str]:
-    """Decide whether the bid actually landed, using configurable text/URL markers."""
-    success_texts = settings.get("success_text_contains") or ["با موفقیت", "ثبت شد", "درخواست شما"]
-    failure_texts = settings.get("failure_text_contains") or ["خطا", "قبلاً", "اعتبار کافی", "مجاز نیست"]
-    body = clean_text(BeautifulSoup(html, "lxml").get_text(" ", strip=True))
+def extract_response_notices(html: str) -> list[str]:
+    """Collect concise visible form/alert notices without dumping the whole response."""
+    soup = BeautifulSoup(html or "", "lxml")
+    selectors = (
+        ".alert-danger",
+        ".alert-error",
+        ".toast-error",
+        ".toast-message",
+        ".validation-summary-errors",
+        ".field-validation-error",
+        "[role='alert']",
+    )
+    notices: list[str] = []
+    seen: set[str] = set()
+    for selector in selectors:
+        try:
+            nodes = soup.select(selector)
+        except Exception:
+            continue
+        for node in nodes[:5]:
+            text = clean_text(node.get_text(" ", strip=True))
+            key = _normalized_marker(text)
+            if not text or len(text) > 600 or not key or key in seen:
+                continue
+            seen.add(key)
+            notices.append(text)
+            if len(notices) >= 5:
+                return notices
+    return notices
 
-    if has_any(body, failure_texts):
-        snippet = next((t for t in failure_texts if clean_text(t) in body), "پیام خطای نامشخص")
-        return False, f"سایت درخواست را رد کرد: {snippet}"
+
+def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tuple[bool, str]:
+    """Require explicit proposal success; generic words on the project page are insufficient."""
+    success_texts = settings.get("success_text_contains") or [
+        "پیشنهاد شما با موفقیت ثبت شد",
+        "پیشنهاد با موفقیت ثبت شد",
+        "پیشنهاد شما ثبت شد",
+    ]
+    failure_texts = settings.get("failure_text_contains") or [
+        "قبلاً پیشنهاد",
+        "قبلا پیشنهاد",
+        "اعتبار کافی",
+        "امکان ارسال",
+        "مجاز نیست",
+        "وارد شوید",
+    ]
+    notices = extract_response_notices(html)
+    error_words = ("خطا", "ناموفق", "خطای", "failed", "error")
+
+    # A specific response alert is much stronger evidence than the surrounding
+    # project page, which can mention the word "error" in unrelated content.
+    for notice in notices:
+        if has_any(notice, failure_texts) or any(word in notice.casefold() for word in error_words):
+            return False, f"سایت پیام داد: {notice[:180]}"
+        if has_any(notice, success_texts):
+            return True, "پیشنهاد با پیام موفقیت سایت تأیید شد."
     if status_code >= 400:
         return False, f"HTTP {status_code}"
+
+    body = clean_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    if has_any(body, failure_texts):
+        snippet = next((t for t in failure_texts if clean_text(t) in body), "پیام رد مشخص")
+        return False, f"سایت درخواست را رد کرد: {snippet}"
     if has_any(body, success_texts):
-        return True, "درخواست با موفقیت ثبت شد."
-    return False, "نتیجه نامشخص؛ متن موفقیت در پاسخ پیدا نشد."
+        return True, "پیشنهاد با پیام موفقیت سایت تأیید شد."
+    return False, "نتیجه نامشخص؛ پیام روشن موفقیت/خطا در پاسخ سایت پیدا نشد."
 
 
 __all__ = [
     "DEFAULT_ID_REGEX",
     "detect_success",
+    "extract_response_notices",
     "enrich_from_detail",
     "extract_external_id",
     "fallback_id",

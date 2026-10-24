@@ -194,7 +194,6 @@ def test_diagnostics_log_raw_card_and_detail_budget_evidence(caplog):
     assert "detail_budget_source" not in caplog.text or "detail_page_text" in caplog.text
 
 
-
 def test_fallback_cards_keeps_budget_and_description_siblings_together():
     html = """
     <html><body>

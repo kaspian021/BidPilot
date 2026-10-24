@@ -21,7 +21,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import yaml
@@ -114,6 +114,74 @@ class HtmlMarketSource(Source):
         headers = super().headers()
         headers.update(self.credentials.headers or {})
         return headers
+
+    @staticmethod
+    def _safe_diagnostic_url(url: str) -> str:
+        """Strip query strings/fragments so diagnostic logs cannot expose tokens."""
+        parsed = urlsplit(str(url))
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+    async def get_html(self, path: str, **kwargs: Any) -> str:
+        """Fetch HTML and optionally log status, redirect chain, and response shape."""
+        diagnostics = bool(
+            (self.settings.get("discovery") or {}).get("log_extraction_details")
+            or (self.settings.get("discovery") or {}).get("log_http_details")
+        )
+        requested = str(path)
+        if not urlsplit(requested).scheme:
+            requested = urljoin(self.base_url + "/", requested.lstrip("/"))
+        safe_requested = self._safe_diagnostic_url(requested)
+        params = kwargs.get("params")
+        param_keys = sorted(str(key) for key in params.keys()) if hasattr(params, "keys") else []
+
+        if diagnostics:
+            log.info(
+                "[HTTP][REQUEST] source=%s url=%s params_keys=%r",
+                self.name,
+                safe_requested,
+                param_keys,
+            )
+
+        client = await self.client()
+        try:
+            response = await client.get(path, **kwargs)
+        except httpx.HTTPError as exc:
+            if diagnostics:
+                log.warning(
+                    "[HTTP][FAILED] source=%s requested=%s error_type=%s",
+                    self.name,
+                    safe_requested,
+                    type(exc).__name__,
+                )
+            raise
+
+        if diagnostics:
+            redirects = [
+                (item.status_code, self._safe_diagnostic_url(str(item.url)))
+                for item in response.history
+            ]
+            log.info(
+                "[HTTP][RESPONSE] source=%s status=%s requested=%s final_url=%s "
+                "content_type=%r html_chars=%s redirects=%r",
+                self.name,
+                response.status_code,
+                safe_requested,
+                self._safe_diagnostic_url(str(response.url)),
+                response.headers.get("content-type", ""),
+                len(response.text or ""),
+                redirects,
+            )
+
+        if response.status_code >= 400:
+            if diagnostics:
+                log.warning(
+                    "[HTTP][FAILED] source=%s requested=%s status=%s",
+                    self.name,
+                    safe_requested,
+                    response.status_code,
+                )
+            raise SourceError(f"GET {path} -> HTTP {response.status_code}")
+        return response.text
 
     def credentials_present(self) -> bool:
         auth = self.settings.get("auth") or {}

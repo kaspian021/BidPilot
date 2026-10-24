@@ -269,8 +269,7 @@ class HtmlMarketSource(Source):
 
             final_path = urlsplit(str(response.url)).path.casefold()
             log.info(
-                "[AUTH][VERIFY-RESPONSE] source=%s requested_path=%s status=%s "
-                "final_path=%s html_chars=%s",
+                "[AUTH][VERIFY-RESPONSE] source=%s requested_path=%s status=%s final_path=%s html_chars=%s",
                 self.name,
                 urlsplit(str(path)).path,
                 response.status_code,
@@ -280,7 +279,10 @@ class HtmlMarketSource(Source):
             if response.status_code in (401, 403) or re.search(
                 r"/(?:login|signin|sign-in)(?:/|$)", final_path
             ):
-                return False, "سایت به صفحه‌ی ورود هدایت کرد یا دسترسی را رد کرد؛ کوکی پارس‌کدرز را در «/market» به‌روز کن."
+                return (
+                    False,
+                    "سایت به صفحه‌ی ورود هدایت کرد یا دسترسی را رد کرد؛ کوکی پارس‌کدرز را در «/market» به‌روز کن.",
+                )
             if response.status_code >= 400:
                 errors.append(f"{path}: HTTP {response.status_code}")
                 continue
@@ -302,7 +304,10 @@ class HtmlMarketSource(Source):
         if _looks_like_login_page(html, auth):
             return False, "سایت فرم ورود نشان داد؛ کوکی/رمز معتبر نیست — «/market» را بزن."
         if auth.get("require_auth_markers"):
-            return False, "صفحه باز شد، اما نشانه‌ی مشخص ورود به حساب پیدا نشد؛ برای جلوگیری از ارسال اشتباه، کوکی را در «/market» دوباره ثبت و سپس «/test» را اجرا کن."
+            return (
+                False,
+                "صفحه باز شد، اما نشانه‌ی مشخص ورود به حساب پیدا نشد؛ برای جلوگیری از ارسال اشتباه، کوکی را در «/market» دوباره ثبت و سپس «/test» را اجرا کن.",
+            )
         return True, "صفحه باز شد و نشانه‌ی «ورود لازم است» نداشت (وضعیت قطعی نیست)."
 
     # -------------------------------------------------------------- health

@@ -2,7 +2,7 @@ import pytest
 
 from bidpilot.app import Application
 from bidpilot.config import AppConfig, FiltersConfig, Profile, RuntimeConfig, Secrets, SourceConfig
-from bidpilot.models import Event, EventKind
+from bidpilot.models import Budget, Event, EventKind, Project
 from bidpilot.notifications.base import Notifier
 from bidpilot.repositories import Repository
 
@@ -303,4 +303,63 @@ async def test_digest_reports_ai_discovery_pages(tmp_path):
     digest = notifier.kinds(EventKind.DIGEST)[0].body
     assert "جست‌وجوی هوشمند" in digest
     assert "7" in digest
+    await application.close()
+
+
+async def test_live_pipeline_blocks_fetch_when_session_verification_fails(tmp_path):
+    application, notifier = await build_app(make_config(tmp_path))
+    source = application.sources["mock"]
+    fetch_calls = {"count": 0}
+    original_fetch = source.fetch_projects
+
+    async def denied_session():
+        return False, "کوکی منقضی شده است"
+
+    async def track_fetch():
+        fetch_calls["count"] += 1
+        return await original_fetch()
+
+    source.verify_session = denied_session
+    source.fetch_projects = track_fetch
+    report = (await application.cycle())[0]
+
+    assert report.fetched == 0
+    assert report.errors and "احراز هویت" in report.errors[0]
+    assert fetch_calls["count"] == 0
+    assert notifier.kinds(EventKind.ERROR)
+    await application.close()
+
+
+async def test_pipeline_revisits_skipped_project_when_new_skills_are_found(tmp_path):
+    config = make_config(tmp_path)
+    config.profile.stack = ["C#"]
+    config.filters.require_skill_match = True
+    config.filters.require_budget = True
+    config.sources = [SourceConfig(type="mock", settings={"projects": [], "latency": 0})]
+    application, _ = await build_app(config)
+    source = application.sources["mock"]
+    fetch_round = {"count": 0}
+
+    async def changing_projects():
+        fetch_round["count"] += 1
+        skills = [] if fetch_round["count"] == 1 else ["برنامه نویسی با C#"]
+        return [
+            Project(
+                source="mock",
+                external_id="321",
+                title="ابزار برنامه‌نویسی",
+                description="ساخت ابزار",
+                budget=Budget(min=500_000, max=1_500_000),
+                skills=skills,
+            )
+        ]
+
+    source.fetch_projects = changing_projects
+    first = (await application.cycle())[0]
+    second = (await application.cycle())[0]
+
+    assert first.skipped == 1
+    assert second.submitted == 1
+    assert second.new == 0
+    assert second.duplicates == 0
     await application.close()

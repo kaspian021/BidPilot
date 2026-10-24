@@ -322,8 +322,6 @@ def test_bid_percent_changes_the_effective_price(env):
 
 
 async def test_live_automation_refuses_to_start_without_a_valid_session(env, tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     import bidpilot.automation as automation_module
 
     monkeypatch.chdir(tmp_path)

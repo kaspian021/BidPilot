@@ -541,3 +541,80 @@ async def test_a_failed_search_is_not_retried_every_cycle(monkeypatch):
         assert source.ai_discovery_enabled() is False
     finally:
         await source.aclose()
+
+
+def test_digest_keeps_page_navigation_and_late_labeled_metadata():
+    html = """
+    <html><head><title>صفحه پروژه</title></head><body>
+      <nav><a href="/project">پروژه‌های مرتبط</a><a href="/profile">پروفایل من</a></nav>
+      <main><h1>ساخت سامانه فروشگاهی</h1>
+        <div id="project-description"><p>شرح نیازمندی اصلی فروشگاه با جزئیات فنی.</p></div>
+      </main>
+      <aside>بودجه: ۲۰ تا ۴۰ میلیون تومان</aside>
+      <aside>مهلت تحویل: ۱۰ روز</aside>
+      <footer>لینک‌های شبکه اجتماعی و اطلاعات غیرمرتبط سایت</footer>
+    </body></html>
+    """
+    page = digest_html(html, BASE + "/project/901", base_url=BASE, max_text=1_000)
+
+    assert any(link.label == "پروژه‌های مرتبط" for link in page.links)
+    assert "شرح نیازمندی اصلی فروشگاه" in page.text
+    assert "بودجه: 20 تا 40 میلیون تومان" in page.text
+    assert "مهلت تحویل: 10 روز" in page.text
+    assert "اطلاعات غیرمرتبط سایت" not in page.text
+
+
+def test_model_cannot_replace_a_visible_budget_with_an_invented_one(fetch):
+    from bidpilot.sources.discovery import _extract_description
+
+    url = BASE + "/project/501/flutter-shop"
+    page = digest_html(PROJECT_501, url, base_url=BASE, max_text=8_000)
+    agent = DiscoveryAgent(
+        source_name="parscoders",
+        base_url=BASE,
+        fetch=fetch,
+        llm=ScriptedLLM(),
+        profile=PROFILE,
+    )
+    extracted = agent._to_project(
+        url,
+        {
+            "is_project": True,
+            "title": "ساخت اپلیکیشن فروشگاهی با Flutter",
+            "description": "خلاصه‌ی کوتاه مدل",
+            "budget_text": "بودجه: ۹۹۹ میلیون تومان",
+            "deadline_text": "۹۹ روز",
+            "skills": ["Flutter", "مهارت ساختگی"],
+            "category": "دسته‌ی ساختگی",
+            "employer": "کارفرمای ساختگی",
+        },
+        page,
+        source_description=_extract_description(PROJECT_501),
+    )
+
+    assert extracted is not None
+    assert extracted.budget is not None
+    assert (extracted.budget.min, extracted.budget.max) == (20_000_000, 40_000_000)
+    assert extracted.employer_deadline == "10 روز"
+    assert extracted.skills == ["Flutter"]
+    assert extracted.category is None
+    assert extracted.employer is None
+    assert "سبد خرید" in extracted.description
+    assert extracted.raw["budget_source"] == "page_text"
+
+
+def test_project_description_extractor_preserves_late_requirements():
+    from bidpilot.sources.discovery import _extract_description
+
+    important = "شرط پذیرش پایانی و جزئیات نهایی باید حفظ شود"
+    html = (
+        '<html><body><h1>پروژه</h1><div id="project-description">'
+        + ("شرح فنی قابل بررسی و محدودیت اجرای پروژه. " * 80)
+        + important
+        + "</div></body></html>"
+    )
+
+    description = _extract_description(html)
+
+    assert important in description
+    assert len(description) > 2_600

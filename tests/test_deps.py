@@ -121,9 +121,10 @@ def test_editable_commands_fall_back_to_uv_then_ensurepip(monkeypatch, tmp_path)
     rendered = [" ".join(command) for command in commands]
 
     assert any("uv pip install" in line and "-e" in line for line in rendered)
-    # last resort: give the venv a pip first
-    assert any("ensurepip" in line for line in rendered)
-    assert not any("python -m pip install -e" in line for line in rendered if "ensurepip" not in line)
+    # Last resort: give the venv a pip first, then install the editable package.
+    ensurepip_index = next(index for index, line in enumerate(rendered) if "ensurepip" in line)
+    assert ensurepip_index > 0
+    assert not any("python -m pip install -e" in line for line in rendered[:ensurepip_index])
 
 
 def test_editable_install_reports_success(monkeypatch, tmp_path):

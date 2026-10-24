@@ -114,7 +114,9 @@ DEFAULT_ENTRIES: list[tuple[str, str]] = [
 
 
 def insights_for(project: Project, limit: int = 4) -> list[tuple[str, str]]:
-    """Pick playbook entries relevant to this project, padded with safe defaults."""
+    """Return only relevant implementation insights; use one safe default when none match."""
+    if limit <= 0:
+        return []
     haystack = " ".join(
         [
             project.title,
@@ -129,9 +131,10 @@ def insights_for(project: Project, limit: int = 4) -> list[tuple[str, str]]:
             picked.append(entry)
         if len(picked) >= limit:
             break
-    for entry in DEFAULT_ENTRIES:
-        if len(picked) >= limit:
-            break
-        if entry not in picked:
-            picked.append(entry)
-    return picked[:limit]
+
+    # Do not pad a sparse project with unrelated talking points merely to hit a
+    # target count. Generic claims make the bid less credible and can imply work
+    # that the employer never requested.
+    if picked:
+        return picked[:limit]
+    return DEFAULT_ENTRIES[:1]

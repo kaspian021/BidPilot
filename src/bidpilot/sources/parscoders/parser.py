@@ -15,6 +15,7 @@ from ..html_parser import (  # noqa: F401
     parse_list_page,
     parse_project_card,
     parse_published,
+    requires_javascript,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "parse_list_page",
     "parse_project_card",
     "parse_published",
+    "requires_javascript",
 ]

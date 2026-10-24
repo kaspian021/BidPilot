@@ -133,6 +133,12 @@ class Scheduler:
                     log.error("[SCHEDULER][STOP-AUTH] marketplace login is not verified; stopping polling")
                     self.request_stop()
                     break
+                if any(getattr(report, "javascript_required", False) for report in reports):
+                    log.error(
+                        "[SCHEDULER][STOP-JAVASCRIPT] marketplace requires browser-side JavaScript; stopping polling"
+                    )
+                    self.request_stop()
+                    break
             except Exception as exc:  # keep the daemon alive no matter what
                 self.consecutive_errors += 1
                 log.exception("Cycle failed (%s in a row)", self.consecutive_errors)

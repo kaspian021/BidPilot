@@ -137,6 +137,34 @@ class Application:
                 )
             )
             return
+        javascript_failures = [r for r in reports if getattr(r, "javascript_required", False)]
+        if javascript_failures:
+            source = javascript_failures[0].source or "marketplace"
+            detail = next(
+                (
+                    str(error)
+                    for report in javascript_failures
+                    for error in report.errors
+                    if str(error).strip()
+                ),
+                "سایت اجرای JavaScript در مرورگر را لازم دانست.",
+            )
+            await self.notifiers.dispatch(
+                Event(
+                    kind=EventKind.ERROR,
+                    title="اجرای JavaScript در مرورگر لازم است",
+                    body=(
+                        f"⛔ سایت «{source}» پاسخ داده که JavaScript مرورگر باید فعال باشد.\n"
+                        f"دلیل: {detail}\n"
+                        "این نسخه از BidPilot با HTTP مستقیم کار می‌کند و JavaScript اجرا نمی‌کند؛ "
+                        "رصد متوقف شد و ثبت پیشنهاد تأیید نشده است.\n"
+                        "فعلاً از مرورگر عادی سایت برای ارسال دستی استفاده کن؛ صرفاً تغییر کوکی "
+                        "ممکن است مشکل را حل نکند. تا پشتیبانی از جریان مبتنی بر مرورگر اضافه نشده، "
+                        "برای همین وضعیت /run را تکرار نکن."
+                    ),
+                )
+            )
+            return
         if not self.config.runtime.notify_digest:
             return
         interesting = [r for r in reports if r.has_news()]

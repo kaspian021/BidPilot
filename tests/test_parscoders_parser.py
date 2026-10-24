@@ -70,6 +70,18 @@ def test_detect_success_and_failure():
     assert not ok
 
 
+def test_requires_javascript_detects_site_requirement():
+    html = """
+    <div class="alert-danger">
+      خطا: جاوا اسکریپت (JavaScript) مرورگر شما غیر فعال است!
+      برای استفاده از پارس‌کدرز باید آن را فعال کنید.
+    </div>
+    """
+    assert parser.requires_javascript(html)
+    assert parser.requires_javascript("<p>Please enable JavaScript in your browser.</p>")
+    assert not parser.requires_javascript("<div>پیشنهاد شما با موفقیت ثبت شد.</div>")
+
+
 def test_parse_cookie_header():
     assert parse_cookie_header("PHPSESSID=abc; other=1") == {"PHPSESSID": "abc", "other": "1"}
     assert parse_cookie_header("raw-session-id") == {"PHPSESSID": "raw-session-id"}

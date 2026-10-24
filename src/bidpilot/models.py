@@ -117,6 +117,8 @@ class SubmissionResult(BaseModel):
     message: str = ""
     external_bid_id: str | None = None
     http_status: int | None = None
+    #: The site explicitly demands browser-side JavaScript.
+    javascript_required: bool = False
     payload_debug: dict = Field(default_factory=dict)
 
 

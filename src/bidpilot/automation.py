@@ -190,8 +190,11 @@ class Automation:
     # ---------------------------------------------------------------- reports
     async def _on_report(self, reports: list[Any]) -> None:
         self.summary.add(reports)
-        if any(getattr(report, "authentication_failed", False) for report in reports):
-            # Application._dispatch_digest sends the explicit login-required alert.
+        if any(
+            getattr(report, "authentication_failed", False) or getattr(report, "javascript_required", False)
+            for report in reports
+        ):
+            # Application._dispatch_digest sends the explicit authentication/JavaScript alert.
             if self._scheduler is not None:
                 self._scheduler.request_stop()
             return

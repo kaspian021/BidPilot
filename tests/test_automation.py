@@ -363,3 +363,35 @@ async def test_live_automation_refuses_to_start_without_a_valid_session(env, tmp
     assert automation._scheduler is None
     assert notes and "وارد حساب کاربری" in notes[0]
     assert "جست‌وجو و ارسال پیشنهاد شروع نشد" in notes[0]
+
+
+async def test_automation_on_report_stops_when_javascript_is_required(env):
+    notes = []
+
+    async def notify(message):
+        notes.append(message)
+
+    class Stopper:
+        stopped = False
+
+        def request_stop(self):
+            self.stopped = True
+
+    class JavaScriptReport:
+        source = "parscoders"
+        authentication_failed = False
+        javascript_required = True
+        fetched = 1
+        submitted = 0
+        dry_run = 0
+        skipped = 0
+        failed = 1
+
+    automation = Automation(store=env, config_path=CONFIG, notify=notify)
+    stopper = Stopper()
+    automation._scheduler = stopper
+
+    await automation._on_report([JavaScriptReport()])
+
+    assert stopper.stopped
+    assert notes == []

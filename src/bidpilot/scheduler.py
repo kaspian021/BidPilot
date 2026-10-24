@@ -129,6 +129,12 @@ class Scheduler:
                     log.info(report.summary())
                     for error in report.errors:
                         log.warning("cycle error: %s", error)
+                if any(getattr(report, "authentication_failed", False) for report in reports):
+                    log.error(
+                        "[SCHEDULER][STOP-AUTH] marketplace login is not verified; stopping polling"
+                    )
+                    self.request_stop()
+                    break
             except Exception as exc:  # keep the daemon alive no matter what
                 self.consecutive_errors += 1
                 log.exception("Cycle failed (%s in a row)", self.consecutive_errors)

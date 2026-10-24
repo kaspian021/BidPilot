@@ -712,8 +712,7 @@ def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None =
         if budget is not None and budget.is_known:
             return budget
 
-    for match in re.finditer(r"([^
-]{0,30}?)(d[d,.٬،]*)s*(تومان|تومن|ریال|هزار تومان|میلیون)", cleaned):
+    for match in re.finditer(r"([^\n]{0,30}?)(\d[\d,.٬،]*)\s*(تومان|تومن|ریال|هزار تومان|میلیون)", cleaned):
         if _is_non_project_budget_evidence(match.group(1)):
             continue
         budget = parse_budget_text(match.group(0))

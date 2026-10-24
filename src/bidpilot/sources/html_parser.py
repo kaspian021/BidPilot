@@ -679,7 +679,7 @@ def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None =
     counters ("۱٬۲۳۴ پروژه") are not mistaken for money.
     """
     cleaned = clean_text(text or "")
-    if not cleaned:
+    if not cleaned or _is_non_project_budget_evidence(cleaned):
         return None
 
     for pattern in patterns or DEFAULT_BUDGET_REGEXES:

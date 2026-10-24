@@ -349,7 +349,9 @@ def _find_project_header_budget(
     for candidate in headings:
         normalized = _normalized_marker(candidate.get_text(" ", strip=True))
         if normalized == normalized_title or (
-            normalized_title and normalized_title in normalized and len(normalized) <= len(normalized_title) + 30
+            normalized_title
+            and normalized_title in normalized
+            and len(normalized) <= len(normalized_title) + 30
         ):
             heading = candidate
             break
@@ -360,8 +362,23 @@ def _find_project_header_budget(
         return None, "", "no_project_heading", ""
 
     node_tags = [
-        "h1", "h2", "h3", "h4", "h5", "p", "div", "span", "li", "dt", "dd",
-        "td", "label", "small", "strong", "b", "time",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "p",
+        "div",
+        "span",
+        "li",
+        "dt",
+        "dd",
+        "td",
+        "label",
+        "small",
+        "strong",
+        "b",
+        "time",
     ]
     ordered = list(soup.find_all(node_tags))
     try:
@@ -919,9 +936,7 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
                 budget_origin = origin
                 budget_source_evidence = source_evidence
             else:
-                budget_origin = (
-                    "not_found" if scope is not None or not require_project_scope else origin
-                )
+                budget_origin = "not_found" if scope is not None or not require_project_scope else origin
 
     if not description:
         fallback_cfg = settings.get("description_fallback") or {}

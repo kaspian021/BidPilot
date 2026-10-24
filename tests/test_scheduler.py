@@ -83,3 +83,41 @@ async def test_scheduler_stops_after_a_report_marks_authentication_failed(tmp_pa
     assert app.cycles == 1
     assert len(callback_reports) == 1
     assert scheduler._stop.is_set()
+
+
+
+async def test_scheduler_stops_after_a_report_requires_javascript(tmp_path):
+    class JavaScriptReport:
+        source = "parscoders"
+        authentication_failed = False
+        javascript_required = True
+        errors = ["سایت JavaScript مرورگر را لازم دانست"]
+
+        def summary(self):
+            return "JavaScript required"
+
+    class JavaScriptApp(FakeApp):
+        def __init__(self):
+            super().__init__()
+            self.sources = {"parscoders": object()}
+            self.cycles = 0
+
+        async def cycle(self, sources=None):
+            self.cycles += 1
+            return [JavaScriptReport()]
+
+    app = JavaScriptApp()
+    callback_reports = []
+    scheduler = Scheduler(
+        app,
+        interval=600,
+        jitter=0,
+        store=SettingsStore(tmp_path / "settings.json"),
+        on_report=lambda reports: callback_reports.extend(reports),
+    )
+
+    await asyncio.wait_for(scheduler.run_forever(), timeout=2)
+
+    assert app.cycles == 1
+    assert len(callback_reports) == 1
+    assert scheduler._stop.is_set()

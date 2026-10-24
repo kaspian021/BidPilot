@@ -113,6 +113,34 @@ async def test_submit_bid_detects_rejection():
 
 
 @respx.mock
+async def test_submit_bid_detects_javascript_requirement_and_marks_it():
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=PROJECT_HTML)
+    )
+    post_route = respx.post("https://parscoders.com/project/12345/bid").mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                '<div class="alert-danger">خطا: جاوا اسکریپت (JavaScript) مرورگر شما غیر فعال است! '
+                "برای استفاده از پارس‌کدرز باید آن را فعال کنید.</div>"
+            ),
+        )
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "session-value"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "failed"
+    assert result.javascript_required
+    assert "JavaScript" in result.message
+    assert "ثبت پیشنهاد تأیید نشده" in result.message
+    assert post_route.call_count == 1
+    await source.aclose()
+
+
+@respx.mock
 async def test_submit_bid_without_credentials_fails_fast():
     source = make_source()
     project = Project(source="parscoders", external_id="1", title="تست")

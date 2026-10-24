@@ -257,7 +257,7 @@ def _find_budget_in_markup(
         for node in nodes:
             seen.add(id(node))
             for evidence in _node_text_candidates(node):
-                if len(evidence) > 500:
+                if len(evidence) > 500 or _is_non_project_budget_evidence(evidence):
                     continue
                 budget = parse_budget_text(evidence)
                 if budget is not None and budget.is_known:

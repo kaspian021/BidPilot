@@ -137,9 +137,7 @@ class Application:
                 )
             )
             return
-        javascript_failures = [
-            r for r in reports if getattr(r, "javascript_required", False)
-        ]
+        javascript_failures = [r for r in reports if getattr(r, "javascript_required", False)]
         if javascript_failures:
             source = javascript_failures[0].source or "marketplace"
             detail = next(

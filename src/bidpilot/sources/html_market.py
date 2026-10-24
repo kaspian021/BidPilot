@@ -55,9 +55,7 @@ def load_yaml_settings(path: Path) -> dict[str, Any]:
 
 def _javascript_required_message(site_notice: str = "") -> str:
     detail = (
-        f"پیام سایت: {site_notice[:180]}"
-        if site_notice
-        else "سایت اجرای JavaScript در مرورگر را لازم دانست."
+        f"پیام سایت: {site_notice[:180]}" if site_notice else "سایت اجرای JavaScript در مرورگر را لازم دانست."
     )
     return (
         f"{detail} BidPilot در این اتصال HTTP مستقیم کار می‌کند و JavaScript "

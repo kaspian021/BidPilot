@@ -105,7 +105,7 @@ _BUDGET_NODE_SELECTORS = (
 _SCOPED_BUDGET_LABELS = (
     r"سقف\s+بودجه",
     r"بودجه(?:[\u200c]?[یٔ])?(?:\s+پروژه)?",
-    r"مبلغ(?:\s+(?:پروژه|کل(?:\s+پروژه)?))?",
+    r"مبلغ\s+(?:پروژه|کل(?:\s+پروژه)?)",
     r"حق[\u200c-]?الزحمه(?:\s+پروژه)?",
     r"هزینه\s+(?:پروژه|کل(?:\s+پروژه)?)",
     r"قیمت\s+پروژه",
@@ -117,7 +117,6 @@ _SCOPED_BUDGET_REGEXES = tuple(rf"{label}\s*[:：]?\s*([^\n]{{2,100}})" for labe
 # Match an explicitly labeled range even when a marketplace splits it across
 # visual lines, e.g. "بودجه 25,000 تومان\n تا\n 500,000 تومان".
 _BUDGET_RANGE_VALUE_RE = re.compile(
-    r"^\s*[:：]?\s*"
     r"(?P<range>\d(?:[\d,.\u066c\u060c]*\d)?\s*"
     r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?"
     r"(?:تومان|تومن|ریال)?\s*"
@@ -151,7 +150,7 @@ _DESCRIPTION_END_MARKERS = (
 def _labeled_range_budget(text: str, value_start: int) -> Budget | None:
     """Parse a nearby explicit budget range before single-amount fallbacks truncate it."""
     value_tail = text[value_start : value_start + 220]
-    match = _BUDGET_RANGE_VALUE_RE.match(value_tail)
+    match = _BUDGET_RANGE_VALUE_RE.search(value_tail)
     if not match:
         return None
     evidence = match.group("range")
@@ -179,6 +178,7 @@ def _find_employer_deadline(root: Tag | BeautifulSoup) -> str:
         r"زمان\s+تحویل(?:\s+پروژه)?",
         r"delivery\s+time",
         r"project\s+duration",
+        r"مهلت",
     )
     tags = ["p", "li", "span", "small", "label", "dt", "dd", "td", "strong", "b", "div", "section"]
     for node in root.find_all(tags):
@@ -212,7 +212,7 @@ def _node_text_candidates(node: Tag) -> list[str]:
 def _find_labeled_budget(text: str, patterns: list[str] | tuple[str, ...] | None = None) -> Budget | None:
     """Parse a budget only when a budget-specific label and its value share a short block."""
     cleaned = clean_text(text or "")
-    if not cleaned or len(cleaned) > 500:
+    if not cleaned or len(cleaned) > 500 or _is_non_project_budget_evidence(cleaned):
         return None
     for pattern in patterns or _SCOPED_BUDGET_REGEXES:
         try:
@@ -399,6 +399,33 @@ _BUDGET_SUFFIX_RE = re.compile(r"[\d\s:/\-–—آ-ی]*")
 def _normalized_marker(value: str) -> str:
     return clean_text(value).replace("\u200c", " ").replace("ي", "ی").replace("ك", "ک").casefold()
 
+_NON_PROJECT_BUDGET_MARKERS = (
+    "عایدی شما",
+    "مبلغ عایدی",
+    "دریافت کنی",
+    "ارتقاء حساب کاربری",
+    "your earnings",
+)
+
+
+def _is_non_project_budget_evidence(text: str | None) -> bool:
+    """Reject the logged-in freelancer's earnings widget as employer project budget."""
+    normalized = _normalized_marker(text or "")
+    return any(_normalized_marker(marker) in normalized for marker in _NON_PROJECT_BUDGET_MARKERS)
+
+
+def _unique_clean_values(values) -> list[str]:
+    """Clean and deduplicate site tags while preserving their original order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = clean_text(str(raw or ""))
+        key = re.sub(r"\s+", " ", _normalized_marker(value)).strip()
+        if value and key and key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
 
 def _find_project_header_budget(
     soup: BeautifulSoup,
@@ -505,7 +532,7 @@ def _find_project_header_budget(
         ]
         candidates = [*visible_candidates, *attrs]
         for evidence in candidates:
-            if not evidence or len(evidence) > 180:
+            if not evidence or len(evidence) > 180 or _is_non_project_budget_evidence(evidence):
                 continue
             if not re.search(r"تومان|تومن|ریال", evidence):
                 continue
@@ -611,7 +638,7 @@ BUDGET_LABELS = (
     r"بودجه",
     r"بودجهٔ",
     r"بودجه‌ی",
-    r"مبلغ",
+    r"مبلغ\s+(?:پروژه|کل(?:\s+پروژه)?)",
     r"حق‌?الزحمه",
     r"حقوق",
     r"هزینه",
@@ -661,7 +688,13 @@ def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None =
             continue
         if not match:
             continue
-        value_start = match.start(1) if match.lastindex else match.start()
+        candidate_start = match.start(1) if match.lastindex else match.start()
+        candidate_end = match.end(1) if match.lastindex else match.end()
+        candidate = match.group(1) if match.lastindex else match.group(0)
+        surrounding = cleaned[max(0, match.start() - 36) : candidate_end]
+        if _is_non_project_budget_evidence(surrounding) or _is_non_project_budget_evidence(candidate):
+            continue
+        value_start = candidate_start
         range_budget = _labeled_range_budget(cleaned, value_start)
         if range_budget is not None and range_budget.is_known:
             return range_budget
@@ -679,7 +712,10 @@ def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None =
         if budget is not None and budget.is_known:
             return budget
 
-    for match in re.finditer(r"([^\n]{0,30}?)(\d[\d,.٬،]*)\s*(تومان|تومن|ریال|هزار تومان|میلیون)", cleaned):
+    for match in re.finditer(r"([^
+]{0,30}?)(d[d,.٬،]*)s*(تومان|تومن|ریال|هزار تومان|میلیون)", cleaned):
+        if _is_non_project_budget_evidence(match.group(1)):
+            continue
         budget = parse_budget_text(match.group(0))
         if budget is not None and budget.is_known:
             return budget
@@ -755,7 +791,7 @@ def parse_project_card(
             budget_text = evidence or found.source_text or found.as_text()
             budget_origin = origin
 
-    skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(card, fields.get("skills"))]
+    skills = _unique_clean_values(s.get_text(" ", strip=True) for s in _all(card, fields.get("skills")))
     description = _text(card, fields.get("description"))
     card_text = clean_text(card.get_text(" ", strip=True)) if isinstance(card, Tag) else ""
     if not description:
@@ -970,12 +1006,12 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
         _text(scoped_root, detail.get("budget")) if scope is not None or not require_project_scope else ""
     )
     budget_text = budget_selector_text
-    skills = [clean_text(s.get_text(" ", strip=True)) for s in _all(scoped_root, detail.get("skills"))]
+    skills = _unique_clean_values(s.get_text(" ", strip=True) for s in _all(scoped_root, detail.get("skills")))
     category = _text(scoped_root, detail.get("category"))
     employer = _text(scoped_root, detail.get("employer"))
     page_text = clean_text(soup.get_text(" ", strip=True))[:20_000]
 
-    budget = _parse_amount(budget_text)
+    budget = None if _is_non_project_budget_evidence(budget_text) else _parse_amount(budget_text)
     budget_origin = "detail_selector" if budget is not None and budget.is_known else "detail_selector_miss"
     budget_source_evidence = ""
     if budget is None or not budget.is_known:

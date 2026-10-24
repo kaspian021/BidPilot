@@ -1,0 +1,147 @@
+# ============================================================================
+# Karlancer (karlancer.com) — selectors only, no code.
+# ----------------------------------------------------------------------------
+# کالیبره‌کردن سلکتورها (وقتی سایت ظاهرش را عوض کرد):
+#   bidpilot inspect -u https://karlancer.com/projects
+#   bidpilot inspect -f data/debug/<page>.html --no-save
+# سپس سلکتور درست را در همین فایل جایگزین کن — بدون تغییر کد.
+# ============================================================================
+
+base_url: "https://karlancer.com"
+
+# --- listing page -----------------------------------------------------------
+list:
+  path: "/projects"
+  page_param: "page"
+  max_pages: 1
+  min_items_per_page: 1
+  card_selectors:
+    - "div.project-item"
+    - "article.project-card"
+    - "div.project-card"
+    - "div.job-card"
+    - "li.project-item"
+    - "div[class*='project-card']"
+    - "[data-testid='project-item']"
+  fields:
+    title:
+      - "h2 a"
+      - "h3 a"
+      - ".project-title a"
+      - "a.project-title"
+      - "a[href*='/project']"
+    link:
+      - "h2 a"
+      - "h3 a"
+      - ".project-title a"
+      - "a.project-title"
+      - "a[href*='/project']"
+    description:
+      - ".project-description"
+      - ".description"
+      - "p.summary"
+      - ".excerpt"
+    budget:
+      - ".project-budget"
+      - ".budget"
+      - "[class*='budget']"
+      - "[class*='price']"
+      - "[class*='amount']"
+    skills:
+      - ".project-skills .tag"
+      - ".skills .tag"
+      - ".tags .tag"
+      - ".skill"
+      - "li.skill"
+    category:
+      - ".project-category"
+      - ".category"
+    employer:
+      - ".project-owner"
+      - ".employer"
+      - ".user-name"
+    published_at:
+      - ".project-date"
+      - "time"
+      - ".date"
+  id_regex: "/projects?/(\\d+)"
+  fetch_details: true
+  detail_concurrency: 3
+
+detail:
+  path: "/project/{external_id}"
+  detail_fields:
+    description:
+      - "#project-description"
+      - ".project-description"
+      - ".project-detail .description"
+      - "div.description"
+      - "section.description"
+    budget:
+      - ".project-budget"
+      - ".budget"
+      - "[class*='budget']"
+      - "[class*='price']"
+    skills:
+      - ".project-skills .tag"
+      - ".skills .tag"
+      - "li.skill"
+    category:
+      - ".project-category"
+      - ".category"
+    employer:
+      - ".project-owner"
+      - ".employer"
+
+# --- bidding ----------------------------------------------------------------
+bid:
+  mode: "form"
+  form_selectors:
+    - "form#proposal-form"
+    - "form#bid-form"
+    - "form[action*='proposal']"
+    - "form[action*='bid']"
+    - "form[action*='offer']"
+    - ".proposal-form form"
+  fields:
+    amount:
+      - "input[name*='amount']"
+      - "input[name*='price']"
+      - "input[name*='budget']"
+      - "input[name*='offer']"
+    description:
+      - "textarea[name*='description']"
+      - "textarea[name*='proposal']"
+      - "textarea[name*='content']"
+      - "textarea[name*='message']"
+      - "textarea"
+    days:
+      - "input[name*='day']"
+      - "input[name*='delivery']"
+      - "input[name*='duration']"
+      - "select[name*='day']"
+  include_hidden: true
+  success_text_contains:
+    - "با موفقیت"
+    - "ثبت شد"
+    - "ارسال شد"
+    - "پیشنهاد شما"
+  failure_text_contains:
+    - "قبلاً پیشنهاد"
+    - "قبلا پیشنهاد"
+    - "اعتبار کافی"
+    - "امکان ارسال"
+    - "خطا"
+    - "مجاز نیست"
+    - "وارد شوید"
+  pre_submit_get: ""
+
+# --- auth -------------------------------------------------------------------
+auth:
+  mode: "cookie"
+  cookie_name: "PHPSESSID"
+  login_path: "/login"
+  submit_path: "/login"
+  username_field: "username"
+  password_field: "password"
+  parse_hidden: true

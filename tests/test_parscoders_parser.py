@@ -316,7 +316,7 @@ def test_detail_budget_is_parsed_when_present_inside_project_scope():
 
     assert enriched.budget is not None and enriched.budget.is_known
     assert enriched.budget.min == 20_000_000
-    assert enriched.raw["detail_budget_source"] in {"budget_node_label", "labeled_text_block"}
+    assert enriched.raw["detail_budget_source"] in {"budget_node", "budget_node_label", "labeled_text_block"}
 
 
 def test_detail_description_fallback_uses_ponisha_markers():

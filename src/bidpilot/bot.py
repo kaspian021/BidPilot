@@ -222,6 +222,7 @@ HELP_TEXT = """<b>BidPilot — راهنما</b>
 /filters — کدام پروژه‌ها بررسی می‌شوند؟ (بودجه، مهارت، کلیدواژه‌ها)
 /mode — جابه‌جایی بین حالت آزمایشی و واقعی
 /test — تست کلید هوش مصنوعی و تلگرام
+/deps — بسته‌های لازم (مثل pypdf برای خواندن PDF) و نصب خودکارشان
 /settings — دیدن مقادیر ذخیره‌شده
 /cancel — لغو پرسش جاری
 
@@ -433,6 +434,8 @@ class BotService:
             await self._cmd_preview(chat_id)
         elif command == "/filters":
             await self._cmd_filters(chat_id)
+        elif command == "/deps":
+            await self._cmd_deps(chat_id)
         elif command == "/test":
             await self._cmd_test(chat_id)
         elif command == "/run":
@@ -504,6 +507,37 @@ class BotService:
 
         await self._consume_answer(chat_id, str(target))
 
+    async def _ensure_pdf_reader(self, chat_id: str) -> bool:
+        """Install ``pypdf`` on the spot instead of telling the user "pip install"."""
+        from .deps import ensure, has, install_command
+
+        if has("pypdf"):
+            return True
+        await self.send(
+            chat_id,
+            "📦 خواندن PDF به بسته‌ی کوچک <code>pypdf</code> نیاز دارد و در این نسخه نصب نیست.\n"
+            "همین حالا خودم نصبش می‌کنم (چند ثانیه)…",
+        )
+        ok, _detail = await asyncio.to_thread(ensure, "pypdf")
+        if ok:
+            await self.send(chat_id, "✅ نصب شد؛ حالا فایل را می‌خوانم…")
+            return True
+        self._note_import_error("pypdf نصب نیست")
+        await self.send(
+            chat_id,
+            "❌ نصب خودکار انجام نشد (اینترنت یا دسترسی نوشتن محیط مجازی).\n\n"
+            "این دستور را در همان پوشه‌ی BidPilot اجرا کن و بعد فایل را دوباره بفرست:\n"
+            f"<code>{escape(install_command('pypdf'))}</code>\n\n"
+            "راه‌های جایگزین بدون نصب: /profile → «لینک گیت‌هاب»، «لینک پورتفولیو» یا «ورود دستی».",
+        )
+        return False
+
+    def _note_import_error(self, message: str) -> None:
+        try:
+            self.store.set("profile.import_error", (message or "خوانده نشد")[:300])
+        except Exception:  # pragma: no cover - read-only store
+            log.warning("Could not store the profile import error")
+
     def _uploads_dir(self):
         from pathlib import Path
 
@@ -523,18 +557,23 @@ class BotService:
         pending = pending_import(self.store)
         if not pending:
             return
+        if pending["type"] == "file" and not await self._ensure_pdf_reader(chat_id):
+            return
         await self.send(chat_id, "🤖 دارم متن را با هوش مصنوعی تحلیل می‌کنم…")
         try:
             result = await run_pending_import(self.store, save_dir=self._uploads_dir())
         except ProfileImportError as exc:
+            self._note_import_error(str(exc))
             await self.send(
                 chat_id,
                 f"⚠️ {escape(str(exc))}\n\n"
-                "می‌توانی دوباره با /profile فایل/لینک بدهی، یا اطلاعات را دستی وارد کنی.",
+                "اطلاعات قبلی پروفایل حفظ شد (چیزی پاک نشد).\n"
+                "می‌توانی دوباره با /profile فایل/لینک بدهی، یا «ورود دستی» را انتخاب کنی.",
             )
             return
         except Exception as exc:  # network, quota, bad config…
             log.exception("Profile import failed")
+            self._note_import_error(f"تحلیل انجام نشد: {exc}")
             await self.send(
                 chat_id,
                 f"⚠️ تحلیل پروفایل انجام نشد: {escape(str(exc))}\n"
@@ -544,6 +583,9 @@ class BotService:
 
         if result is None:  # pragma: no cover - defensive
             return
+        from .profile_import import clear_import_error
+
+        clear_import_error(self.store)
         body = summary_text(result.fields)
         footer = (
             "🤖 استخراج با هوش مصنوعی انجام شد."
@@ -668,6 +710,53 @@ class BotService:
     async def _cmd_stop(self, chat_id: str) -> None:
         ok, message = await self.automation.stop()
         await self.send(chat_id, ("⏸ " if ok else "ℹ️ ") + escape(message), self._run_keyboard())
+
+    # ----------------------------------------------------------- dependencies
+    def _deps_text(self) -> str:
+        from .deps import DEPENDENCIES, has, install_command
+
+        lines = ["<b>📦 بسته‌های لازم</b>", ""]
+        for dep in DEPENDENCIES:
+            ok = has(dep.module)
+            lines.append(f"{'✅' if ok else '❌'} <code>{escape(dep.package)}</code> — {escape(dep.why)}")
+            if not ok:
+                lines.append(f"    <code>{escape(install_command(dep.package))}</code>")
+        if all(has(dep.module) for dep in DEPENDENCIES):
+            lines += ["", "همه‌چیز نصب است؛ نه لازم است کاری کنی."]
+        else:
+            lines += ["", "دکمه‌ی زیر نصب خودکار را انجام می‌دهد (نصب در همان پایتونی که ربات با آن اجرا شده)."]
+        return "\n".join(lines)
+
+    def _deps_keyboard(self) -> dict[str, Any]:
+        from .deps import missing
+
+        rows = [
+            [{"text": f"⬇️ نصب {dep.package}", "callback_data": f"dep:{dep.package}"}] for dep in missing()
+        ]
+        rows.append([{"text": "📊 وضعیت", "callback_data": "cmd:status"}])
+        return {"inline_keyboard": rows}
+
+    async def _cmd_deps(self, chat_id: str) -> None:
+        await self.send(chat_id, self._deps_text(), self._deps_keyboard())
+
+    async def _install_dep(self, chat_id: str, package: str) -> None:
+        from .deps import ensure, has
+
+        module = package.strip()
+        if not module.isidentifier():
+            await self.send(chat_id, "نام بسته نامعتبر است.")
+            return
+        await self.send(chat_id, f"⬇️ دارم <code>{escape(module)}</code> را نصب می‌کنم…")
+        ok, detail = await asyncio.to_thread(ensure, module)
+        if ok or has(module):
+            await self.send(chat_id, "✅ نصب شد.")
+        else:
+            await self.send(
+                chat_id,
+                "❌ نصب خودکار نشد. این دستور را در پوشه‌ی BidPilot اجرا کن:\n"
+                f"<code>{escape(detail[-300:] if detail else '')}</code>",
+            )
+        await self.send(chat_id, self._deps_text(), self._deps_keyboard())
 
     # ---------------------------------------------------------------- filters
     def _filter_view(self) -> tuple[Any, Any]:
@@ -1092,6 +1181,19 @@ class BotService:
             )
             await self._post_setup(chat_id)
             return
+        if flow.name == "profile":
+            error = str(self.store.get("profile.import_error") or "")
+            if error:
+                await self.send(
+                    chat_id,
+                    "⚠️ <b>پروفایل با فایل کامل نشد</b> — اطلاعات قبلی دست‌نخورده ماند.\n"
+                    f"دلیل: {escape(error)}\n\n"
+                    "• دوباره فایل/لینک بفرست: /profile\n"
+                    "• یا دستی وارد کن: /profile → «ورود دستی»",
+                )
+                return
+            await self.send(chat_id, "✅ پروفایل به‌روز شد.\n\n" + status_text(self.store))
+            return
         if flow.name == "style":
             await self.send(
                 chat_id,
@@ -1155,6 +1257,7 @@ class BotService:
             "• /stop توقف ارسال\n"
             "• /mode آزمایشی یا ارسال واقعی\n"
             "• /settings دیدن مقادیر ذخیره‌شده\n"
+            "• /deps نصب بسته‌های لازم (pypdf و…)\n"
             "• /test تست کلید هوش مصنوعی"
         )
 

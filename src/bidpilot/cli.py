@@ -14,6 +14,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
+from . import deps as deps_mod
 from .app import Application, build_application, configure_logging
 from .config import AppConfig, get_secrets, load_config, reset_secret_cache
 from .credentials import site_credentials
@@ -321,6 +322,43 @@ def initdb(config: str = CONFIG_OPTION) -> None:
 
 
 @app.command()
+def deps(
+    install: bool = typer.Option(False, "--install", help="بسته‌های نصب‌نشده را همین حالا نصب کن"),
+) -> None:
+    """بسته‌های اختیاری (مثل pypdf برای خواندن PDF رزومه) نصب هستند یا نه؟"""
+    table = Table(title="Dependencies")
+    table.add_column("بسته")
+    table.add_column("وضعیت")
+    table.add_column("برای چه")
+    for dep in deps_mod.DEPENDENCIES:
+        ok = deps_mod.has(dep.module)
+        table.add_row(
+            dep.package,
+            "[green]OK[/green]" if ok else "[yellow]نصب نشده[/yellow]",
+            escape(dep.why),
+        )
+    console.print(table)
+    missing = deps_mod.missing()
+    if not missing:
+        return
+    for dep in missing:
+        console.print(f"[dim]{escape(deps_mod.install_command(dep.package))}[/dim]")
+    if not install:
+        console.print("\n[bold]bidpilot deps --install[/bold] همین کار را خودکار انجام می‌دهد.")
+        return
+    for dep in missing:
+        console.print(f"[cyan]نصب {dep.package}…[/cyan]")
+        ok, detail = deps_mod.install(dep.package)
+        if ok:
+            console.print(f"[green]{dep.package} نصب شد.[/green]")
+        else:
+            console.print(f"[red]نصب {dep.package} ناموفق بود.[/red]")
+            if detail:
+                console.print(f"[dim]{escape(detail)}[/dim]")
+            raise typer.Exit(code=1)
+
+
+@app.command()
 def doctor(config: str = CONFIG_OPTION) -> None:
     """بررسی سلامت تنظیمات، کلیدها و دسترسی به منابع."""
 
@@ -375,6 +413,15 @@ def doctor(config: str = CONFIG_OPTION) -> None:
         )
 
         row("حالت ارسال", True, "LIVE" if cfg.runtime.live else "DRY-RUN (پیشنهاد ارسال نمی‌شود)")
+
+        missing_deps = deps_mod.missing()
+        row(
+            "بسته‌های اختیاری",
+            not missing_deps,
+            "همه نصب‌اند"
+            if not missing_deps
+            else "نصب نشده: " + "، ".join(dep.package for dep in missing_deps) + " → bidpilot deps --install",
+        )
 
         for name, (ok, detail) in (await application.healthcheck()).items():
             row(f"منبع: {name}", ok, detail)
@@ -434,6 +481,17 @@ def selftest(
             "تنظیمات ذخیره‌شده",
             OK if store.exists else WARN,
             str(store.path) if store.exists else "خالی — با bidpilot setup پر کن",
+        )
+
+        missing_deps = deps_mod.missing()
+        add(
+            "بسته‌های لازم (PDF…)",
+            OK if not missing_deps else WARN,
+            "همه نصب‌اند"
+            if not missing_deps
+            else "نصب نشده: "
+            + "، ".join(dep.package for dep in missing_deps)
+            + " → bidpilot deps --install (یا در تلگرام /deps)",
         )
 
         # ---------------------------------------------------------- telegram

@@ -40,7 +40,13 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "== 5) تست سلامت ==" -ForegroundColor Cyan
+Write-Host "== 5) بسته‌های اختیاری (pypdf برای خواندن PDF رزومه) ==" -ForegroundColor Cyan
+& $venvPython -m bidpilot deps --install
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "نصب pypdf ناموفق بود؛ بعداً با /deps در تلگرام یا «bidpilot deps --install» امتحان کن." -ForegroundColor Yellow
+}
+
+Write-Host "== 6) تست سلامت ==" -ForegroundColor Cyan
 & $venvPython -m bidpilot selftest --offline
 Write-Host "`nآماده است:" -ForegroundColor Green
 Write-Host "  .\.venv\Scripts\activate"

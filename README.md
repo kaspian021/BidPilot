@@ -114,7 +114,12 @@ PARSOCODERS_COOKIE="PHPSESSID=…"        # یا PARSOCODERS_USERNAME/PASSWORD
 3. به ربات خودت `/start` بده؛ `chat_id` خودکار ثبت می‌شود.
 
 از آن به بعد همه‌چیز در چت است: `/status`، `/style`، `/profile`، `/llm`، `/market`،
-`/preview`، `/filters`، `/mode`، `/test`. راهنمای کامل: `bidpilot bot` و `/help`.
+`/preview`، `/filters`، `/deps`، `/mode`، `/test`. راهنمای کامل: `bidpilot bot` و `/help`.
+
+اگر فایل PDF رزومه خوانده نشود، ربات **صادق** می‌ماند: می‌گوید چرا (نصب نبودن `pypdf`،
+اسکن‌شده بودن، رمز داشتن) و «✅ ذخیره شد» نمی‌فرستد؛ اطلاعات قبلی پروفایل هم دست‌نخورده
+می‌ماند و همان فایل در صف می‌ماند تا بعد از رفع مشکل دوباره تلاش شود. برای PDF متنی،
+ربات بسته‌ی `pypdf` را خودش نصب می‌کند (نصب در همان محیط مجازی BidPilot).
 
 **قبل از ارسال واقعی، یک آزمایش بی‌خطر لازم است.** تا وقتی یک `/preview` موفق یا یک دور
 🧪 آزمایشی کامل نشود، `/run` در حالت 🔴 واقعی باز نمی‌شود؛ این‌طور پیشنهادِ ناقص روی حساب
@@ -356,7 +361,7 @@ python -m pip install -e ".[dev]"
 py -3.12 -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install httpx pydantic pydantic-settings sqlalchemy aiosqlite jinja2 typer rich `
-  tenacity beautifulsoup4 lxml python-dateutil jdatetime orjson PyYAML
+  tenacity beautifulsoup4 lxml python-dateutil jdatetime orjson PyYAML pypdf
 $env:PYTHONPATH="src"
 python -m bidpilot selftest --offline
 python -m bidpilot setup
@@ -376,6 +381,7 @@ python -m bidpilot setup
 | `صفحه لیست باز شد اما هیچ پروژه‌ای…` | ظاهر سایت عوض شده: `bidpilot inspect -s <site>` و اصلاح `sources/<site>/config.yaml` |
 | `نشست منقضی شده` | کوکی `PHPSESSID` را تازه کن: `/market` → روش کوکی |
 | `فرم ارسال پیشنهاد پیدا نشد` | قبلاً برای این پروژه پیشنهاد داده‌ای یا سلکتورها عوض شده‌اند |
+| `بسته‌ی pypdf برای خواندن PDF نصب نیست` | ربات خودش نصبش می‌کند؛ اگر نشد در تلگرام `/deps` یا `bidpilot deps --install` (هر دو روی همان پایتونی که ربات با آن اجرا شده نصب می‌کنند) یا `/profile` → لینک گیت‌هاب/پورتفولیو/ورود دستی |
 
 پیش از هر تست واقعی، یک بکاپ از `data/settings.json` بگیر (همه‌ی اعتبارنامه‌ها همان‌جاست)
 و مطمئن شو `runtime.submit_mode` روی `dry_run` است تا وقتی خودت نخواهی چیزی ارسال نشود.

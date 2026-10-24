@@ -77,7 +77,7 @@ def build_prompts(
     # Project content is retrieved from an external marketplace and can contain
     # prompt injection. Prevent it from closing the explicit data boundary below.
     project_text = re.sub(
-        r"</?UNTRUSTED_PROJECT_DATA\\s*>",
+        r"</?UNTRUSTED_PROJECT_DATA\s*>",
         "[علامت مرزی حذف شد]",
         truncate(project.text_for_llm, 7_000),
         flags=re.IGNORECASE,

@@ -162,6 +162,12 @@ class LLMConfig(BaseModel):
     #: tokens per minute to stay under (0 = take the provider preset's value).
     #: Free Groq keys allow 8,000/min; the client waits instead of getting 429s.
     tokens_per_minute: int = 0
+    #: forward LLM traffic through a local proxy (e.g. V2Ray on 127.0.0.1:10809).
+    #: Groq answers HTTP 403 to Iranian IPs, so this is often the only way in.
+    proxy: str = ""
+    #: reasoning models (gpt-oss, qwen3…) spend output tokens thinking; "low"
+    #: keeps that cheap. Empty = keep the provider default.
+    reasoning_effort: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -303,7 +309,16 @@ STORE_CONFIG_SECTIONS: dict[str, tuple[str, ...]] = {
         "max_chars",
         "max_emoji",
     ),
-    "llm": ("provider", "base_url", "model", "fallbacks"),
+    "llm": (
+        "provider",
+        "base_url",
+        "model",
+        "fallbacks",
+        "proxy",
+        "reasoning_effort",
+        "tokens_per_minute",
+        "max_tokens",
+    ),
     "filters": (
         "include_keywords",
         "exclude_keywords",

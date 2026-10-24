@@ -10,6 +10,15 @@ the client does two things a naive wrapper does not:
 * when a 429 does happen anyway, it waits exactly as long as the provider asks
   (``retry-after`` / ``x-ratelimit-reset-tokens`` / ``try again in 7.66s``)
   rather than retrying in 1.5 seconds.
+
+It also understands *reasoning* models (Groq's ``gpt-oss-*``, ``qwen3*``…):
+they spend output tokens thinking, so a small ``max_tokens`` produces a
+``finish_reason=length`` answer whose ``content`` is **empty** — which used to
+surface as "the model returned no valid JSON" and made the whole AI search fall
+back to CSS selectors. Here that case is detected, retried with more room, and
+reported as what it is. Iranian users also hit ``403 Forbidden`` because Groq
+blocks the country at the IP level; the client therefore accepts an explicit
+proxy, so the key keeps working through the user's VPN.
 """
 
 from __future__ import annotations
@@ -20,6 +29,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
@@ -48,6 +58,19 @@ class LLMError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = True) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class EmptyCompletionError(LLMError):
+    """The provider answered, but ``content`` was empty.
+
+    With reasoning models this usually means the token budget was consumed by
+    the hidden reasoning pass, so ``finish_reason`` is ``length``.
+    """
+
+    def __init__(self, message: str, *, finish_reason: str = "", truncated: bool = False) -> None:
+        super().__init__(message, retryable=True)
+        self.finish_reason = finish_reason
+        self.truncated = truncated
 
 
 class RateLimitError(LLMError):
@@ -133,6 +156,8 @@ class LLMClient:
         extra_headers: dict[str, str] | None = None,
         max_retries: int = 2,
         tokens_per_minute: int = 0,
+        proxy: str = "",
+        reasoning_effort: str = "",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -145,13 +170,20 @@ class LLMClient:
         self.max_retries = max_retries
         #: 0 = unlimited (local models). Groq free tier = 8,000/min.
         self.tokens_per_minute = max(0, int(tokens_per_minute))
+        #: e.g. http://127.0.0.1:10809 — needed where the provider blocks the country
+        self.proxy = (proxy or "").strip()
+        #: "low"/"medium"/"high" for reasoning models; empty = provider default
+        self.reasoning_effort = (reasoning_effort or "").strip().lower()
         self._client = client
         self._budget_key = f"{self.base_url}|{self.model}"
         self._spent = _BUDGETS.setdefault(self._budget_key, deque())
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            kwargs: dict[str, Any] = {"timeout": self.timeout}
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+            self._client = httpx.AsyncClient(**kwargs)
         return self._client
 
     async def aclose(self) -> None:
@@ -224,13 +256,16 @@ class LLMClient:
         }
         if response_format:
             payload["response_format"] = response_format
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         client = await self._get_client()
         last_error: Exception | None = None
         started = time.monotonic()
         reserved = estimate_tokens(system) + estimate_tokens(user) + wants
         spend: _Spend | None = None
+        attempt = 0
 
-        for attempt in range(self.max_retries + 1):
+        while True:
             try:
                 spend = await self._reserve(reserved)
                 response = await client.post(
@@ -252,20 +287,41 @@ class LLMClient:
 
                 data = response.json()
                 choice = (data.get("choices") or [{}])[0]
-                text = (choice.get("message") or {}).get("content", "")
-                if not text or not text.strip():
-                    raise LLMError("LLM returned an empty completion")
+                message = choice.get("message") or {}
+                text = message.get("content") or ""
+                finish = str(choice.get("finish_reason") or "")
+                if not text.strip():
+                    thoughts = str(message.get("reasoning") or message.get("reasoning_content") or "")
+                    if finish == "length" or thoughts:
+                        raise EmptyCompletionError(
+                            "مدل بودجه‌ی خروجی را با «استدلال» تمام کرد و پاسخ خالی ماند "
+                            f"(finish_reason={finish or '—'}, max_tokens={wants})",
+                            finish_reason=finish,
+                            truncated=finish == "length" or bool(thoughts),
+                        )
+                    raise EmptyCompletionError("پاسخ مدل خالی بود", finish_reason=finish)
                 result = LLMResponse(
                     text=text.strip(),
                     model=data.get("model", self.model),
                     latency_ms=int((time.monotonic() - started) * 1000),
                     usage=data.get("usage", {}) or {},
-                    finish_reason=str(choice.get("finish_reason") or ""),
+                    finish_reason=finish,
                 )
                 self._settle(spend, result, reserved)
                 return result
             except (httpx.HTTPError, LLMError, ValueError) as exc:
                 last_error = exc
+                if isinstance(exc, EmptyCompletionError) and exc.truncated and wants < 3_200:
+                    # a reasoning model ate the output budget: give it room and go
+                    # again — this is not a network retry, so it has its own counter
+                    wants = min(wants * 2, 4_000)
+                    payload["max_tokens"] = wants
+                    reserved = estimate_tokens(system) + estimate_tokens(user) + wants
+                    log.info(
+                        "LLM answered empty because it ran out of output tokens; retrying with max_tokens=%s",
+                        wants,
+                    )
+                    continue
                 if not getattr(exc, "retryable", True):
                     break
                 if attempt < self.max_retries:
@@ -275,8 +331,19 @@ class LLMClient:
                     sleep_for = min(sleep_for, 65.0)
                     log.warning("LLM call failed (%s); retrying in %.1fs", exc, sleep_for)
                     await asyncio.sleep(sleep_for)
+                    attempt += 1
+                    continue
+                break
 
-        raise LLMError(f"LLM call failed after {self.max_retries + 1} attempts: {last_error}")
+        raise LLMError(f"LLM call failed: {last_error}")
 
 
-__all__ = ["LLMClient", "LLMError", "LLMResponse", "RateLimitError", "estimate_tokens"]
+__all__ = [
+    "EmptyCompletionError",
+    "LLMClient",
+    "LLMError",
+    "LLMResponse",
+    "RateLimitError",
+    "estimate_tokens",
+    "reset_token_budgets",
+]

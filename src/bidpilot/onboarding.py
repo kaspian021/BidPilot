@@ -228,6 +228,55 @@ def llm_questions(store: SettingsStore) -> list[Question]:
     ]
 
 
+def validate_proxy(value: Any) -> str | None:
+    """Persian error for a proxy URL that httpx cannot use (or None when fine)."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"off", "none", "خاموش", "بدون"}:
+        return None
+    if "://" not in text:
+        text = "http://" + text
+    scheme = text.split("://", 1)[0].lower()
+    if scheme not in {"http", "https", "socks5", "socks5h", "socks4"}:
+        return "پروکسی باید با http:// یا socks5:// شروع شود (مثلاً http://127.0.0.1:10809)."
+    host = text.split("://", 1)[1]
+    if not host or host.startswith("/"):
+        return "آدرس پروکسی ناقص است؛ شکل درست: http://127.0.0.1:10809"
+    if scheme.startswith("socks5") and "socksio" not in _installed_modules():
+        return (
+            "برای پروکسی socks5 بسته‌ی socksio لازم است. ساده‌تر: پورت HTTP همان برنامه "
+            "(مثلاً 10809 در V2Ray/Clash) را بده: http://127.0.0.1:10809"
+        )
+    return None
+
+
+def _installed_modules() -> set[str]:
+    import importlib.util
+
+    return {name for name in ("socksio",) if importlib.util.find_spec(name) is not None}
+
+
+def proxy_questions(store: SettingsStore) -> list[Question]:
+    """LLM proxy — the fix when Groq answers 403 because of the user's country."""
+    return [
+        Question(
+            key="llm.proxy",
+            prompt="پروکسی برای هوش مصنوعی (اختیاری)",
+            kind="text",
+            stage="llm",
+            optional=True,
+            validator=validate_proxy,
+            help=(
+                "اگر سرویس هوش مصنوعی ۴۰۳ (Forbidden) می‌دهد، معمولاً IP شما را بلاک کرده. "
+                "آدرس پروکسی/VPN محلی را بده؛ مثلاً http://127.0.0.1:10809 "
+                "(V2Ray/Clash پورت HTTP). برای خاموش‌کردن: off"
+            ),
+        )
+    ]
+
+
 #: Persian labels/descriptions for the built-in marketplaces.
 SITE_LABELS: dict[str, tuple[str, str]] = {
     "parscoders": ("پارس‌کدرز (parscoders.com)", "بزرگ‌ترین بازار پروژه‌های برنامه‌نویسی ایران"),
@@ -771,6 +820,17 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
         # the actual analysis happens in the async layer (bot / terminal wizard)
         import_kind = "file" if key == "profile.resume_path" else "url"
         store.update({key: value, "profile.import_pending": {"type": import_kind, "value": value}})
+        reset_secret_cache()
+        return
+    if key == "llm.proxy":
+        text = str(value or "").strip()
+        if text.lower() in {"off", "none", "خاموش", "بدون", "-"}:
+            store.update({"llm.proxy": None})
+            reset_secret_cache()
+            return
+        if text and "://" not in text:
+            text = "http://" + text
+        store.update({"llm.proxy": text or None})
         reset_secret_cache()
         return
     if key == "pricing.bid_percent":

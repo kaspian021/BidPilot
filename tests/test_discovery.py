@@ -498,3 +498,46 @@ def test_provider_errors_become_actionable_persian():
     assert "/llm" in key
 
     assert "چیز عجیبی" in friendly_llm_error("چیز عجیبی")
+
+
+def test_a_403_is_explained_as_a_country_block():
+    from bidpilot.sources.discovery import friendly_llm_error
+
+    text = friendly_llm_error('LLM rejected the request (HTTP 403): {"error":{"message":"Forbidden"}}')
+
+    assert "پروکسی" in text or "VPN" in text
+    assert "/proxy" in text  # a next step, not just a complaint
+
+
+def test_an_empty_reasoning_answer_is_explained():
+    from bidpilot.sources.discovery import friendly_llm_error
+
+    text = friendly_llm_error("مدل بودجه‌ی خروجی را با «استدلال» تمام کرد و پاسخ خالی ماند")
+
+    assert "استدلال" in text
+    assert "gpt-oss-20b" in text
+
+
+async def test_a_failed_search_is_not_retried_every_cycle(monkeypatch):
+    """A blocked provider must not be hammered on every 120-second poll."""
+    attempts: list[str] = []
+
+    class Blocked(ScriptedLLM):
+        async def complete(self, *args, **kwargs):
+            attempts.append("call")
+            raise RuntimeError('LLM rejected the request (HTTP 403): {"error":{"message":"Forbidden"}}')
+
+    source = make_source(Blocked(), monkeypatch)
+    source.settings["discovery"] = {"mode": "auto", "seed_paths": ["/"], "failure_cooldown_seconds": 900}
+    try:
+        await source.fetch_projects()
+        assert source.last_discovery_error
+        calls_after_first = len(attempts)
+
+        # the next cycles are inside the cooldown: selectors only, no model calls
+        await source.fetch_projects()
+        await source.fetch_projects()
+        assert len(attempts) == calls_after_first
+        assert source.ai_discovery_enabled() is False
+    finally:
+        await source.aclose()

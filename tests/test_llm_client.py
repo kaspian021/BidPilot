@@ -182,3 +182,74 @@ def test_rate_limit_error_carries_the_hint():
     error = RateLimitError("429", retry_after=12.5)
     assert error.retry_after == 12.5
     assert error.retryable is True
+
+
+# ---------------------------------------------------------------------------
+# Reasoning models (Groq gpt-oss): empty content is *truncation*, not a bad key
+# ---------------------------------------------------------------------------
+async def test_an_empty_reasoning_answer_gets_more_room(sleeps):
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        seen.append(payload)
+        if len(seen) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"content": "", "reasoning": "خب باید فکر کنم…"},
+                            "finish_reason": "length",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"action": "done"}'}, "finish_reason": "stop"}]},
+        )
+
+    client = make_client(handler, reasoning_effort="low")
+    response = await client.complete("sys", "user", max_tokens=220)
+
+    assert response.text == '{"action": "done"}'
+    assert [p["max_tokens"] for p in seen] == [220, 440]
+    assert seen[0]["reasoning_effort"] == "low"
+    await client.aclose()
+
+
+async def test_a_genuinely_empty_answer_still_fails():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "   "}, "finish_reason": "stop"}]}
+        )
+
+    client = make_client(handler, max_retries=0)
+    with pytest.raises(LLMError):
+        await client.complete("sys", "user")
+
+    await client.aclose()
+
+
+async def test_the_proxy_is_used_for_the_connection():
+    client = LLMClient("https://llm.test/v1", "key", "test-model", proxy="http://127.0.0.1:10809")
+    http = await client._get_client()
+
+    assert http._mounts, "httpx must be given a proxy mount"
+    assert len(http._mounts) == 1  # a proxy transport is mounted for every scheme
+    await client.aclose()
+
+
+def test_build_client_carries_proxy_and_low_effort_for_reasoning_models():
+    from bidpilot.config import LLMConfig
+    from bidpilot.llm_providers import LLMProvider, build_client, resolve_chain
+
+    config = LLMConfig(provider="groq", proxy="http://127.0.0.1:10809")
+    provider = resolve_chain(config, {}, legacy_key="key")[0]
+    assert isinstance(provider, LLMProvider)
+    client = build_client(provider, config)
+
+    assert client.proxy == "http://127.0.0.1:10809"
+    assert client.reasoning_effort == "low"
+    assert client.tokens_per_minute == 7000

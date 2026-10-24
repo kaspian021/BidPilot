@@ -7,11 +7,13 @@ contract (listing -> detail enrichment -> form submit -> success detection).
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 
 from bidpilot.config import AppConfig, Profile, RuntimeConfig, Secrets
 from bidpilot.credentials import SiteCredentials
 from bidpilot.models import Budget, Project, Proposal
+from bidpilot.sources.base import SourceError
 from bidpilot.sources.parscoders.adapter import ParscodersSource
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -191,4 +193,59 @@ async def test_verify_session_does_not_treat_generic_account_text_as_login_proof
 
     assert ok is False
     assert "ورود" in message or "کوکی" in message
+    await source.aclose()
+
+
+@respx.mock
+async def test_get_html_retries_transient_server_disconnect():
+    calls = {"count": 0}
+
+    def flaky_response(request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response")
+        return httpx.Response(200, text="<html>ok</html>")
+
+    route = respx.get("https://parscoders.com/project").mock(side_effect=flaky_response)
+    source = make_source()
+
+    html = await source.get_html("/project")
+
+    assert html == "<html>ok</html>"
+    assert route.call_count == 2
+    await source.aclose()
+
+
+@respx.mock
+async def test_get_html_reports_exception_type_when_transport_error_message_is_empty():
+    def always_disconnect(request):
+        raise httpx.RemoteProtocolError("")
+
+    route = respx.get("https://parscoders.com/project").mock(side_effect=always_disconnect)
+    source = make_source()
+
+    with pytest.raises(SourceError) as raised:
+        await source.get_html("/project")
+
+    assert route.call_count == 3
+    assert "RemoteProtocolError" in str(raised.value)
+    await source.aclose()
+
+
+@respx.mock
+async def test_detail_html_is_cached_between_poll_cycles():
+    list_route = respx.get("https://parscoders.com/project").mock(
+        return_value=httpx.Response(200, text=LIST_HTML)
+    )
+    detail_route = respx.get(url__regex=r"https://parscoders\\.com/project/\\d+").mock(
+        return_value=httpx.Response(200, text=PROJECT_HTML)
+    )
+    source = make_source(list={"fetch_details": True, "detail_concurrency": 2})
+
+    first = await source.fetch_projects()
+    second = await source.fetch_projects()
+
+    assert len(first) == 3 and len(second) == 3
+    assert list_route.call_count == 2
+    assert detail_route.call_count == 3
     await source.aclose()

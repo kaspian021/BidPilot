@@ -132,3 +132,63 @@ def test_detail_page_budget_fallback():
     enriched = parser.enrich_from_detail(html, project, settings)
     assert enriched.budget is not None and enriched.budget.is_known
     assert enriched.budget.min == 1_000_000 and enriched.budget.max == 2_000_000
+
+
+def test_diagnostics_log_raw_card_and_detail_budget_evidence(caplog):
+    import logging
+
+    from bidpilot.sources.html_parser import enrich_from_detail, parse_list_page
+
+    list_html = """
+    <html><body>
+      <article class="project-list-item">
+        <h2><a href="/project/9001">ساخت فروشگاه اینترنتی با وردپرس</a></h2>
+        <p>اتصال درگاه پرداخت و طراحی صفحه محصول</p>
+        <div class="meta">بودجه: ۲۰,۰۰۰,۰۰۰ تا ۴۰,۰۰۰,۰۰۰ تومان</div>
+      </article>
+    </body></html>
+    """
+    list_settings = {
+        "card_selectors": ["article.project-list-item"],
+        "id_regex": r"/project/(\\d+)",
+        "fields": {
+            "title": ["h2 a"],
+            "link": ["h2 a"],
+            "budget": [".missing-budget-selector"],
+            "description": ["p"],
+        },
+        "_diagnostics": True,
+    }
+
+    with caplog.at_level(logging.INFO, logger="bidpilot.sources.html_parser"):
+        projects = parse_list_page(list_html, list_settings, "ponisha", "https://ponisha.ir")
+
+        detail_html = """
+        <html><body>
+          <h1>ساخت فروشگاه اینترنتی با وردپرس</h1>
+          <div class="description">اتصال درگاه پرداخت و طراحی صفحه محصول با جزئیات کامل پروژه.</div>
+          <section class="metadata">بودجه: ۲۰,۰۰۰,۰۰۰ تا ۴۰,۰۰۰,۰۰۰ تومان</section>
+          <p>مدت زمان مورد نظر کارفرما: ۱۰ روز</p>
+        </body></html>
+        """
+        enriched = enrich_from_detail(
+            detail_html,
+            projects[0],
+            {
+                "detail_fields": {
+                    "description": [".description"],
+                    "budget": [".missing-budget-selector"],
+                    "skills": [],
+                },
+                "_diagnostics": True,
+            },
+        )
+
+    assert len(projects) == 1
+    assert enriched.budget is not None and enriched.budget.is_known
+    assert enriched.budget.min == 20_000_000 and enriched.budget.max == 40_000_000
+    assert enriched.raw["detail_budget_source"] == "detail_page_text"
+    assert "[PARSER][CARD-TEXT]" in caplog.text
+    assert "[PARSER][DETAIL-TEXT]" in caplog.text
+    assert "بودجه: ۲۰,۰۰۰,۰۰۰ تا ۴۰,۰۰۰,۰۰۰ تومان" in caplog.text
+    assert "detail_budget_source" not in caplog.text or "detail_page_text" in caplog.text

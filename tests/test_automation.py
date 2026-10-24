@@ -365,7 +365,6 @@ async def test_live_automation_refuses_to_start_without_a_valid_session(env, tmp
     assert "جست‌وجو و ارسال پیشنهاد شروع نشد" in notes[0]
 
 
-
 async def test_automation_on_report_stops_when_javascript_is_required(env):
     notes = []
 

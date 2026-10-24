@@ -60,8 +60,8 @@ def _javascript_required_message(site_notice: str = "") -> str:
         else "سایت اجرای JavaScript در مرورگر را لازم دانست."
     )
     return (
-        f"{detail} BidPilot در این اتصال HTTP مستقیم کار می‌کند و JavaScript اجرا نمی‌کند؛ "
-        "رصد خودکار متوقف شد. ثبت پیشنهاد تأیید نشده است."
+        f"{detail} BidPilot در این اتصال HTTP مستقیم کار می‌کند و JavaScript "
+        "اجرا نمی‌کند؛ رصد خودکار متوقف شد. ثبت پیشنهاد تأیید نشده است."
     )
 
 

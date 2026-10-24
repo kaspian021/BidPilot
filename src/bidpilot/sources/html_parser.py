@@ -1314,7 +1314,9 @@ def extract_response_notices(html: str) -> list[str]:
 
 def requires_javascript(html: str) -> bool:
     """Detect an explicit site message requiring browser-side JavaScript."""
-    text = _normalized_marker(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    text = _normalized_marker(
+        BeautifulSoup(html or "", "lxml").get_text(" ", strip=True)
+    )
     has_javascript = "javascript" in text or "جاوا اسکریپت" in text
     persian_disabled = has_javascript and any(
         marker in text for marker in ("غیر فعال", "غیرفعال", "فعال نیست")

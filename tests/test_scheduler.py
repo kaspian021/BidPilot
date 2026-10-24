@@ -85,7 +85,6 @@ async def test_scheduler_stops_after_a_report_marks_authentication_failed(tmp_pa
     assert scheduler._stop.is_set()
 
 
-
 async def test_scheduler_stops_after_a_report_requires_javascript(tmp_path):
     class JavaScriptReport:
         source = "parscoders"

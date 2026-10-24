@@ -137,11 +137,18 @@ class Application:
                 )
             )
             return
-        javascript_failures = [r for r in reports if getattr(r, "javascript_required", False)]
+        javascript_failures = [
+            r for r in reports if getattr(r, "javascript_required", False)
+        ]
         if javascript_failures:
             source = javascript_failures[0].source or "marketplace"
             detail = next(
-                (str(error) for report in javascript_failures for error in report.errors if str(error).strip()),
+                (
+                    str(error)
+                    for report in javascript_failures
+                    for error in report.errors
+                    if str(error).strip()
+                ),
                 "سایت اجرای JavaScript در مرورگر را لازم دانست.",
             )
             await self.notifiers.dispatch(

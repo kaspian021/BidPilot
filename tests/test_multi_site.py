@@ -306,7 +306,6 @@ class _ReadyCreds:
     summary = "کوکی ثبت شده"
 
 
-
 async def test_http_diagnostics_log_redirects_without_query_values(caplog):
     import logging
 

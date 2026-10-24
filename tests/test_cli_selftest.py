@@ -68,3 +68,32 @@ def test_selftest_rejects_an_unregistered_site(tmp_path, monkeypatch):
     )
     assert result.exit_code != 0
     assert "ثبت نشده" in result.output
+
+
+def test_explore_shows_what_the_agent_read_without_network(tmp_path, monkeypatch):
+    """`bidpilot explore` must show the projects and the trace, not just a count."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BIDPILOT_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    from bidpilot.settings_store import get_store, reset_store_cache
+
+    reset_store_cache()
+    get_store().set("marketplace.name", "mock")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["explore", "-s", "mock", "-n", "2", "-c", str(ROOT / "config" / "config.yaml")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "سایت آزمایشی" in result.output
+    assert "ساخت ربات تلگرام" in result.output
+    assert "بودجه" in result.output
+
+
+def test_explore_rejects_an_unknown_site(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["explore", "-s", "nope"])
+
+    assert result.exit_code != 0
+    assert "ثبت نشده" in result.output

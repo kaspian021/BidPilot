@@ -28,6 +28,7 @@ from .proposals.generator import ProposalError, ProposalGenerator
 from .ratelimit import RateLimiter
 from .repositories import Repository
 from .sources.base import Source
+from .text import parse_days
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ class RunReport:
     proposed: list[str] = field(default_factory=list)
     #: the real reason the LLM failed (shown to the user instead of "template")
     llm_error: str = ""
+    #: pages the AI read while discovering projects (0 = selector mode)
+    ai_pages: int = 0
+    ai_calls: int = 0
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def has_news(self) -> bool:
@@ -70,6 +74,10 @@ class RunReport:
             lines.append(f"⏭ {count}× {reason}")
         if self.errors:
             lines.append(f"⚠️ {len(self.errors)} خطا: {self.errors[0][:120]}")
+        if self.ai_pages:
+            lines.append(
+                f"🧭 جست‌وجوی هوشمند: {self.ai_pages} صفحه خوانده شد ({self.ai_calls} درخواست به مدل)"
+            )
         if self.llm_error:
             lines.append(f"🤖 هوش مصنوعی جواب نداد: {self.llm_error[:160]}")
             lines.append("متن‌ها از قالب ساخته شدند — /test و /llm را ببین.")
@@ -129,6 +137,10 @@ class BidPipeline:
         try:
             projects = await source.fetch_projects()
             report.fetched = len(projects)
+            discovery = getattr(source, "last_discovery", None)
+            if discovery is not None:
+                report.ai_pages = int(getattr(discovery, "pages_read", 0) or 0)
+                report.ai_calls = int(getattr(discovery, "llm_calls", 0) or 0)
             for project in projects[: self.max_projects]:
                 try:
                     await self.process_project(project, report)
@@ -180,6 +192,10 @@ class BidPipeline:
 
         amount = pricing.amount
         delivery = self.delivery_days
+        # respect the timeline the employer asked for (never exceed it)
+        hint = parse_days(project.employer_deadline)
+        if hint and hint < delivery:
+            delivery = hint
 
         # 4) proposal
         try:

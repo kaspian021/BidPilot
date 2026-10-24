@@ -985,7 +985,10 @@ class BotService:
         await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
 
     async def _cmd_preview(self, chat_id: str) -> None:
-        await self.send(chat_id, "⏳ در حال گرفتن یک پروژه و نوشتن پیشنهاد نمونه…")
+        await self.send(
+            chat_id,
+            "🔎 دارم داخل سایت می‌گردم؛ فهرست پروژه‌ها را می‌خوانم و پروژه‌های مرتبط با تخصصت را باز می‌کنم…",
+        )
         try:
             messages = await self._generate_preview(limit=1)
         except Exception as exc:
@@ -995,7 +998,7 @@ class BotService:
             await self.send(
                 chat_id,
                 "پروژه‌ای برای پیش‌نمایش پیدا نشد (یا همه با فیلترها/بودجه رد شدند).\n"
-                "برای دیدن دلیل رد شدن‌ها: /filters",
+                "برای دیدن دلیل رد شدن‌ها و روشن/خاموش کردن قاعده‌ها: /filters",
             )
             return
         mark_preview_ok(self.store, "preview", note=messages[-1][:200])
@@ -1034,21 +1037,50 @@ class BotService:
             generator = application.generator
             delivery = int(cfg.pricing.get("delivery_days", 14))
             messages: list[str] = []
+
+            notes = self._discovery_note(source, len(projects))
+            if notes:
+                messages.append(notes)
+
+            rejected: dict[str, int] = {}
+            filter_preview = application.filter_preview()
+            proposals = 0
             for project in projects:
-                if len(messages) >= limit:
+                if proposals >= limit:
                     break
-                if not application.filter_preview().evaluate(project):
+                decision = filter_preview.evaluate(project)
+                if not decision:
+                    key = decision.reason.split("—")[0].strip()[:90]
+                    rejected[key] = rejected.get(key, 0) + 1
                     continue
                 price = pricing.price(project, project.budget)
                 if price is None:
+                    key = "قیمت‌گذاری ممکن نبود (بودجه نامشخص)"
+                    rejected[key] = rejected.get(key, 0) + 1
                     continue
-                proposal = await generator.generate(project, price.amount, delivery)  # type: ignore[union-attr]
+                from .text import parse_days
+
+                hint = parse_days(project.employer_deadline)
+                bid_delivery = min(delivery, hint) if hint else delivery
+                proposal = await generator.generate(project, price.amount, bid_delivery)  # type: ignore[union-attr]
+                deadline_line = (
+                    f"⏱ کارفرما: {escape(project.employer_deadline)} | پیشنهاد من: {bid_delivery} روز"
+                    if project.employer_deadline
+                    else f"⏱ {bid_delivery} روز"
+                )
+                proposals += 1
                 messages.append(
                     "🧪 <b>پیش‌نمایش پیشنهاد</b>\n"
                     f"<b>{escape(project.title)}</b>\n"
-                    f"💵 {price.amount:,} تومان | ⏱ {delivery} روز | 🤖 {escape(proposal.generated_by)}\n\n"
+                    f"💵 {price.amount:,} تومان | {deadline_line} | 🤖 {escape(proposal.generated_by)}\n"
+                    f"🔗 {escape(project.url)}\n\n"
                     f"<pre>{escape(proposal.text)}</pre>"
                 )
+            if proposals == 0 and rejected:
+                lines = ["⚠️ <b>هیچ پروژه‌ای از فیلترها نگذشت</b>"]
+                lines += [f"• {count}× {escape(reason)}" for reason, count in rejected.items()]
+                lines.append("/filters — قاعده‌ها را ببین یا موقتاً خاموش کن.")
+                messages.append("\n".join(lines))
             reason = str(getattr(generator, "last_llm_error", "") or "")
             if messages and reason:
                 # The template fallback is silent by design; the *reason* must not be.
@@ -1061,6 +1093,33 @@ class BotService:
             return messages
         finally:
             await application.close()
+
+    @staticmethod
+    def _discovery_note(source: Any, project_count: int) -> str:
+        """Tell the user what the agent really did — «AI searched» must be verifiable."""
+        result = getattr(source, "last_discovery", None)
+        error = str(getattr(source, "last_discovery_error", "") or "")
+        if result is not None and project_count:
+            return (
+                "🧭 <b>جست‌وجوی هوشمند در سایت</b>\n"
+                f"• {result.pages_read} صفحه خوانده شد، {len(result.visited)} آدرس باز شد\n"
+                f"• {project_count} پروژه پیدا شد ({result.llm_calls} درخواست به مدل)\n"
+                "<i>مدل خودش فهرست‌ها و صفحه‌ی پروژه‌ها را با حساب تو خوانده است.</i>"
+            )
+        if error:
+            # a failed search must not be reported as «nothing found»
+            return (
+                "⚠️ <b>جست‌وجوی هوشمند انجام نشد</b> — با سلکتورهای ثابت سایت ادامه دادم.\n"
+                f"<pre>{escape(error[:500])}</pre>"
+                "/test یا /llm را ببین."
+            )
+        if result is not None:
+            return (
+                "🧭 <b>جست‌وجوی هوشمند در سایت</b>\n"
+                f"• {result.pages_read} صفحه خوانده شد، {result.llm_calls} درخواست به مدل\n"
+                "• صفحه‌ها را خواندم ولی پروژه‌ی مرتبطی پیدا نشد."
+            )
+        return ""
 
     # ----------------------------------------------------------------- flows
     async def _start_flow(

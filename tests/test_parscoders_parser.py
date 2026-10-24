@@ -203,6 +203,14 @@ def test_fallback_cards_keeps_budget_and_description_siblings_together():
         <div class="budget-label">بودجه: ۲ میلیون تومان</div>
         <div class="skills">مهارت‌ها: Python</div>
       </section>
+      <section class="listing-row">
+        <div class="title"><h2><a href="/project/556">ساخت وب‌سایت شرکتی</a></h2></div>
+        <div class="description"><p>طراحی چند صفحه‌ی شرکتی با نمایش مناسب موبایل.</p></div>
+      </section>
+      <section class="listing-row">
+        <div class="title"><h2><a href="/project/557">ساخت پنل مدیریتی</a></h2></div>
+        <div class="description"><p>پیاده‌سازی پنل مدیریت و گزارش‌های کاربردی.</p></div>
+      </section>
     </body></html>
     """
     settings = {
@@ -219,7 +227,7 @@ def test_fallback_cards_keeps_budget_and_description_siblings_together():
 
     projects = parser.parse_list_page(html, settings, "ponisha", "https://ponisha.ir")
 
-    assert len(projects) == 1
+    assert len(projects) == 3
     assert projects[0].external_id == "555"
     assert "پنل مدیریت" in projects[0].description
     assert projects[0].budget is not None and projects[0].budget.is_known

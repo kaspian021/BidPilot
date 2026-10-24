@@ -745,7 +745,9 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
             budget_text = evidence or found.source_text or budget_text
             budget_origin = "detail_page_text" if origin == "labeled_text_block" else origin
         else:
-            budget_origin = "not_found" if scope is not None or not require_project_scope else "no_project_scope"
+            budget_origin = (
+                "not_found" if scope is not None or not require_project_scope else "no_project_scope"
+            )
 
     if not description:
         fallback_cfg = settings.get("description_fallback") or {}

@@ -434,7 +434,7 @@ def digest_html(
     text = primary_text
     for line in metadata_lines:
         if len(text) + len(line) + 1 <= max_text:
-            text = text + ("\\n" if text else "") + line
+            text = text + ("\n" if text else "") + line
 
     if not text:
         text = clean_text(body.get_text(" ", strip=True))[:max_text]

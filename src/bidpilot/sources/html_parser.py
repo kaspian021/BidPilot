@@ -128,8 +128,6 @@ _BUDGET_RANGE_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 
-
-
 _DESCRIPTION_END_MARKERS = (
     "مهارت‌های مورد نیاز",
     "مهارت های مورد نیاز",

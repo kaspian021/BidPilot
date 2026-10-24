@@ -164,11 +164,53 @@ class BidPipeline:
             return None
 
         # 2) filtering
+        budget_debug = project.budget.model_dump() if project.budget else None
+        raw = project.raw or {}
+        log.info(
+            "[PIPELINE][CANDIDATE] source=%s id=%s title=%r url=%s "
+            "budget=%r raw_budget_text=%r detail_budget_selector_text=%r "
+            "detail_budget_text_used=%r detail_budget_source=%r skills=%r "
+            "category=%r deadline=%r description_chars=%s",
+            project.source,
+            project.external_id,
+            project.title,
+            project.url,
+            budget_debug,
+            raw.get("budget_text", ""),
+            raw.get("detail_budget_selector_text", ""),
+            raw.get("detail_budget_text_used", ""),
+            raw.get("detail_budget_source", ""),
+            project.skills,
+            project.category,
+            project.employer_deadline,
+            len(project.description or ""),
+        )
         decision = self.project_filter.evaluate(project)
+        log.info(
+            "[PIPELINE][FILTER] source=%s id=%s title=%r allowed=%s reason=%r "
+            "require_budget=%s require_skill_match=%s profile_skills=%r",
+            project.source,
+            project.external_id,
+            project.title,
+            decision.allowed,
+            decision.reason,
+            self.config.filters.require_budget,
+            self.config.filters.require_skill_match,
+            self.project_filter.skill_keywords,
+        )
         project_row = await self.repo.save_project(project)
         report.new += 1
 
         if not decision.allowed:
+            log.warning(
+                "[PIPELINE][SKIPPED] source=%s id=%s title=%r reason=%r budget=%r raw=%r",
+                project.source,
+                project.external_id,
+                project.title,
+                decision.reason,
+                budget_debug,
+                raw,
+            )
             report.skipped += 1
             plan = BidPlan(
                 project=project,
@@ -185,7 +227,25 @@ class BidPipeline:
 
         # 3) pricing
         pricing = self.pricing.price(project, project.budget)
+        log.info(
+            "[PIPELINE][PRICING] source=%s id=%s title=%r budget=%r "
+            "strategy=%s result=%r",
+            project.source,
+            project.external_id,
+            project.title,
+            budget_debug,
+            getattr(self.pricing, "name", type(self.pricing).__name__),
+            pricing.model_dump() if pricing is not None else None,
+        )
         if pricing is None:
+            log.warning(
+                "[PIPELINE][NO-PRICE] source=%s id=%s title=%r budget=%r raw=%r",
+                project.source,
+                project.external_id,
+                project.title,
+                budget_debug,
+                raw,
+            )
             report.skipped += 1
             await self._emit_skip(project, "قیمت‌گذاری امکان‌پذیر نبود.", report)
             return None

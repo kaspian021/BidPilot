@@ -559,8 +559,8 @@ def test_digest_keeps_page_navigation_and_late_labeled_metadata():
 
     assert any(link.label == "پروژه‌های مرتبط" for link in page.links)
     assert "شرح نیازمندی اصلی فروشگاه" in page.text
-    assert "بودجه: ۲۰ تا ۴۰ میلیون تومان" in page.text
-    assert "مهلت تحویل: ۱۰ روز" in page.text
+    assert "بودجه: 20 تا 40 میلیون تومان" in page.text
+    assert "مهلت تحویل: 10 روز" in page.text
     assert "اطلاعات غیرمرتبط سایت" not in page.text
 
 

@@ -325,4 +325,6 @@ def test_template_does_not_invent_matching_past_experience():
     proposal = generator.generate_from_template(project, 750_000, 7)
 
     assert "پروژه‌هایی با همین جنس کار" not in proposal.text
+    assert "همان روز کار را استارت بزنم" not in proposal.text
+    assert "همین روز شروع کنم" not in proposal.text
     assert "راهکار را بر اساس نیازها و محدودیت‌های اعلام‌شده‌ی همین پروژه تنظیم می‌کنم" in proposal.text

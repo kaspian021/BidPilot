@@ -269,12 +269,35 @@ def bot(
             console.print(f"[yellow]⚠️ {escape(info.warning())}[/yellow]")
             console.print(f"   رفع: [bold]{escape(info.fix_command())}[/bold]")
 
+        from .network import check_telegram, proxy_from_store
+
+        proxy = proxy_from_store(store)
+        if proxy:
+            console.print(f"[dim]🔌 پروکسی: {escape(proxy)}[/dim]")
+        reachable, telegram_detail = await check_telegram(str(token), proxy=proxy)
+        if reachable:
+            console.print(f"[green]تلگرام: {escape(telegram_detail)}[/green]")
+        else:
+            console.print(
+                f"[yellow]⚠️ تلگرام در دسترس نیست: {escape(telegram_detail)}[/yellow]\n"
+                "   در ایران api.telegram.org بدون VPN/پروکسی کار نمی‌کند. ربات تا وصل‌شدن "
+                "دوباره تلاش می‌کند.\n"
+                "   پروکسی: [bold]bidpilot settings set network.proxy http://127.0.0.1:10809[/bold]"
+            )
+
         service = build_bot(str(token), store=store, config_path=config)
         automation = service.automation
         automation.interval = interval
         automation.sources = source
         tasks = [asyncio.create_task(service.run_forever(), name="telegram-bot")]
-        if with_runner:
+        if with_runner and not reachable:
+            # never bid in the dark: the user asked to be told about every bid
+            console.print(
+                "[red]رصد خودکار شروع نشد.[/red] بدون تلگرام نمی‌توانی پیشنهادها را ببینی یا "
+                "متوقف کنی، پس تا وصل‌شدن اتصال، چیزی ارسال نمی‌شود.\n"
+                "  پس از وصل‌شدن، در تلگرام دکمه‌ی «🚀 شروع فعالیت» را بزن."
+            )
+        elif with_runner:
             ok, message = await automation.start()
             console.print(("[green]" if ok else "[red]") + message + "[/]")
         else:
@@ -464,24 +487,54 @@ def doctor(
         await application.close()
         console.print(table)
 
+        from .network import diagnose, proxy_from_store
+
+        proxy = proxy_from_store(store)
+
+        async def llm_probe() -> tuple[bool, str]:
+            provider_name = str(getattr(cfg.llm, "provider", "") or "groq")
+            key = application.secrets.llm_keys.get(provider_name) or application.secrets.llm_api_key
+            if not key:
+                return False, "کلید تنظیم نشده"
+            from .llm_providers import LLMProvider, get_preset, is_reasoning_model, verify_provider
+
+            preset = get_preset(provider_name)
+            model = cfg.llm.model or preset.model
+            return await verify_provider(
+                LLMProvider(
+                    id=preset.id,
+                    base_url=cfg.llm.base_url or preset.base_url,
+                    model=model,
+                    api_key=str(key),
+                    extra_headers=dict(preset.extra_headers),
+                ),
+                proxy=proxy,
+                reasoning_effort="low" if is_reasoning_model(model) else "",
+            )
+
+        reach = await diagnose(
+            token=str(application.secrets.telegram_bot_token or ""),
+            llm_check=llm_probe,
+            proxy=proxy,
+        )
+        row("تلگرام (اتصال)", bool(reach.telegram), reach.telegram_detail)
+        row("هوش مصنوعی (اتصال)", bool(reach.llm), reach.llm_detail)
+        row(
+            "پروکسی",
+            bool(proxy) or bool(reach.telegram and reach.llm),
+            proxy or "تنظیم نشده — اگر در ایران هستی و هر دو خطا دادند: /proxy",
+        )
+
         if info.warning():
             console.print(f"\n[yellow]⚠️ {escape(info.warning())}[/yellow]")
             if fix and info.project_root is not None:
                 console.print("[dim]دارم همین پوشه را در پایتون فعلی نصب می‌کنم…[/dim]")
-                import subprocess
-                import sys
-
-                completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                    [sys.executable, "-m", "pip", "install", "-e", str(info.project_root)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if completed.returncode == 0:
+                ok, detail = deps_mod.install_editable(info.project_root)
+                if ok:
                     console.print("[green]✅ نصب شد. حالا برنامه را دوباره اجرا کن.[/green]")
                 else:
-                    tail = (completed.stderr or completed.stdout or "").strip()[-500:]
-                    console.print(f"[red]نصب انجام نشد:[/red] {escape(tail)}")
+                    console.print(f"[red]نصب انجام نشد:[/red] {escape(detail)}")
+                    console.print(f"   دستی: [bold]{escape(info.fix_command())}[/bold]")
             else:
                 console.print("   رفع خودکار: [bold]bidpilot doctor --fix[/bold]")
                 console.print(f"   یا دستی: [bold]{escape(info.fix_command())}[/bold]")

@@ -84,13 +84,19 @@ class InstallInfo:
         return "site-packages" in parts or "dist-packages" in parts
 
     def fix_command(self) -> str:
-        """Install *this repository* into the interpreter that is running."""
-        exe = sys.executable or "python"
-        if " " in exe and not exe.startswith('"'):
-            exe = f'"{exe}"'
+        """Install *this repository* into the interpreter that is running.
+
+        A ``uv``-created venv has no pip, so the command is built from what is
+        actually available (``uv pip install --python …`` or ``ensurepip`` first).
+        """
+        from .deps import editable_install_command, has_pip, install_command
+
         if self.project_root is not None:
-            return f'{exe} -m pip install -e "{self.project_root}"'
-        return f"{exe} -m pip install --upgrade bidpilot"
+            return editable_install_command(self.project_root)
+        if not has_pip():
+            exe = sys.executable or "python"
+            return f'"{exe}" -m ensurepip --upgrade && "{exe}" -m pip install --upgrade bidpilot'
+        return install_command("bidpilot")
 
     def summary(self) -> str:
         where = str(self.package_file.parent)

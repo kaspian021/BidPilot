@@ -648,4 +648,4 @@ async def test_ai_discovery_logs_visited_pages_decisions_and_extracted_project(c
     assert "[AI-EXTRACT][MODEL-OUTPUT]" in caplog.text
     assert "[AI-EXTRACT][NORMALIZED]" in caplog.text
     assert "بودجه: ۲۰ تا ۴۰ میلیون تومان" in caplog.text
-    assert "https://parscoders.com/project/501/flutter-shop" in caplog.text
+    assert "https://ponisha.ir/project/501/flutter-shop" in caplog.text

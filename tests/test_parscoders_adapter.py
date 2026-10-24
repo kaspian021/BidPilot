@@ -237,7 +237,7 @@ async def test_detail_html_is_cached_between_poll_cycles():
     list_route = respx.get("https://parscoders.com/project").mock(
         return_value=httpx.Response(200, text=LIST_HTML)
     )
-    detail_route = respx.get(url__regex=r"https://parscoders\\.com/project/\\d+").mock(
+    detail_route = respx.get(url__regex=r"https://parscoders[.]com/project/[0-9]+").mock(
         return_value=httpx.Response(200, text=PROJECT_HTML)
     )
     source = make_source(list={"fetch_details": True, "detail_concurrency": 2})

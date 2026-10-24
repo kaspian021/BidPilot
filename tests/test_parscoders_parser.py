@@ -370,3 +370,111 @@ def test_detail_description_fallback_uses_ponisha_markers():
     assert "نریشن فارسی با صدای گرم" in enriched.description
     assert "مهارت‌های مورد نیاز" not in enriched.description
     assert "سرویس‌های مرتبط" not in enriched.description
+
+
+
+def test_ponisha_header_budget_is_found_outside_title_scope_and_excluded_from_description():
+    from bidpilot.models import Project
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "طراحی قالب سبک وردپرس مشابه باسکول"
+    html = f"""
+    <html><body>
+      <main>
+        <article class="project-content">
+          <h1>{title}</h1>
+          <p>زمان باقی‌مانده برای ارسال پیشنهاد</p>
+          <p>طراحی و پیاده‌سازی یک قالب سبک برای وردپرس با ظاهری مشابه باسکول.</p>
+        </article>
+        <div class="plain-metadata">تصریح 1 میلیون تا 12 میلیون تومان 02 آبان 1405 14:06</div>
+        <h2>مهارت‌های مورد نیاز</h2>
+        <p>وردپرس (WordPress) قالب</p>
+        <section class="related-projects">
+          <article><a href="/project/777">پروژه مرتبط اول</a><p>بودجه: ۹۹ میلیون تومان</p></article>
+          <article><a href="/project/778">پروژه مرتبط دوم</a><p>بودجه: ۸۸ میلیون تومان</p></article>
+        </section>
+      </main>
+    </body></html>
+    """
+    project = Project(
+        source="ponisha",
+        external_id="762250",
+        title=title,
+        url="https://ponisha.ir/project/762250",
+    )
+
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {
+            "require_project_scope_for_budget": True,
+            "detail_fields": {
+                "description": [".missing-description"],
+                "budget": [".project-budget", ".budget", "[class*='price']"],
+                "skills": [".missing-skill"],
+            },
+            "description_fallback": {
+                "start_markers": ["زمان باقی‌مانده برای ارسال پیشنهاد"],
+                "end_markers": ["مهارت‌های مورد نیاز", "سرویس‌های مرتبط"],
+            },
+            "_diagnostics": True,
+        },
+    )
+
+    assert enriched.budget is not None and enriched.budget.is_known
+    assert enriched.budget.min == 1_000_000
+    assert enriched.budget.max == 12_000_000
+    assert enriched.raw["detail_budget_source"] == "project_header_money_node"
+    assert "قالب سبک برای وردپرس" in enriched.description
+    assert "12 میلیون" not in enriched.description
+    assert "تصریح" not in enriched.description
+    assert "02 آبان 1405" not in enriched.description
+
+
+def test_ponisha_header_budget_never_uses_recommended_project_budget_after_skills():
+    from bidpilot.models import Project
+    from bidpilot.sources.html_parser import enrich_from_detail
+
+    title = "پروژه اصلی بدون بودجه"
+    html = f"""
+    <html><body>
+      <main>
+        <article>
+          <h1>{title}</h1>
+          <p>زمان باقی‌مانده برای ارسال پیشنهاد</p>
+          <p>شرح پروژه اصلی بدون مبلغ اعلام‌شده.</p>
+        </article>
+        <h2>مهارت‌های مورد نیاز</h2><p>Python</p>
+        <section class="related-projects">
+          <article><a href="/project/777">پروژه مرتبط اول</a><p>بودجه: ۹۹ میلیون تومان</p></article>
+          <article><a href="/project/778">پروژه مرتبط دوم</a><p>بودجه: ۸۸ میلیون تومان</p></article>
+        </section>
+      </main>
+    </body></html>
+    """
+    project = Project(
+        source="ponisha",
+        external_id="762251",
+        title=title,
+        url="https://ponisha.ir/project/762251",
+    )
+
+    enriched = enrich_from_detail(
+        html,
+        project,
+        {
+            "require_project_scope_for_budget": True,
+            "detail_fields": {
+                "description": [".missing-description"],
+                "budget": [".missing-budget"],
+                "skills": [],
+            },
+            "description_fallback": {
+                "start_markers": ["زمان باقی‌مانده برای ارسال پیشنهاد"],
+                "end_markers": ["مهارت‌های مورد نیاز", "سرویس‌های مرتبط"],
+            },
+        },
+    )
+
+    assert enriched.budget is None
+    assert enriched.raw["detail_budget_source"] == "not_found"

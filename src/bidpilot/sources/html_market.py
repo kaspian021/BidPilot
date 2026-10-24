@@ -797,7 +797,9 @@ class HtmlMarketSource(Source):
         redirected_paths = [final_path, location_path, *(item["path"] for item in redirect_history)]
         notices = parser.extract_response_notices(response.text)
         if any(login_path_re.search(path) for path in redirected_paths if path):
-            message = "نشست منقضی شده است؛ ارسال متوقف شد. از /market ورود/کوکی را به‌روز کن و با /test بررسی کن."
+            message = (
+                "نشست منقضی شده است؛ ارسال متوقف شد. از /market ورود/کوکی را به‌روز کن و با /test بررسی کن."
+            )
             log.warning(
                 "[BID][SUBMIT-RESPONSE] source=%s id=%s status=%s action_path=%s final_path=%s "
                 "location_path=%s redirects=%r response_chars=%s notices=%r outcome=auth_required",

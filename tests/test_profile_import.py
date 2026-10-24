@@ -279,3 +279,53 @@ def test_summary_text_escapes_html_for_telegram():
     text = pi.summary_text({"full_name": "<script>x</script>", "stack": ["C#", "Flutter"]})
     assert "&lt;script&gt;" in text
     assert "Flutter" in text
+
+
+# ---------------------------------------------------------------------------
+# A missing pypdf must be fixable, not fatal
+# ---------------------------------------------------------------------------
+def test_missing_pypdf_explains_how_to_install_it_for_this_python(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pypdf", None)  # ``from pypdf import …`` now fails
+
+    with pytest.raises(pi.MissingDependency) as exc:
+        pi.pdf_text(b"%PDF-1.4 something")
+
+    message = str(exc.value)
+    assert exc.value.module == "pypdf"
+    assert sys.executable in message
+    assert "-m pip install" in message
+
+
+async def test_a_failed_import_keeps_the_queue_for_a_retry(store):
+    path = store.path.parent / "broken.pdf"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"%PDF-1.4 not really a pdf")
+    store.update(
+        {
+            "profile.resume_path": str(path),
+            "profile.import_pending": {"type": "file", "value": str(path)},
+        }
+    )
+
+    with pytest.raises(pi.ProfileImportError):
+        await pi.run_pending_import(store)
+
+    # the user can fix the cause (install pypdf, resend a text PDF) and retry
+    assert pi.pending_import(store) == {"type": "file", "value": str(path)}
+    assert store.get("profile.source") is None
+
+
+async def test_a_successful_import_clears_an_old_error(store, monkeypatch):
+    store.set("profile.import_error", "pypdf نصب نیست")
+    store.set("profile.import_pending", {"type": "url", "value": "https://github.com/x"})
+
+    async def fake_url(url, *, store, kind=None):  # noqa: ANN001
+        return pi.ImportedProfile(kind="github", fields={"full_name": "Ali"})
+
+    monkeypatch.setattr(pi, "import_from_url", fake_url)
+    await pi.run_pending_import(store)
+
+    assert store.get("profile.import_error") is None
+    assert store.get("profile.imported_at")

@@ -163,6 +163,14 @@ class ProfileImportError(RuntimeError):
     """Persian, user-safe error message."""
 
 
+class MissingDependency(ProfileImportError):
+    """A package the importer needs is not installed (installable on the spot)."""
+
+    def __init__(self, module: str, message: str) -> None:
+        super().__init__(message)
+        self.module = module
+
+
 @dataclass
 class ImportedProfile:
     """Result of one import — shown to the user before it is trusted."""
@@ -190,8 +198,14 @@ def pdf_text(data: bytes, *, max_chars: int = MAX_TEXT_CHARS) -> str:
         raise ProfileImportError("فایل خالی است.")
     try:
         from pypdf import PdfReader
-    except ImportError as exc:  # pragma: no cover - dependency is installed
-        raise ProfileImportError("برای خواندن PDF باید بسته‌ی pypdf نصب باشد: pip install pypdf") from exc
+    except ImportError as exc:
+        from .deps import install_command
+
+        raise MissingDependency(
+            "pypdf",
+            "بسته‌ی pypdf برای خواندن PDF نصب نیست.\n"
+            f"دستور نصب برای همین پایتون:\n<code>{install_command('pypdf')}</code>",
+        ) from exc
 
     try:
         reader = PdfReader(io.BytesIO(data))
@@ -659,6 +673,11 @@ def clear_pending_import(store: SettingsStore) -> None:
     store.delete(PENDING_KEY)
 
 
+def clear_import_error(store: SettingsStore) -> None:
+    """A successful import (or a fresh manual entry) forgets the last failure."""
+    store.delete("profile.import_error")
+
+
 async def run_pending_import(
     store: SettingsStore,
     *,
@@ -668,7 +687,6 @@ async def run_pending_import(
     pending = pending_import(store)
     if pending is None:
         return None
-    clear_pending_import(store)
 
     if pending["type"] == "file":
         path = Path(pending["value"]).expanduser()
@@ -679,6 +697,9 @@ async def run_pending_import(
         result = await import_from_url(pending["value"], store=store)
 
     save_profile_fields(store, result.fields, source=result.kind)
+    # only a *successful* import consumes the queued resume/URL, so a failed
+    # attempt (missing pypdf, no network) can be retried without re-sending
+    clear_pending_import(store)
     return result
 
 
@@ -693,6 +714,7 @@ def save_profile_fields(store: SettingsStore, fields: dict[str, Any], *, source:
         written[key] = value
     updates["profile.source"] = source
     updates["profile.imported_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    updates["profile.import_error"] = None  # a good import clears the last failure
     store.update(updates)
 
     from .config import reset_secret_cache
@@ -731,6 +753,7 @@ __all__ = [
     "ImportedProfile",
     "MAX_TEXT_CHARS",
     "PROFILE_FIELDS",
+    "MissingDependency",
     "ProfileImportError",
     "STACK_VOCABULARY",
     "analyse_text",
@@ -746,6 +769,7 @@ __all__ = [
     "parse_json_object",
     "pdf_text",
     "pending_import",
+    "clear_import_error",
     "clear_pending_import",
     "run_pending_import",
     "save_profile_fields",

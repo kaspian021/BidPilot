@@ -925,6 +925,8 @@ def readiness(store: SettingsStore) -> dict[str, Any]:
         "mode": store.get("runtime.submit_mode") or "dry_run",
         "profile_source": str(store.get("profile.source") or ""),
         "profile_imported_at": store.get("profile.imported_at"),
+        "profile_imported": bool(store.get("profile.imported_at")),
+        "profile_error": str(store.get("profile.import_error") or ""),
         "bid_percent": bid_percent(store),
         "preview": preview_is_fresh(store),
         "setup_completed": bool(store.get("setup.completed")),
@@ -962,9 +964,7 @@ def status_text(store: SettingsStore) -> str:
         f"{mark(state['credentials'])} سایت فعال: {site_label(state['marketplace'])}",
         f"{mark(bool(state['tone']))} لحن: {state['tone'] or 'تعیین نشده'}",
         f"{mark(state['style'])} دستورهای سبک: " + ("ثبت شده" if state["style"] else "ثبت نشده (اختیاری)"),
-        f"{mark(bool(store.get('profile.full_name')))} پروفایل: "
-        + (str(store.get("profile.full_name")) if store.get("profile.full_name") else "وارد نشده")
-        + (" (از " + _profile_source_label(state["profile_source"]) + ")" if state["profile_source"] else ""),
+        _profile_status_line(state, store),
         f"💰 قیمت: {to_persian_digits(str(state['bid_percent']))}٪ بودجه‌ی کارفرما",
         f"حالت ارسال: {'🔴 واقعی' if state['mode'] == 'live' else '🧪 آزمایشی'}",
         f"{mark(state['preview'])} آزمایش بی‌خطر: "
@@ -972,6 +972,23 @@ def status_text(store: SettingsStore) -> str:
         f"تنظیمات اولیه: {'کامل ✅' if state['setup_completed'] else 'ناتمام ⚠️'}",
     ]
     return "\n".join(lines)
+
+
+def _profile_status_line(state: dict[str, Any], store: SettingsStore) -> str:
+    """Never claim «از رزومه» when the resume was never actually read."""
+    name = str(store.get("profile.full_name") or "").strip()
+    if not name:
+        return "❌ پروفایل: وارد نشده"
+    source = _profile_source_label(state.get("profile_source") or "")
+    if state.get("profile_error"):
+        return (
+            f"⚠️ پروفایل: {name}"
+            + (f" — {source} خوانده نشد" if source else " — منبع خوانده نشد")
+            + " (/profile)"
+        )
+    if state.get("profile_source") and not state.get("profile_imported"):
+        return f"⚠️ پروفایل: {name} — {source} هنوز خوانده نشده (/profile)"
+    return f"✅ پروفایل: {name}" + (f" (از {source})" if source and state.get("profile_imported") else "")
 
 
 def _profile_source_label(source: str) -> str:
@@ -1066,6 +1083,26 @@ def _prompt_question(console, question: Question, store: SettingsStore, index: i
             console.print(f"[red]{escape(str(exc))}[/red]")
 
 
+def _ensure_pdf_reader(console) -> bool:
+    """Read a resume PDF even when ``pypdf`` was never installed in this venv."""
+    from rich.markup import escape
+
+    from .deps import ensure, has, install_command
+
+    if has("pypdf"):
+        return True
+    console.print("[cyan]بسته‌ی خواندن PDF نصب نیست؛ همین حالا نصبش می‌کنم…[/cyan]")
+    ok, detail = ensure("pypdf")
+    if ok:
+        console.print("[green]pypdf نصب شد.[/green]")
+        return True
+    console.print("[yellow]نصب خودکار انجام نشد. دستی اجرا کن:[/yellow]")
+    console.print(f"  [bold]{escape(install_command('pypdf'))}[/bold]")
+    if detail:
+        console.print(f"[dim]{escape(detail[-300:])}[/dim]")
+    return False
+
+
 def _run_pending_profile_import(console, store: SettingsStore) -> None:
     from rich.markup import escape
 
@@ -1076,15 +1113,21 @@ def _run_pending_profile_import(console, store: SettingsStore) -> None:
         summary_text,
     )
 
-    if pending_import(store) is None:
+    pending = pending_import(store)
+    if pending is None:
+        return
+    if pending["type"] == "file" and not _ensure_pdf_reader(console):
+        store.set("profile.import_error", "pypdf نصب نیست")
         return
     console.print("[cyan]در حال خواندن و تحلیل رزومه/پروفایل…[/cyan]")
     try:
         result = asyncio.run(run_pending_import(store))
     except ProfileImportError as exc:
+        store.set("profile.import_error", str(exc)[:300])
         console.print(f"[yellow]{escape(str(exc))}[/yellow]")
         return
     except Exception as exc:  # network/quota — the profile keeps its old values
+        store.set("profile.import_error", f"تحلیل انجام نشد: {exc}"[:300])
         console.print(f"[yellow]تحلیل پروفایل انجام نشد: {escape(str(exc))}[/yellow]")
         return
     if result is None:  # pragma: no cover - defensive

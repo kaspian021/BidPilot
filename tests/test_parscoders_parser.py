@@ -114,6 +114,38 @@ def test_find_budget_handles_labels_and_rejects_counters():
     assert find_budget("سلام، پروژه‌ی ساده‌ای است") is None
 
 
+def test_budget_range_split_across_lines_keeps_both_bounds():
+    from bidpilot.sources.html_parser import enrich_from_detail, find_budget
+
+    raw = "بودجه 25,000 تومان\n تا\n 500,000 تومان مهلت برای انجام 2روز وضعیت مناقصه باز"
+    budget = find_budget(raw)
+    assert budget is not None and budget.is_known
+    assert (budget.min, budget.max) == (25_000, 500_000)
+
+    list_html = (FIXTURES / "sample_list.html").read_text(encoding="utf-8")
+    project = parser.parse_list_page(list_html, SETTINGS["list"], "parscoders", "https://parscoders.com")[0]
+    detail_html = f"""
+    <html><body>
+      <main>
+        <h1>{project.title}</h1>
+        <p>بودجه 25,000 تومان
+         تا
+         500,000 تومان مهلت برای انجام 2روز وضعیت مناقصه باز</p>
+      </main>
+    </body></html>
+    """
+    settings = {
+        "detail_fields": {
+            "description": [],
+            "budget": [".missing-budget-selector"],
+            "skills": [],
+        }
+    }
+    enriched = enrich_from_detail(detail_html, project, settings)
+    assert enriched.budget is not None and enriched.budget.is_known
+    assert (enriched.budget.min, enriched.budget.max) == (25_000, 500_000)
+
+
 def test_detail_page_budget_fallback():
     html = """
     <html><body>

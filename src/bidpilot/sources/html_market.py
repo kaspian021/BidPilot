@@ -641,6 +641,18 @@ class HtmlMarketSource(Source):
         except httpx.HTTPError as exc:
             return self.fail(f"خطای شبکه هنگام باز کردن صفحه پروژه: {exc}")
 
+        # Keep the target URL query-free in logs; the HTML size and final path
+        # are enough to diagnose an empty/changed form or a login/challenge page.
+        log.info(
+            "[BID][PAGE-RESPONSE] source=%s id=%s status=%s final_url=%s html_chars=%s content_type=%r",
+            self.name,
+            project.external_id,
+            page.status_code,
+            str(page.url).split("?", 1)[0],
+            len(page.text or ""),
+            page.headers.get("content-type", ""),
+        )
+
         if page.status_code in (301, 302, 401, 403) or "login" in str(page.url).lower():
             return self.fail("نشست منقضی شده است؛ در تلگرام «/market» کوکی را به‌روز کن.", page.status_code)
         if page.status_code >= 400:
@@ -649,7 +661,8 @@ class HtmlMarketSource(Source):
         form, payload = parser.find_bid_form(page.text, bid_cfg)
         if form is None:
             return self.fail(
-                "فرم ارسال پیشنهاد پیدا نشد (احتمالاً قبلاً پیشنهاد داده‌اید یا سلکتورها به‌روز نیستند)."
+                "صفحهٔ پروژه دریافت شد، اما فرم HTML ارسال پیشنهاد شناسایی نشد؛ "
+                "ساختار صفحه، فرمِ ساخته‌شده با JavaScript یا صفحهٔ ورود/محدودیت شبکه باید بررسی شود."
             )
 
         mapping = parser.map_bid_fields(form, bid_cfg)

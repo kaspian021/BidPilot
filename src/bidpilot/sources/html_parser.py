@@ -113,6 +113,21 @@ _SCOPED_BUDGET_LABELS = (
     r"budget(?:\s+amount)?",
 )
 _SCOPED_BUDGET_REGEXES = tuple(rf"{label}\s*[:：]?\s*([^\n]{{2,100}})" for label in _SCOPED_BUDGET_LABELS)
+
+# Match an explicitly labeled range even when a marketplace splits it across
+# visual lines, e.g. "بودجه 25,000 تومان\n تا\n 500,000 تومان".
+_BUDGET_RANGE_VALUE_RE = re.compile(
+    r"^\s*[:：]?\s*"
+    r"(?P<range>\d(?:[\d,.\u066c\u060c]*\d)?\s*"
+    r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?"
+    r"(?:تومان|تومن|ریال)?\s*"
+    r"(?:تا|الی|[-–—])\s*"
+    r"\d(?:[\d,.\u066c\u060c]*\d)?\s*"
+    r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?"
+    r"(?:تومان|تومن|ریال)?)",
+    re.IGNORECASE,
+)
+
 _DESCRIPTION_END_MARKERS = (
     "مهارت‌های مورد نیاز",
     "مهارت های مورد نیاز",
@@ -131,6 +146,29 @@ _DESCRIPTION_END_MARKERS = (
     "مشاهده‌ی پروژه",
     "مشاهده پروژه",
 )
+
+
+def _labeled_range_budget(text: str, value_start: int) -> Budget | None:
+    """Parse a nearby explicit budget range before single-amount fallbacks truncate it."""
+    value_tail = text[value_start : value_start + 220]
+    match = _BUDGET_RANGE_VALUE_RE.match(value_tail)
+    if not match:
+        return None
+    evidence = match.group("range")
+    # Require monetary context so dates, durations and other numeric ranges
+    # cannot be promoted to budgets just because they follow a label.
+    if not re.search(r"تومان|تومن|ریال|هزار|میلیون|ملیون|میلیارد", evidence):
+        return None
+    budget = parse_budget_text(evidence)
+    if (
+        budget is None
+        or not budget.is_known
+        or budget.min is None
+        or budget.max is None
+        or budget.min == budget.max
+    ):
+        return None
+    return budget
 
 
 def _node_text_candidates(node: Tag) -> list[str]:
@@ -158,8 +196,13 @@ def _find_labeled_budget(text: str, patterns: list[str] | tuple[str, ...] | None
             continue
         if not match:
             continue
+        value_start = match.start(1) if match.lastindex else match.end()
+        range_budget = _labeled_range_budget(cleaned, value_start)
+        if range_budget is not None and range_budget.is_known:
+            return range_budget
         candidate = match.group(1) if match.groups() else match.group(0)
-        # Never scan beyond the first amount unit in the same block.
+        # Never scan beyond the first amount unit in the same block when only a
+        # single amount is present.
         unit = re.search(r"تومان|تومن|ریال|هزار|میلیون|میلیارد", candidate)
         if unit:
             candidate = candidate[: unit.end()]
@@ -312,9 +355,11 @@ _MONEY_EXPRESSION_RE = re.compile(
     r"(?<!\w)"
     r"(?P<amount>\d(?:[\d,.\u066c\u060c]*\d)?\s*"
     r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?"
+    r"(?:تومان|تومن|ریال)?"
     r"(?:\s*(?:تا|الی|[-–—])\s*\d(?:[\d,.\u066c\u060c]*\d)?\s*"
-    r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?)?"
-    r"(?:تومان|تومن|ریال))",
+    r"(?:(?:هزار|میلیون|ملیون|میلیارد)\s*)?"
+    r"(?:تومان|تومن|ریال)?)?"
+    r")",
     re.IGNORECASE,
 )
 _BUDGET_PREFIX_RE = re.compile(
@@ -591,6 +636,10 @@ def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None =
             continue
         if not match:
             continue
+        value_start = match.start(1) if match.lastindex else match.start()
+        range_budget = _labeled_range_budget(cleaned, value_start)
+        if range_budget is not None and range_budget.is_known:
+            return range_budget
         candidate = match.group(1) if match.groups() else match.group(0)
         # A label such as «بودجه: توافقی» is followed by other card text; only a
         # candidate that names a currency may be read as an amount, and nothing
@@ -1043,6 +1092,31 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
                 form = candidate
                 break
     if form is None:
+        body_text = clean_text(soup.get_text(" ", strip=True))
+        title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+        lowered = body_text.casefold()
+        marker_candidates = (
+            "ورود به حساب",
+            "لطفاً وارد شوید",
+            "captcha",
+            "cloudflare",
+            "access denied",
+            "just a moment",
+        )
+        marker_hits = [marker for marker in marker_candidates if marker.casefold() in lowered]
+        log.warning(
+            "[BID][FORM-NOT-FOUND] title=%r selectors=%r forms=%s textareas=%s "
+            "inputs=%s buttons=%s scripts=%s page_markers=%r body_chars=%s",
+            title,
+            form_selectors,
+            len(soup.find_all("form")),
+            len(soup.find_all("textarea")),
+            len(soup.find_all("input")),
+            len(soup.find_all(["button", "input"], attrs={"type": re.compile("submit|button", re.I)})),
+            len(soup.find_all("script")),
+            marker_hits,
+            len(body_text),
+        )
         return None, {}
 
     payload: dict[str, Any] = {}

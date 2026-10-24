@@ -306,8 +306,8 @@ _METADATA_LINE = re.compile(
     re.IGNORECASE,
 )
 _DEADLINE_RE = re.compile(
-    r"(?:مهلت(?:\\s+تحویل)?|زمان\\s+تحویل|مدت\\s+زمان(?:\\s+مورد\\s+نظر)?|deadline|delivery\\s+time)"
-    r"\\s*[:：\\-]?\\s*([0-9]+(?:[.,][0-9]+)?\\s*(?:روز(?:\\s+کاری)?|هفته(?:\\s+کاری)?|ماه|ساعت|دقیقه|days?|weeks?|months?|hours?))",
+    r"(?:مهلت(?:\s+تحویل)?|زمان\s+تحویل|مدت\s+زمان(?:\s+مورد\s+نظر)?|deadline|delivery\s+time)"
+    r"\s*[:：\-]?\s*([0-9]+(?:[.,][0-9]+)?\s*(?:روز(?:\s+کاری)?|هفته(?:\s+کاری)?|ماه|ساعت|دقیقه|days?|weeks?|months?|hours?))",
     re.IGNORECASE,
 )
 _CONTENT_SELECTORS = (

@@ -47,6 +47,8 @@ class RunReport:
     errors: list[str] = field(default_factory=list)
     #: True when the account session is invalid; the scheduler must stop searching.
     authentication_failed: bool = False
+    #: True when the site requires JavaScript in a real browser.
+    javascript_required: bool = False
     #: human-readable reason -> how many projects were skipped for it
     skip_reasons: dict[str, int] = field(default_factory=dict)
     #: titles of the projects that made it all the way to a proposal
@@ -61,7 +63,7 @@ class RunReport:
     def has_news(self) -> bool:
         # Authentication failures are surfaced by the runner as a dedicated,
         # actionable message rather than a duplicate generic digest.
-        if self.authentication_failed:
+        if self.authentication_failed or self.javascript_required:
             return False
         return bool(self.new or self.submitted or self.failed or self.errors)
 
@@ -172,9 +174,11 @@ class BidPipeline:
                 except Exception as exc:  # never let one project kill the batch
                     log.exception("Project %s failed", project.uid)
                     report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
-                if report.authentication_failed:
+                if report.authentication_failed or report.javascript_required:
+                    stop_reason = "AUTH" if report.authentication_failed else "JAVASCRIPT"
                     log.error(
-                        "[PIPELINE][STOP-AUTH] source=%s stopping the current project batch",
+                        "[PIPELINE][STOP-%s] source=%s stopping the current project batch",
+                        stop_reason,
                         source.name,
                     )
                     break
@@ -442,6 +446,14 @@ class BidPipeline:
             report.errors.append("ورود به حساب کاربری تأیید نشد؛ جست‌وجو و ارسال پیشنهاد متوقف می‌شود.")
             log.error(
                 "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stopping after response indicated login/session failure",
+                project.source,
+                project.external_id,
+            )
+        if result.javascript_required:
+            report.javascript_required = True
+            report.errors.append("سایت اجرای JavaScript در مرورگر را لازم دانست؛ ارسال خودکار متوقف می‌شود.")
+            log.error(
+                "[PIPELINE][STOP-JAVASCRIPT] source=%s id=%s stopping after JavaScript requirement",
                 project.source,
                 project.external_id,
             )

@@ -53,6 +53,18 @@ def load_yaml_settings(path: Path) -> dict[str, Any]:
         return yaml.safe_load(fh) or {}
 
 
+def _javascript_required_message(site_notice: str = "") -> str:
+    detail = (
+        f"پیام سایت: {site_notice[:180]}"
+        if site_notice
+        else "سایت اجرای JavaScript در مرورگر را لازم دانست."
+    )
+    return (
+        f"{detail} BidPilot در این اتصال HTTP مستقیم کار می‌کند و JavaScript اجرا نمی‌کند؛ "
+        "رصد خودکار متوقف شد. ثبت پیشنهاد تأیید نشده است."
+    )
+
+
 def merge_settings(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     merged = dict(defaults)
     for key, value in (overrides or {}).items():
@@ -744,6 +756,19 @@ class HtmlMarketSource(Source):
             return self.fail("نشست منقضی شده است؛ در تلگرام «/market» کوکی را به‌روز کن.", page.status_code)
         if page.status_code >= 400:
             return self.fail(f"صفحه پروژه قابل دریافت نبود (HTTP {page.status_code}).", page.status_code)
+        if parser.requires_javascript(page.text):
+            message = _javascript_required_message()
+            log.warning(
+                "[BID][PAGE-RESPONSE] source=%s id=%s outcome=javascript_required",
+                self.name,
+                project.external_id,
+            )
+            return SubmissionResult(
+                status=SubmissionStatus.FAILED,
+                message=message,
+                http_status=page.status_code,
+                javascript_required=True,
+            )
 
         form, payload = parser.find_bid_form(page.text, bid_cfg)
         if form is None:
@@ -814,6 +839,34 @@ class HtmlMarketSource(Source):
                 notices,
             )
             return self.fail(message, response.status_code)
+
+        if parser.requires_javascript(response.text):
+            notice = next((item for item in notices if parser.requires_javascript(item)), "")
+            message = _javascript_required_message(notice)
+            log.warning(
+                "[BID][SUBMIT-RESPONSE] source=%s id=%s status=%s method=%s action_path=%s "
+                "final_path=%s location_path=%s redirects=%r content_type=%r response_chars=%s "
+                "notices=%r outcome=javascript_required message=%r",
+                self.name,
+                project.external_id,
+                response.status_code,
+                method,
+                urlsplit(action).path,
+                final_path,
+                location_path,
+                redirect_history,
+                response.headers.get("content-type", ""),
+                len(response.text or ""),
+                notices,
+                message,
+            )
+            return SubmissionResult(
+                status=SubmissionStatus.FAILED,
+                message=message,
+                http_status=response.status_code,
+                payload_debug={"action": action, "fields": sorted(payload)},
+                javascript_required=True,
+            )
 
         ok, message = parser.detect_success(response.status_code, response.text, bid_cfg)
         log_method = log.info if ok else log.warning

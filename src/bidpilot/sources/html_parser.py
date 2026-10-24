@@ -1312,6 +1312,27 @@ def extract_response_notices(html: str) -> list[str]:
     return notices
 
 
+def requires_javascript(html: str) -> bool:
+    """Detect an explicit site message requiring browser-side JavaScript."""
+    text = _normalized_marker(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    has_javascript = "javascript" in text or "جاوا اسکریپت" in text
+    persian_disabled = has_javascript and any(
+        marker in text for marker in ("غیر فعال", "غیرفعال", "فعال نیست")
+    )
+    persian_enable = "جاوا اسکریپت" in text and any(
+        marker in text for marker in ("فعال کنید", "فعال باشد")
+    )
+    english_required = bool(
+        re.search(
+            r"javascript.{0,60}(?:disabled|not enabled|must be enabled|is required)",
+            text,
+            re.IGNORECASE,
+        )
+        or re.search(r"(?:enable|activate|turn on).{0,40}javascript", text, re.IGNORECASE)
+    )
+    return persian_disabled or persian_enable or english_required
+
+
 def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tuple[bool, str]:
     """Require explicit proposal success; generic words on the project page are insufficient."""
     success_texts = settings.get("success_text_contains") or [
@@ -1353,6 +1374,7 @@ __all__ = [
     "DEFAULT_ID_REGEX",
     "detect_success",
     "extract_response_notices",
+    "requires_javascript",
     "enrich_from_detail",
     "extract_external_id",
     "fallback_id",

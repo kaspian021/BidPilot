@@ -1109,7 +1109,11 @@ def explore(
                 for note in result.notes:
                     console.print(f"  [dim]↳ {escape(note)}[/dim]")
             elif error:
-                console.print(f"\n[red]❌ جست‌وجوی هوشمند شکست خورد:[/red] {escape(error[:800])}")
+                from .sources.discovery import friendly_llm_error
+
+                console.print(
+                    f"\n[red]❌ جست‌وجوی هوشمند شکست خورد:[/red] {escape(friendly_llm_error(error))}"
+                )
                 console.print("[dim]با سلکتورهای ثابت ادامه داده شد.[/dim]")
             else:
                 console.print("\n[dim]خروجی از سلکتورهای CSS آمد (بدون مدل).[/dim]")

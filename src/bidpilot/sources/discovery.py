@@ -49,13 +49,18 @@ log = logging.getLogger(__name__)
 
 Fetch = Callable[[str], Awaitable[str]]
 
-#: never spend more than this on one cycle (free tiers are ~30 requests/minute)
-MAX_STEPS = 10
-MAX_DETAIL_PAGES = 6
-MAX_PROJECTS = 6
-MAX_TEXT_CHARS = 3_500
-MAX_DETAIL_CHARS = 6_000
-MAX_LINKS = 70
+#: Free tiers are counted in *tokens per minute* (Groq: 8,000), not just requests.
+#: Every prompt below is sized so a whole discovery run fits in one or two
+#: minutes of budget: a list page needs only its links, a detail page ~700 tokens.
+MAX_STEPS = 8
+MAX_DETAIL_PAGES = 4
+MAX_PROJECTS = 4
+MAX_TEXT_CHARS = 1_600
+MAX_DETAIL_CHARS = 2_600
+MAX_LINKS = 45
+#: a page with this many project links is a list: its prose is noise for the model
+LIST_PAGE_MIN_LINKS = 3
+LIST_PAGE_TEXT_CHARS = 350
 
 _STATIC_SUFFIXES = (
     ".css",
@@ -259,7 +264,7 @@ def digest_html(
     return PageSnapshot(url=url, title=title, text=text, links=links, is_login=is_login)
 
 
-def render_links(links: list[PageLink], *, limit: int = 50) -> str:
+def render_links(links: list[PageLink], *, limit: int = 30) -> str:
     lines = [f"[{link.index}] {link.label} — {urlparse(link.url).path}" for link in links[:limit]]
     if len(links) > limit:
         lines.append(f"… و {len(links) - limit} لینک دیگر (بدون شماره)")
@@ -375,6 +380,12 @@ class DiscoveryAgent:
             try:
                 decision = await self._decide(page, history, step, len(collected))
             except Exception as exc:
+                if collected:
+                    # keep what we already read; a rate limit on page 5 must not
+                    # throw away the four projects we extracted before it
+                    result.notes.append(f"جست‌وجو نیمه‌کاره ماند: {exc}")
+                    log.warning("discovery stopped early, keeping %s projects: %s", len(collected), exc)
+                    break
                 raise DiscoveryError(f"تصمیم‌گیری مدل ناموفق بود: {exc}") from exc
             result.llm_calls += 1
 
@@ -473,20 +484,22 @@ class DiscoveryAgent:
         step: int,
         collected: int,
     ) -> dict[str, Any]:
+        list_like = sum(1 for link in page.links if _looks_like_item(link.url)) >= LIST_PAGE_MIN_LINKS
+        text = truncate(page.text, LIST_PAGE_TEXT_CHARS if list_like else MAX_TEXT_CHARS)
         prompt = STEP_PROMPT.format(
             profile=profile_brief(self.profile),
             brief=self.brief,
-            history="\n".join(history[-8:]) or "تازه شروع کرده‌ای؛ این اولین صفحه است.",
+            history="\n".join(history[-6:]) or "تازه شروع کرده‌ای؛ این اولین صفحه است.",
             pages=step,
             collected=collected,
             step=step,
             max_steps=self.max_steps,
             url=page.url,
             title=page.title or "—",
-            text=truncate(page.text, MAX_TEXT_CHARS),
+            text=text + ("\n(این صفحه فهرست پروژه است.)" if list_like else ""),
             links=render_links(page.links),
         )
-        answer = await self._complete_json(AGENT_SYSTEM, prompt, max_tokens=400)
+        answer = await self._complete_json(AGENT_SYSTEM, prompt, max_tokens=220)
         data = parse_json_object(getattr(answer, "text", answer))
         if not data:
             raise DiscoveryError("مدل JSON معتبر برنگرداند.")
@@ -506,7 +519,7 @@ class DiscoveryAgent:
             return None
         prompt = EXTRACT_PROMPT.format(url=url, text=page.text)
         try:
-            answer = await self._complete_json(EXTRACT_SYSTEM, prompt, max_tokens=900)
+            answer = await self._complete_json(EXTRACT_SYSTEM, prompt, max_tokens=700)
         except Exception as exc:
             log.debug("discovery: extraction failed for %s (%s)", url, exc)
             return None
@@ -550,6 +563,23 @@ class DiscoveryAgent:
         )
 
 
+def friendly_llm_error(message: str) -> str:
+    """Turn a provider's JSON blob into a sentence the user can act on."""
+    text = str(message or "")
+    lowered = text.lower()
+    if "429" in text or "rate limit" in lowered or "quota" in lowered:
+        return (
+            "سهمیه‌ی دقیقه‌ای مدل پر شد (مثلاً Groq رایگان ۸٬۰۰۰ توکن در دقیقه است). "
+            "برنامه خودش فاصله‌ها را رعایت می‌کند و از سلکتورها ادامه داد؛ "
+            "یک دقیقه بعد دوباره /preview یا explore بزن."
+        )
+    if "401" in text or "403" in text or "invalid api key" in lowered:
+        return "کلید هوش مصنوعی رد شد. در /llm کلید را دوباره ثبت کن یا /test بگیر."
+    if "404" in text or "model" in lowered and "not found" in lowered:
+        return "مدل انتخاب‌شده در دسترس نیست؛ در /llm مدل را عوض کن."
+    return truncate(text, 500)
+
+
 def _short(url: str) -> str:
     parsed = urlparse(url)
     return (parsed.path or "/")[:60]
@@ -582,6 +612,7 @@ def _pick_many(links: list[PageLink], raw_indexes: Any) -> list[PageLink]:
 
 __all__ = [
     "AGENT_SYSTEM",
+    "friendly_llm_error",
     "DEFAULT_SITE_BRIEF",
     "DiscoveryAgent",
     "DiscoveryError",

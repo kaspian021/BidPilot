@@ -260,6 +260,9 @@ class HtmlMarketSource(Source):
         failures: list[str] = []
         for provider in providers:
             client = build_client(provider, self.config.llm)
+            budget = int(cfg.get("tokens_per_minute") or 0)
+            if budget:
+                client.tokens_per_minute = budget
             self._llm_clients.append(client)
             agent = DiscoveryAgent(
                 source_name=self.name,

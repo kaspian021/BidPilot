@@ -5,7 +5,7 @@ import respx
 from bidpilot.config import AppConfig, Profile, ProposalConfig
 from bidpilot.models import Budget, Project
 from bidpilot.proposals.generator import ProposalError, ProposalGenerator, validate_proposal
-from bidpilot.proposals.llm_client import LLMClient, LLMError
+from bidpilot.proposals.llm_client import LLMClient, LLMError, LLMResponse
 
 VALID_LLM_TEXT = (
     "سلام و وقت بخیر 🌱\n\n"
@@ -214,3 +214,65 @@ async def test_llm_failure_reason_is_kept_for_the_user():
 
     assert proposal.generated_by == "template"
     assert "401 invalid api key" in generator.last_llm_error
+
+
+# ---------------------------------------------------------------------------
+# Persian digits must not cost the user a real LLM proposal
+# ---------------------------------------------------------------------------
+VALID_BID = """سلام و وقت بخیر
+من علی هستم، برنامه‌نویس موبایل با ۵ سال تجربه در Flutter و ASP.NET Core.
+
+درباره‌ی «ساخت ربات تلگرام فروشگاهی» متن شما را دقیق خواندم. سه نکته‌ی کلیدی:
+• جریان پرداخت و بازگشت کاربر؛ راه‌حل: ثبت idempotent سفارش و لاگ تراکنش
+• مدیریت موجودی؛ راه‌حل: همگام‌سازی با cron و webhook
+• پشتیبانی؛ راه‌حل: پنل ساده برای پاسخ سریع
+
+قیمت پیشنهادی من ۱,۵۰۰,۰۰۰ تومان و زمان تحویل ۱۴ روز است. اگر جزئیات را روشن کنیم،
+همین امروز شروع می‌کنم.
+
+با احترام، علی اقبالی"""
+
+
+def test_persian_digit_price_passes_validation():
+    config = make_config().proposal
+    report = validate_proposal(VALID_BID, config, 1_500_000)
+    assert report.ok, report.issues
+
+
+def test_millions_written_in_words_pass_validation():
+    text = VALID_BID.replace("۱,۵۰۰,۰۰۰ تومان", "۱.۵ میلیون تومان")
+    report = validate_proposal(text, make_config().proposal, 1_500_000)
+    assert report.ok, report.issues
+
+
+def test_a_wrong_price_is_still_rejected():
+    report = validate_proposal(VALID_BID, make_config().proposal, 900_000)
+    assert not report.ok
+    assert any("قیمت پیشنهادی" in issue for issue in report.issues)
+
+
+class TruncatingClient(LLMClient):
+    """First answer is cut off mid-sentence (finish_reason=length)."""
+
+    def __init__(self) -> None:
+        super().__init__("https://llm.test/v1", "k", "m")
+        self.budgets: list[int | None] = []
+        self.answers = 0
+
+    async def complete(self, system, user, *, max_tokens=None, response_format=None):
+        self.budgets.append(max_tokens)
+        self.answers += 1
+        if self.answers == 1:
+            return LLMResponse(text="سلام و وقت بخیر\nمن علی هستم و قیمت", finish_reason="length")
+        return LLMResponse(text=VALID_BID, finish_reason="stop")
+
+
+async def test_a_truncated_answer_is_retried_with_more_room():
+    client = TruncatingClient()
+    generator = ProposalGenerator(make_config(), llm=client)
+
+    proposal = await generator.generate(make_project(), 1_500_000, 14)
+
+    assert proposal.generated_by.startswith("llm")
+    assert len(client.budgets) == 2
+    assert client.budgets[0] is not None and client.budgets[1] > client.budgets[0]

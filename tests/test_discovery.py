@@ -421,3 +421,80 @@ def test_shipped_site_briefs_describe_the_logic_and_not_the_urls():
         # the prompt must teach the *logic*; it must not hand over the list URLs
         assert "only-available" not in brief
         assert "http" not in brief
+
+
+async def test_a_list_page_sends_links_not_prose(fetch):
+    """Groq's free tier is 8,000 tokens/min: a list page must not ship its text."""
+    long_noise = "این یک متن توضیحی بسیار طولانی درباره‌ی قوانین سایت است. " * 60
+    extra_links = "".join(f"<a href='/project/70{i}/job-{i}'>پروژه شماره {i}</a>" for i in range(4))
+    list_html = MATCHED_LIST.replace("</body>", f"{extra_links}<p>{long_noise}</p></body>")
+
+    async def list_fetch(url: str) -> str:
+        return list_html
+
+    captured: dict[str, str] = {}
+
+    class Recorder(ScriptedLLM):
+        async def complete(self, system, user, *, max_tokens=None, response_format=None):
+            if "استخراج‌کننده" not in system:
+                captured["prompt"] = user
+            return _Answer(json.dumps({"action": "done", "why": "کافی است"}))
+
+    agent = DiscoveryAgent(
+        source_name="parscoders",
+        base_url=BASE,
+        fetch=list_fetch,
+        llm=Recorder(),
+        profile=PROFILE,
+        seed_paths=["/project"],
+    )
+    await agent.discover()
+
+    prompt = captured["prompt"]
+    assert len(prompt) < 4_000, f"list prompt too big for 8k TPM: {len(prompt)} chars"
+    # 60 repetitions of the paragraph would mean the full text was sent
+    assert prompt.count("قوانین سایت") <= 3
+    assert "فهرست پروژه است" in prompt
+
+
+async def test_projects_collected_before_a_rate_limit_are_kept(fetch):
+    class Flaky(ScriptedLLM):
+        async def complete(self, system, user, *, max_tokens=None, response_format=None):
+            if "استخراج‌کننده" in system:
+                path = re.search(r"# متن صفحه‌ی پروژه \((.*?)\)", user).group(1)
+                from urllib.parse import urlparse
+
+                data = DETAILS.get(urlparse(path).path, {"is_project": False})
+                return _Answer(json.dumps(data, ensure_ascii=False))
+            if "آدرس: https://parscoders.com/project\n" in user:
+                return _Answer(json.dumps({"action": "collect", "links": [0], "why": "فهرست"}))
+            raise RuntimeError("429 rate limit")
+
+    agent = DiscoveryAgent(
+        source_name="parscoders",
+        base_url=BASE,
+        fetch=fetch,
+        llm=Flaky(),
+        profile=PROFILE,
+        # the second seed hits the failing decision *after* the project was read
+        seed_paths=["/project", "/"],
+    )
+
+    result = await agent.discover()
+
+    assert [p.external_id for p in result.projects] == ["501"]
+    assert any("نیمه‌کاره" in note for note in result.notes)
+
+
+def test_provider_errors_become_actionable_persian():
+    from bidpilot.sources.discovery import friendly_llm_error
+
+    rate = friendly_llm_error(
+        'LLM HTTP 429: {"error":{"message":"Rate limit reached ... tokens per minute (TPM)"}}'
+    )
+    assert "۸٬۰۰۰" in rate and "429" not in rate
+
+    key = friendly_llm_error("LLM rejected the request (HTTP 401): invalid api key")
+    assert "/llm" in key
+
+    assert "چیز عجیبی" in friendly_llm_error("چیز عجیبی")

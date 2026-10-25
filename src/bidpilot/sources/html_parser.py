@@ -1139,7 +1139,6 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     return project.model_copy(update=update)
 
 
-
 def detect_existing_bid(html: str, settings: dict[str, Any]) -> bool | None:
     """Return True/False only when the project page provides clear bid-state evidence.
 
@@ -1176,13 +1175,13 @@ def detect_existing_bid(html: str, settings: dict[str, Any]) -> bool | None:
         "proposal already submitted",
         "already applied",
     ]
-    normalized_already = [_normalized_marker(str(marker)) for marker in already_markers if str(marker).strip()]
+    normalized_already = [
+        _normalized_marker(str(marker)) for marker in already_markers if str(marker).strip()
+    ]
     if any(marker and marker in body_text for marker in normalized_already):
         return True
 
-    actionable_nodes = soup.select(
-        "a, button, input[type='submit'], input[type='button'], [role='button']"
-    )
+    actionable_nodes = soup.select("a, button, input[type='submit'], input[type='button'], [role='button']")
     action_labels: list[str] = []
     for node in actionable_nodes:
         values = [
@@ -1219,11 +1218,7 @@ def detect_existing_bid(html: str, settings: dict[str, Any]) -> bool | None:
         "make an offer",
     )
     normalized_submit_markers = tuple(_normalized_marker(marker) for marker in submit_markers)
-    if any(
-        marker and marker in label
-        for label in action_labels
-        for marker in normalized_submit_markers
-    ):
+    if any(marker and marker in label for label in action_labels for marker in normalized_submit_markers):
         return False
 
     return None

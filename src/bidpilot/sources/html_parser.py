@@ -8,6 +8,7 @@ in order; the first selector that matches something wins.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from datetime import datetime
@@ -1598,19 +1599,55 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
         )
         return None, {}
 
-    payload: dict[str, Any] = {}
-    if settings.get("include_hidden", True):
-        for inp in form.select("input[type=hidden]"):
-            name = inp.get("name")
-            if name:
-                payload[name] = inp.get("value", "")
-    for inp in form.select("input"):
-        if inp.get("type") in ("submit", "button", "file", "hidden"):
-            continue
-        name = inp.get("name")
-        if name and name not in payload and inp.get("value"):
-            payload[name] = inp.get("value", "")
+    payload: dict[str, Any] = serialize_form(form, include_hidden=bool(settings.get("include_hidden", True)))
     return form, payload
+
+
+def serialize_form(form: Tag, *, include_hidden: bool = True) -> dict[str, str]:
+    """Serialize a form the way a browser would submit it ("successful controls").
+
+    The old payload builder only copied hidden inputs and text inputs that
+    happened to carry a ``value`` — silently dropping the defaults of
+    ``<select>`` elements and textareas. On the real ParsCoders bid form
+    (verified via ``bidpilot inspect``, project 621237) fields such as
+    ``initEscrowPercent``/``expertGuaranteePercent``/``validDays`` live next
+    to ``bidAmount``/``deadline``/``message``; omitting their browser
+    defaults is exactly the kind of thing a Laravel validator rejects.
+
+    Rules (HTML form submission, subset): named + non-disabled controls;
+    submit/button/file/image/reset inputs are skipped; checkbox/radio only
+    when checked; a select contributes its selected option (else the first),
+    using the option's text when it has no ``value``; a textarea contributes
+    its default content. The caller overwrites the mapped bid fields.
+    """
+    payload: dict[str, str] = {}
+    for node in form.select("input[name], select[name], textarea[name]"):
+        if node.has_attr("disabled"):
+            continue
+        name = str(node.get("name") or "")
+        if not name:
+            continue
+        if node.name == "input":
+            input_type = str(node.get("type") or "text").lower()
+            if input_type in ("submit", "button", "file", "image", "reset"):
+                continue
+            if input_type == "hidden" and not include_hidden:
+                continue
+            if input_type in ("checkbox", "radio"):
+                if node.has_attr("checked"):
+                    payload[name] = str(node.get("value") or "on")
+                continue
+            payload[name] = str(node.get("value") or "")
+        elif node.name == "textarea":
+            payload[name] = node.get_text()
+        elif node.name == "select":
+            options = node.find_all("option")
+            if not options:
+                continue
+            chosen = next((o for o in options if o.has_attr("selected")), options[0])
+            value = chosen.get("value")
+            payload[name] = str(value) if value is not None else chosen.get_text(strip=True)
+    return payload
 
 
 def map_bid_fields(form: Tag, settings: dict[str, Any]) -> dict[str, str]:
@@ -1678,6 +1715,43 @@ def extract_response_notices(html: str) -> list[str]:
             if len(notices) >= 5:
                 return notices
     return notices
+
+
+def extract_json_notices(text: str) -> list[str]:
+    """Notices from a JSON response body (Laravel validation errors & friends).
+
+    JS-driven bid forms (like the real ParsCoders one: no ``action``, a
+    ``_token`` field) are answered with JSON — ``{"message": ...,
+    "errors": {"bidAmount": ["..."]}}`` with HTTP 422. Surfacing those field
+    errors turns "نتیجه نامشخص" into the server naming exactly what it wants.
+    """
+    body = (text or "").strip()
+    if not body.startswith("{"):
+        return []
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    notices: list[str] = []
+    message = data.get("message")
+    if isinstance(message, str) and message.strip():
+        notices.append(clean_text(message)[:300])
+    errors = data.get("errors")
+    if isinstance(errors, dict):
+        for field, messages in errors.items():
+            if isinstance(messages, (list, tuple)):
+                items = [m for m in messages if isinstance(m, str) and m.strip()][:2]
+            elif isinstance(messages, str) and messages.strip():
+                items = [messages]
+            else:
+                items = []
+            for item in items:
+                notices.append(f"{field}: {clean_text(item)[:200]}")
+                if len(notices) >= 5:
+                    return notices
+    return notices[:5]
 
 
 #: A JavaScript-requirement notice must say "javascript" AND "disabled/enable…"
@@ -1751,7 +1825,8 @@ def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tup
         "مجاز نیست",
         "وارد شوید",
     ]
-    notices = extract_response_notices(html)
+    json_notices = extract_json_notices(html)
+    notices = extract_response_notices(html) + json_notices
     error_words = ("خطا", "ناموفق", "خطای", "failed", "error")
 
     # A specific response alert is much stronger evidence than the surrounding
@@ -1761,8 +1836,18 @@ def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tup
             return False, f"سایت پیام داد: {notice[:180]}"
         if has_any(notice, success_texts):
             return True, "پیشنهاد با پیام موفقیت سایت تأیید شد."
+    if status_code == 419:
+        # Laravel's "Page Expired": the form's CSRF token was stale/rejected.
+        return False, "سایت توکن امنیتی فرم (CSRF) را رد کرد (HTTP 419)."
     if status_code >= 400:
-        return False, f"HTTP {status_code}"
+        # Prefer a per-field validation error ("bidAmount: ...") over the
+        # generic top-level message — the field name is the actionable part.
+        detail = next(
+            (n for n in json_notices if ": " in n),
+            json_notices[0] if json_notices else "",
+        )
+        suffix = f": {detail[:180]}" if detail else ""
+        return False, f"سایت درخواست را رد کرد (HTTP {status_code}){suffix}"
 
     body = clean_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
     if has_any(body, failure_texts):
@@ -1778,6 +1863,8 @@ __all__ = [
     "detect_success",
     "detect_existing_bid",
     "extract_response_notices",
+    "extract_json_notices",
+    "serialize_form",
     "javascript_requirement_snippet",
     "requires_javascript",
     "enrich_from_detail",

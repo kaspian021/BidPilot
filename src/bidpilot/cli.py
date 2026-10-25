@@ -1146,6 +1146,7 @@ def inspect(
             find_proposal_cta_url,
             map_bid_fields,
             score_bid_form,
+            serialize_form,
         )
 
         forms = soup.find_all("form")
@@ -1154,10 +1155,20 @@ def inspect(
         for i, form in enumerate(forms[:12]):
             fields = [inp.get("name") for inp in form.select("input,textarea,select") if inp.get("name")]
             mapping = map_bid_fields(form, bid_cfg)
+            data_target = form.get("data-action") or form.get("data-url")
+            # hidden values (CSRF tokens) are masked: inspect output gets shared
+            hidden_names = {inp.get("name") for inp in form.select("input[type=hidden]")}
+            shown_defaults = {
+                key: ("***" if key in hidden_names else value) for key, value in serialize_form(form).items()
+            }
             console.print(
                 f"  form#{i} score=[bold]{score_bid_form(form, bid_cfg)}[/bold] "
-                f"action={form.get('action')} method={(form.get('method') or 'get')}\n"
-                f"         fields={fields} mapped_bid_fields={mapping}"
+                f"id={form.get('id')} class={form.get('class')} "
+                f"action={form.get('action')} method={(form.get('method') or 'get')}"
+                + (f" data_target={data_target}" if data_target else "")
+                + "\n"
+                f"         fields={fields} mapped_bid_fields={mapping}\n"
+                f"         serialized_defaults={shown_defaults}"
             )
         chosen, _payload = find_bid_form(html, bid_cfg)
         if chosen is not None:

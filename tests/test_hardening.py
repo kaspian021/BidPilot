@@ -607,3 +607,178 @@ async def test_generator_raises_on_refusal_without_repair_or_template_fallback()
     # exactly one call: no repair pass ever ran on the refusal
     assert route.call_count == 1
     await generator.aclose()
+
+
+# =====================================================================
+# 0.9.0 — the REAL ParsCoders bid form, verified via `bidpilot inspect`
+# on project 621237 (2026-10-25): no action/method (JS submits it),
+# fields _token, bidAmount, deadline, initEscrowPercent,
+# expertGuaranteePercent, validDays, message. These tests pin the
+# pinned config, browser-faithful serialization (select defaults!),
+# data-action endpoints, and Laravel JSON/419 answers.
+# =====================================================================
+
+_REAL_PAGE_HTML = """
+<html><body>
+  <form action="/project-report/621237/new" method="post">
+    <input type="checkbox" name="project_report[]" value="spam">
+    <input type="checkbox" name="project_report[]" value="abuse" checked>
+    <input type="checkbox" name="project_report[]" value="fraud">
+    <textarea name="project_report"></textarea>
+    <button type="submit">ثبت گزارش</button>
+  </form>
+  <form class="proposal-form">
+    <input type="hidden" name="_token" value="csrf-token-xyz">
+    <label>مبلغ پیشنهادی</label><input type="text" name="bidAmount" value="">
+    <label>مدت انجام</label><input type="text" name="deadline" value="">
+    <select name="initEscrowPercent">
+      <option value="10">۱۰٪</option><option value="20" selected>۲۰٪</option>
+    </select>
+    <select name="expertGuaranteePercent">
+      <option value="0">بدون تضمین</option><option value="5">۵٪</option>
+    </select>
+    <input type="hidden" name="validDays" value="30">
+    <textarea name="message"></textarea>
+    <button type="submit">ثبت پیشنهاد</button>
+  </form>
+</body></html>"""
+
+
+def test_parscoders_config_pins_the_real_bid_form():
+    from bidpilot.sources.parscoders.adapter import load_default_settings
+
+    bid_cfg = load_default_settings()["bid"]
+    form, payload = parser.find_bid_form(_REAL_PAGE_HTML, bid_cfg)
+
+    assert form is not None
+    assert parser.map_bid_fields(form, bid_cfg) == {
+        "amount": "bidAmount",
+        "days": "deadline",
+        "description": "message",
+    }
+    # the whole point of browser-faithful serialization: the defaults a
+    # browser would send ride along (the report form contributes nothing)
+    assert payload["_token"] == "csrf-token-xyz"
+    assert payload["initEscrowPercent"] == "20"  # the *selected* option
+    assert payload["expertGuaranteePercent"] == "0"  # no selected -> first
+    assert payload["validDays"] == "30"
+    assert "project_report" not in payload
+    assert "project_report[]" not in payload
+
+
+def test_serialize_form_follows_browser_successful_control_rules():
+    from bs4 import BeautifulSoup
+
+    form = BeautifulSoup(
+        """
+        <form>
+          <input type="text" name="empty_ok" value="">
+          <input type="text" name="disabled_one" value="x" disabled>
+          <input type="checkbox" name="opt_in" value="yes">
+          <input type="checkbox" name="opt_out" value="yes" checked>
+          <input type="radio" name="plan" value="free">
+          <input type="radio" name="plan" value="pro" checked>
+          <input type="submit" name="go" value="ارسال">
+          <input type="hidden" name="secret" value="s3cr3t">
+          <textarea name="note">متن پیش‌فرض</textarea>
+          <select name="textual"><option>الف</option><option selected>ب</option></select>
+        </form>""",
+        "lxml",
+    ).find("form")
+
+    assert parser.serialize_form(form) == {
+        "empty_ok": "",
+        "opt_out": "yes",
+        "plan": "pro",
+        "secret": "s3cr3t",
+        "note": "متن پیش‌فرض",
+        "textual": "ب",
+    }
+    assert "secret" not in parser.serialize_form(form, include_hidden=False)
+
+
+def test_extract_json_notices_reads_laravel_validation_errors():
+    body = (
+        '{"message": "The given data was invalid.", '
+        '"errors": {"bidAmount": ["مبلغ پیشنهادی الزامی است."], '
+        '"deadline": ["مدت انجام باید عدد باشد.", "دومین خطا", "سومین خطای اضافی"]}}'
+    )
+    notices = parser.extract_json_notices(body)
+    assert notices[0] == "The given data was invalid."
+    assert "bidAmount: مبلغ پیشنهادی الزامی است." in notices
+    assert sum(1 for n in notices if n.startswith("deadline:")) == 2  # capped per field
+    assert parser.extract_json_notices("<html>not json</html>") == []
+    assert parser.extract_json_notices("{broken json") == []
+
+
+def test_detect_success_explains_csrf_419_and_json_422():
+    ok, message = parser.detect_success(419, "Page Expired", {})
+    assert not ok and "CSRF" in message
+
+    body = (
+        '{"message": "The given data was invalid.", "errors": {"bidAmount": ["مبلغ پیشنهادی الزامی است."]}}'
+    )
+    ok, message = parser.detect_success(422, body, {})
+    assert not ok
+    assert "422" in message and "bidAmount" in message
+
+    ok, _message = parser.detect_success(
+        200, '{"status": true, "message": "پیشنهاد شما با موفقیت ثبت شد"}', {}
+    )
+    assert ok
+
+
+@respx.mock
+async def test_submit_uses_data_action_endpoint_and_sends_select_defaults():
+    from bidpilot.models import Proposal
+
+    page = _REAL_PAGE_HTML.replace(
+        '<form class="proposal-form">',
+        '<form class="proposal-form" data-action="/project/12345/store-bid">',
+    )
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
+    post_route = respx.post("https://parscoders.com/project/12345/store-bid").mock(
+        return_value=httpx.Response(200, text="<div>پیشنهاد شما با موفقیت ثبت شد.</div>")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام، متن پیشنهاد"), 1_000_000, 14)
+
+    assert result.status.value == "submitted"
+    body = post_route.calls[0].request.content.decode()
+    assert "bidAmount=1000000" in body
+    assert "deadline=14" in body
+    assert "_token=csrf-token-xyz" in body
+    assert "initEscrowPercent=20" in body
+    assert "expertGuaranteePercent=0" in body
+    assert "validDays=30" in body
+    await source.aclose()
+
+
+@respx.mock
+async def test_submit_actionless_form_posts_to_page_and_surfaces_json_field_errors():
+    from bidpilot.models import Proposal
+
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=_REAL_PAGE_HTML)
+    )
+    respx.post("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(
+            422,
+            json={
+                "message": "The given data was invalid.",
+                "errors": {"initEscrowPercent": ["درصد گروگذاری نامعتبر است."]},
+            },
+        )
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "failed"
+    assert "initEscrowPercent" in result.message
+    await source.aclose()

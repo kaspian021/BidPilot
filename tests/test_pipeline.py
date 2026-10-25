@@ -252,7 +252,9 @@ async def test_one_digest_per_cycle_instead_of_one_message_per_project(tmp_path)
 
 async def test_digest_lists_why_projects_were_skipped(tmp_path):
     config = make_digest_config(tmp_path)
-    config.sources = [SourceConfig(type="mock", settings={"projects": [PROJECTS[0], PROJECTS[2]], "latency": 0})]
+    config.sources = [
+        SourceConfig(type="mock", settings={"projects": [PROJECTS[0], PROJECTS[2]], "latency": 0})
+    ]
     application, notifier = await build_app(config)
     report = (await application.cycle())[0]
 

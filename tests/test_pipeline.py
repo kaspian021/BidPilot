@@ -226,8 +226,6 @@ async def test_database_submission_history_never_overrides_current_page_state(tm
 
 
 async def test_database_redacts_legacy_project_details_but_keeps_bid_history(tmp_path):
-    from bidpilot.db import ProjectRow
-
     application, _ = await build_app(make_config(tmp_path))
     await application.cycle()
 

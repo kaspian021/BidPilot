@@ -782,3 +782,51 @@ async def test_submit_actionless_form_posts_to_page_and_surfaces_json_field_erro
     assert result.status.value == "failed"
     assert "initEscrowPercent" in result.message
     await source.aclose()
+
+
+@respx.mock
+async def test_submit_sends_ajax_and_csrf_headers():
+    from bidpilot.models import Proposal
+
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=_REAL_PAGE_HTML)
+    )
+    post_route = respx.post("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, json={"status": "success", "message": "پیشنهاد با موفقیت ثبت شد"})
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "submitted"
+    req_headers = post_route.calls[0].request.headers
+    assert req_headers.get("X-Requested-With") == "XMLHttpRequest"
+    assert "application/json" in req_headers.get("Accept", "")
+    assert req_headers.get("X-CSRF-TOKEN") == "csrf-token-xyz"
+    await source.aclose()
+
+
+def test_noscript_alert_on_rerendered_html_page_is_decomposed_and_ignored():
+    html_page = """
+    <html><body>
+      <noscript>
+        <div class="alert-danger">خطا: جاوا اسکریپت (JavaScript) مرورگر شما غیر فعال است! برای استفاده از پارس‌کدرز باید آن را فعال کنید.</div>
+      </noscript>
+      <div class="main-content">محتوای صفحه</div>
+    </body></html>
+    """
+    notices = parser.extract_response_notices(html_page)
+    assert notices == []
+    ok, _msg = parser.detect_success(200, html_page, {})
+    assert not ok
+
+
+def test_detect_success_understands_json_success_object():
+    ok, msg = parser.detect_success(200, '{"status": "success", "message": "ثبت شد"}', {})
+    assert ok
+    assert "ثبت شد" in msg
+
+    ok, msg = parser.detect_success(200, '{"success": true}', {})
+    assert ok

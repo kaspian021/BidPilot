@@ -28,6 +28,8 @@ runtime:
   #: one grouped «گزارش دور» per cycle instead of one message per project
   notify_digest: true
   notify_on_skip: true
+  # اگر سایت پاسخ «JavaScript لازم است» داد، همان منبع این‌قدر مکث می‌کند (با تکرار دو برابر می‌شود)
+  javascript_cooldown_seconds: 1800
   request_timeout_seconds: 25.0
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 

@@ -86,6 +86,10 @@ class RuntimeConfig(BaseModel):
     #: one grouped message per cycle instead of one message per project
     notify_digest: bool = True
     notify_error_cooldown_seconds: int = 1_800
+    #: when a marketplace answers with a "JavaScript required" interstitial,
+    #: pause *that source* this long (doubling on repeats) instead of killing
+    #: the whole daemon or hammering the site every poll interval
+    javascript_cooldown_seconds: int = 1_800
     request_timeout_seconds: float = 25.0
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

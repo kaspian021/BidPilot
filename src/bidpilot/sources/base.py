@@ -20,6 +20,25 @@ class SourceError(RuntimeError):
     pass
 
 
+class AuthenticationRequiredError(SourceError):
+    """The stored marketplace session is missing/expired — the user must log in again.
+
+    Typed on purpose: the pipeline/scheduler used to classify failures by
+    searching for Persian substrings inside human-readable messages, which
+    breaks the moment a message is reworded (and false-fires when an unrelated
+    error *mentions* login, e.g. a proposal text about building a login page).
+    """
+
+
+class JavaScriptRequiredError(SourceError):
+    """The marketplace page cannot be used without executing browser JavaScript.
+
+    Almost always transient (anti-bot interstitial), so the scheduler pauses
+    the *source* with a cooldown instead of committing suicide — see
+    :class:`bidpilot.scheduler.Scheduler`.
+    """
+
+
 class Source(abc.ABC):
     name: str = "base"
     #: HTML-backed marketplaces override this and require a verifiable page state.
@@ -98,6 +117,17 @@ class Source(abc.ABC):
     async def check_bid_status(self, project: Project) -> bool | None:
         """Check the marketplace page for an existing bid; None means unknown."""
         return None
+
+    async def enrich_project(self, project: Project) -> Project:
+        """Fetch full detail data for *one* project that passed the filters.
+
+        Detail pages are the most expensive (and most anti-bot-sensitive)
+        requests a source makes. Fetching them for every listing card — 25
+        HTTP requests per poll to enrich projects that are then filtered out —
+        is what used to get the bot disconnected/throttled. Sources override
+        this; the pipeline calls it lazily, only for real candidates.
+        """
+        return project
 
     # ---------------------------------------------------------------- helpers
     async def get_html(self, path: str, **kwargs: Any) -> str:

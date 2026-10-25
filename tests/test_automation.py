@@ -365,7 +365,9 @@ async def test_live_automation_refuses_to_start_without_a_valid_session(env, tmp
     assert "جست‌وجو و ارسال پیشنهاد شروع نشد" in notes[0]
 
 
-async def test_automation_on_report_stops_when_javascript_is_required(env):
+async def test_automation_on_report_does_not_stop_when_javascript_is_required(env):
+    # JavaScript interstitials are handled by the Scheduler's per-source
+    # cooldown; stopping the automation here was the production bug.
     notes = []
 
     async def notify(message):
@@ -393,5 +395,5 @@ async def test_automation_on_report_stops_when_javascript_is_required(env):
 
     await automation._on_report([JavaScriptReport()])
 
-    assert stopper.stopped
+    assert not stopper.stopped
     assert notes == []

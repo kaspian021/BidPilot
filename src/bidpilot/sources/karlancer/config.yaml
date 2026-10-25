@@ -101,8 +101,9 @@ list:
       - "time"
       - ".date"
   id_regex: "/projects?/(\\d+)"
-  fetch_details: true
-  detail_concurrency: 3
+  # فقط برای پروژه‌هایی که از فیلتر رد شده‌اند صفحه‌ی جزئیات باز می‌شود (ترافیک و ریسک مسدودی کمتر)
+  detail_mode: "on_demand"
+  detail_concurrency: 2
 
 detail:
   path: "/project/{external_id}"

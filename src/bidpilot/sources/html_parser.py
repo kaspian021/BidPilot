@@ -722,18 +722,58 @@ def find_budget(text: str | None, patterns: list[str] | tuple[str, ...] | None =
     return None
 
 
+#: Persian marketplaces spell small numbers out («چهار ساعت پیش», «دو روز پیش»),
+#: which the old digit-only regex never matched -> published_at was always None
+#: and the newest-first sort silently degraded to page order.
+_PERSIAN_WORD_NUMBERS: dict[str, int] = {
+    "یک": 1,
+    "دو": 2,
+    "سه": 3,
+    "چهار": 4,
+    "پنج": 5,
+    "شش": 6,
+    "هفت": 7,
+    "هشت": 8,
+    "نه": 9,
+    "ده": 10,
+    "یازده": 11,
+    "دوازده": 12,
+    "سیزده": 13,
+    "چهارده": 14,
+    "پانزده": 15,
+    "شانزده": 16,
+    "هفده": 17,
+    "هجده": 18,
+    "نوزده": 19,
+    "بیست": 20,
+    "سی": 30,
+}
+
+
 def parse_published(text: str) -> datetime | None:
     """Best-effort parser for Persian relative/absolute timestamps ("۳ ساعت پیش")."""
     if not text:
         return None
-    t = clean_text(text)
-    now = datetime.now()
-    rel = re.search(r"(\d+)\s*(دقیقه|ساعت|روز|هفته|ماه)\s*پیش", t)
-    if rel:
-        value, unit = int(rel.group(1)), rel.group(2)
-        minutes = {"دقیقه": 1, "ساعت": 60, "روز": 1440, "هفته": 10080, "ماه": 43200}[unit]
-        from datetime import timedelta
+    t = clean_text(text).replace("‌", " ")
+    # timezone-aware UTC like the rest of the codebase; a naive value here
+    # raises TypeError the day an aware one joins the same sort.
+    from datetime import timedelta, timezone
 
+    now = datetime.now(timezone.utc)
+    if any(marker in t for marker in ("لحظاتی پیش", "دقایقی پیش", "هم‌اکنون", "هم اکنون", "الان", "تازه")):
+        return now
+    if "دیروز" in t:
+        return now - timedelta(days=1)
+    if "پریروز" in t:
+        return now - timedelta(days=2)
+    if "ساعتی پیش" in t:
+        return now - timedelta(hours=1)
+    word_numbers = "|".join(sorted(_PERSIAN_WORD_NUMBERS, key=len, reverse=True))
+    rel = re.search(rf"(\d+|{word_numbers})\s*(دقیقه|ساعت|روز|هفته|ماه)\s*پیش", t)
+    if rel:
+        raw_value, unit = rel.group(1), rel.group(2)
+        value = int(raw_value) if raw_value.isdigit() else _PERSIAN_WORD_NUMBERS[raw_value]
+        minutes = {"دقیقه": 1, "ساعت": 60, "روز": 1440, "هفته": 10080, "ماه": 43200}[unit]
         return now - timedelta(minutes=value * minutes)
     try:
         import jdatetime
@@ -741,7 +781,8 @@ def parse_published(text: str) -> datetime | None:
         m = re.search(r"(\d{1,4})[/-](\d{1,2})[/-](\d{1,2})", t)
         if m and len(m.group(1)) == 4 and int(m.group(1)) > 1300:
             jalali = jdatetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            return jalali.togregorian()
+            gregorian = jalali.togregorian()  # a plain date, not a datetime
+            return datetime(gregorian.year, gregorian.month, gregorian.day, tzinfo=timezone.utc)
     except Exception:
         pass
     return None
@@ -800,7 +841,12 @@ def parse_project_card(
             end_markers=settings.get("description_end_markers"),
         )
 
-    log.info(
+    # Per-card diagnostics are DEBUG by default: 25 cards x several verbose
+    # INFO lines per cycle made real logs megabytes of percent-encoded URLs
+    # and hid the handful of lines that actually matter. The
+    # ``log_extraction_details`` diagnostics flag promotes them back to INFO.
+    log.log(
+        logging.INFO if settings.get("_diagnostics") else logging.DEBUG,
         "[PARSER][CARD] source=%s id=%s title=%r url=%s budget_selector_text=%r "
         "budget_text_used=%r budget_origin=%s budget_final={%s} skills=%r category=%r employer=%r",
         source_name,
@@ -851,7 +897,9 @@ def parse_project_card(
         skills=[s for s in skills if s][:12],
         category=_text(card, fields.get("category")) or None,
         employer=_text(card, fields.get("employer")) or None,
-        published_at=parse_published(_text(card, fields.get("published_at"))),
+        # Sites like ParsCoders print «چهار ساعت پیش» as bare card text with no
+        # date class, so fall back to scanning the card text itself.
+        published_at=parse_published(_text(card, fields.get("published_at")) or card_text),
         raw={"budget_text": budget_text},
     )
 
@@ -1061,7 +1109,8 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     # widget. Remove that exact DOM text node so proposal text remains only the brief.
     if description and budget_source_evidence and budget_source_evidence in description:
         description = description.rsplit(budget_source_evidence, 1)[0].rstrip()
-    log.info(
+    log.log(
+        logging.INFO if settings.get("_diagnostics") else logging.DEBUG,
         "[PARSER][DETAIL] source=%s id=%s title=%r url=%s scope_found=%s scope_tag=%s "
         "scope_id=%r scope_class=%r budget_selector_text=%r budget_text_used=%r "
         "budget_origin=%s budget_final={%s} description_chars=%s skills=%r category=%r employer=%r",
@@ -1397,23 +1446,60 @@ def extract_response_notices(html: str) -> list[str]:
     return notices
 
 
+#: A JavaScript-requirement notice must say "javascript" AND "disabled/enable…"
+#: within one short window. The previous implementation searched the two parts
+#: independently anywhere in the flattened page text, so a *skill tag* named
+#: «جاوا اسکریپت» plus an unrelated «فعال نیست» 300 KB later (user status,
+#: settings copy, …) reported "JavaScript required" on perfectly usable pages
+#: and shut the scheduler down. Proximity is what makes the signal real.
+_JS_REQUIRED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?:javascript|جاوا اسکریپت).{0,80}?"
+        r"(?:disabled|not enabled|must be enabled|is required|"
+        r"غیر\s*فعال|فعال نیست|فعال کنید|فعال باشد|فعال نمایید)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:enable|activate|turn on).{0,40}?javascript",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:فعال کنید|فعال باشد|فعال نمایید|غیر\s*فعال).{0,80}?(?:javascript|جاوا اسکریپت)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _visible_page_text(html: str) -> str:
+    """Flatten *visible* text only.
+
+    ``<noscript>`` banners ("JavaScript را فعال کنید") ship on almost every
+    page and are by definition only rendered when JS is off *in a browser*;
+    ``<script>``/``<style>``/``<template>`` content is not visible copy either.
+    Counting them made the JS detector fire on every healthy page.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    for node in soup(["script", "style", "noscript", "template"]):
+        node.decompose()
+    return _normalized_marker(soup.get_text(" ", strip=True))
+
+
+def javascript_requirement_snippet(html: str) -> str:
+    """Return the short matched notice (for logs/messages), or ``""``."""
+    text = _visible_page_text(html)
+    if not text:
+        return ""
+    for pattern in _JS_REQUIRED_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            start = max(0, match.start() - 30)
+            return text[start : match.end() + 30].strip()[:200]
+    return ""
+
+
 def requires_javascript(html: str) -> bool:
-    """Detect an explicit site message requiring browser-side JavaScript."""
-    text = _normalized_marker(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
-    has_javascript = "javascript" in text or "جاوا اسکریپت" in text
-    persian_disabled = has_javascript and any(
-        marker in text for marker in ("غیر فعال", "غیرفعال", "فعال نیست")
-    )
-    persian_enable = "جاوا اسکریپت" in text and any(marker in text for marker in ("فعال کنید", "فعال باشد"))
-    english_required = bool(
-        re.search(
-            r"javascript.{0,60}(?:disabled|not enabled|must be enabled|is required)",
-            text,
-            re.IGNORECASE,
-        )
-        or re.search(r"(?:enable|activate|turn on).{0,40}javascript", text, re.IGNORECASE)
-    )
-    return persian_disabled or persian_enable or english_required
+    """Detect an explicit, *visible* site message requiring browser JavaScript."""
+    return bool(javascript_requirement_snippet(html))
 
 
 def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tuple[bool, str]:
@@ -1458,6 +1544,7 @@ __all__ = [
     "detect_success",
     "detect_existing_bid",
     "extract_response_notices",
+    "javascript_requirement_snippet",
     "requires_javascript",
     "enrich_from_detail",
     "extract_external_id",

@@ -1,4 +1,15 @@
-"""Polling scheduler: jittered intervals, graceful shutdown, error backoff."""
+"""Polling scheduler: jittered intervals, graceful shutdown, error backoff.
+
+Failure policy (deliberately asymmetric):
+
+* **Authentication failure** -> hard stop. Bidding logged-out risks duplicate
+  or misdirected proposals, and only the user can fix the cookie.
+* **JavaScript-required interstitial** -> pause *that one source* with an
+  exponentially growing cooldown and keep everything else running. These
+  pages are usually transient anti-bot responses; the old behaviour killed
+  the whole daemon forever on the first one (and, worse, the detector could
+  false-fire on a healthy page), leaving the bot dead until a manual /run.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +18,7 @@ import inspect
 import logging
 import random
 import signal
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -30,11 +42,19 @@ class Scheduler:
         app_factory: Callable[[], Application] | None = None,
         store: SettingsStore | None = None,
         on_report: Callable[[list[Any]], Any] | None = None,
+        javascript_cooldown: int | None = None,
     ) -> None:
         self.app = app
         self.interval = interval or app.config.runtime.poll_interval_seconds
         self.jitter = jitter if jitter is not None else app.config.runtime.jitter_seconds
         self.sources = sources
+        if javascript_cooldown is None:
+            javascript_cooldown = int(getattr(app.config.runtime, "javascript_cooldown_seconds", 1_800) or 0)
+        self.javascript_cooldown = max(0, int(javascript_cooldown))
+        #: source name -> monotonic deadline until which it is not polled
+        self._paused_until: dict[str, float] = {}
+        #: source name -> consecutive JavaScript-required reports (backoff input)
+        self._js_streak: dict[str, int] = {}
         self._stop = asyncio.Event()
         self.consecutive_errors = 0
         # When the user changes something in the Telegram bot (tone, key, live mode,
@@ -104,6 +124,47 @@ class Scheduler:
         except Exception as exc:  # a broken callback must not stop the bidder
             log.warning("on_report callback failed: %s", exc)
 
+    # ------------------------------------------------- JavaScript circuit breaker
+    def _active_sources(self) -> list[str] | None:
+        """Sources to poll this cycle (None = application's own default list)."""
+        names = self.sources or list(getattr(self.app, "sources", {}) or [])
+        if not names:
+            return self.sources
+        now = time.monotonic()
+        return [name for name in names if self._paused_until.get(name, 0.0) <= now]
+
+    def _pause_javascript_sources(self, reports: list[Any]) -> None:
+        for report in reports or []:
+            name = str(getattr(report, "source", "") or "")
+            if not name:
+                continue
+            if not getattr(report, "javascript_required", False):
+                self._js_streak.pop(name, None)  # healthy again: reset backoff
+                continue
+            streak = self._js_streak.get(name, 0) + 1
+            self._js_streak[name] = streak
+            if not self.javascript_cooldown:
+                continue
+            cooldown = min(
+                self.javascript_cooldown * (2 ** (streak - 1)),
+                self.javascript_cooldown * 8,
+            )
+            self._paused_until[name] = time.monotonic() + cooldown
+            log.error(
+                "[SCHEDULER][PAUSE-JAVASCRIPT] source=%s paused_for=%ss streak=%s "
+                "(other sources keep polling; this one retries automatically)",
+                name,
+                cooldown,
+                streak,
+            )
+
+    def _seconds_until_next_resume(self) -> float | None:
+        if not self._paused_until:
+            return None
+        now = time.monotonic()
+        remaining = [until - now for until in self._paused_until.values() if until > now]
+        return min(remaining) if remaining else None
+
     async def run_forever(self) -> None:
         self._install_signal_handlers()
         mode = "LIVE" if self.app.config.runtime.live else "DRY-RUN"
@@ -119,12 +180,23 @@ class Scheduler:
 
         while not self._stop.is_set():
             started = datetime.now(timezone.utc)
+            all_paused = False
             try:
                 await self.reload_if_settings_changed()
-                reports = await self.app.cycle(self.sources)
+                active = self._active_sources()
+                if active == []:
+                    all_paused = True
+                    log.warning(
+                        "[SCHEDULER][PAUSED] every source is in JavaScript cooldown; next retry in %.0fs",
+                        self._seconds_until_next_resume() or 0,
+                    )
+                    reports = []
+                else:
+                    reports = await self.app.cycle(active)
                 self.consecutive_errors = 0
                 self._remember_safe_test(reports)
-                await self._emit_report(reports)
+                if reports:
+                    await self._emit_report(reports)
                 for report in reports:
                     log.info(report.summary())
                     for error in report.errors:
@@ -133,12 +205,10 @@ class Scheduler:
                     log.error("[SCHEDULER][STOP-AUTH] marketplace login is not verified; stopping polling")
                     self.request_stop()
                     break
-                if any(getattr(report, "javascript_required", False) for report in reports):
-                    log.error(
-                        "[SCHEDULER][STOP-JAVASCRIPT] marketplace requires browser-side JavaScript; stopping polling"
-                    )
-                    self.request_stop()
-                    break
+                # JavaScript interstitials pause the offending source only;
+                # they are usually transient anti-bot pages and must not kill
+                # the daemon (or the user's other marketplaces) forever.
+                self._pause_javascript_sources(reports)
             except Exception as exc:  # keep the daemon alive no matter what
                 self.consecutive_errors += 1
                 log.exception("Cycle failed (%s in a row)", self.consecutive_errors)
@@ -151,6 +221,12 @@ class Scheduler:
                 delay = min(delay * (2**self.consecutive_errors), 3_600)
             elapsed = (datetime.now(timezone.utc) - started).total_seconds()
             sleep_for = max(5.0, delay - elapsed)
+            if all_paused:
+                # Wake up exactly when the first paused source may retry
+                # instead of sleeping a whole extra poll interval past it.
+                resume_in = self._seconds_until_next_resume()
+                if resume_in is not None:
+                    sleep_for = min(sleep_for, max(5.0, resume_in))
             log.debug("Sleeping %.0fs", sleep_for)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=sleep_for)

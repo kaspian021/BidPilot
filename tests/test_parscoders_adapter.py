@@ -51,7 +51,7 @@ async def test_fetch_enriches_from_detail_page():
     detail_route = respx.get(url__regex=r"https://parscoders\.com/project/\d+").mock(
         return_value=httpx.Response(200, text=PROJECT_HTML)
     )
-    source = make_source(list={"fetch_details": True, "detail_concurrency": 2})
+    source = make_source(list={"detail_mode": "eager", "detail_concurrency": 2})
 
     projects = await source.fetch_projects()
     assert detail_route.call_count == 3
@@ -268,7 +268,7 @@ async def test_detail_html_is_cached_between_poll_cycles():
     detail_route = respx.get(url__regex=r"https://parscoders[.]com/project/[0-9]+").mock(
         return_value=httpx.Response(200, text=PROJECT_HTML)
     )
-    source = make_source(list={"fetch_details": True, "detail_concurrency": 2})
+    source = make_source(list={"detail_mode": "eager", "detail_concurrency": 2})
 
     first = await source.fetch_projects()
     second = await source.fetch_projects()

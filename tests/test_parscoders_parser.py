@@ -59,7 +59,6 @@ def test_bid_form_payload_and_field_mapping():
     assert mapping["days"] == "delivery_days"
 
 
-
 def test_detect_existing_bid_from_edit_proposal_controls():
     html = """
     <html><body>

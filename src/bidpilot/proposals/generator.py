@@ -67,6 +67,39 @@ class ValidationReport:
         return not self.issues
 
 
+#: Phrases that betray an LLM *refusal* instead of a proposal. Production
+#: incident: for a "game cheat" project the model answered with an ethics
+#: refusal that passed repair + validation and was one request away from
+#: being submitted to the employer. Refusals are never repaired and never
+#: template-fallback-ed — the project itself is skipped.
+REFUSAL_MARKERS = (
+    "نمی‌توانم همکاری",
+    "نمی‌توانم در این پروژه",
+    "نمی‌توانم پیشنهاد",
+    "نمی‌توانم کمکی",
+    "نمی‌توانم انجام",
+    "نمی‌تونم همکاری",
+    "امکان همکاری در این پروژه",
+    "مخالف اخلاقیات",
+    "مخالف قوانین بازی",
+    "برخلاف قوانین",
+    "برخلاف اخلاقیات",
+    "نمی‌تواند در این پروژه",
+    "i can't help",
+    "i cannot help",
+    "i can't assist",
+    "i cannot assist",
+    "against my guidelines",
+    "against the game's rules",
+)
+
+
+def looks_like_refusal(text: str) -> bool:
+    """True when the text contains an LLM refusal marker."""
+    folded = (text or "").casefold().replace("‌", " ").replace("ـ", "")
+    return any(marker.casefold().replace("‌", " ") in folded for marker in REFUSAL_MARKERS)
+
+
 def validate_proposal(
     text: str,
     config: ProposalConfig,
@@ -79,6 +112,8 @@ def validate_proposal(
 
     if not stripped:
         return ValidationReport(["متن خالی است."])
+    if looks_like_refusal(stripped):
+        return ValidationReport(["خروجی مدل ردّ همکاری (refusal) است، نه متن پیشنهاد؛ نباید ارسال شود."])
     if not stripped.startswith(_SALAM):
         issues.append("متن باید با سلام/وقت بخیر شروع شود.")
     if strict_length and len(stripped) < config.min_chars:
@@ -211,6 +246,19 @@ class ProposalGenerator:
                 continue
 
             text = response.text.strip()
+            if looks_like_refusal(text):
+                # A refusal means the model refused the *project* itself
+                # (e.g. game cheats). Never repair it — a repaired refusal
+                # with a greeting on top is what nearly got submitted — and
+                # never template-fallback it: the project is skipped outright.
+                log.error(
+                    "[PROPOSAL][REFUSAL] provider=%s project=%r skipped",
+                    provider.id,
+                    project.title[:70],
+                )
+                raise ProposalError(
+                    "مدل زبانی از همکاری روی این پروژه خودداری کرد (refusal)؛ پروژه رد می‌شود."
+                )
             report = validate_proposal(text, self.settings, amount)
             if not report.ok:
                 log.info(

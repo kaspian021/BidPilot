@@ -58,6 +58,13 @@ filters:
     - "هک"
     - "کپی سایت"
     - "پروژه دانشجویی"
+    # game cheats: LLM providers refuse these (refusal guard exists too), so
+    # skip them upstream — قبل از تولید متن فیلتر می‌شوند
+    - "cheat"
+    - "aimbot"
+    - "wallhack"
+    - "چیت بازی"
+    - "تقلب در بازی"
   min_budget: null
   max_budget: null
   categories_allow: []

@@ -265,3 +265,345 @@ async def test_pipeline_enriches_only_projects_that_pass_the_filter(tmp_path):
     # the blacklisted project ("2") never earned a detail-page request
     assert enriched_ids == ["1", "3"]
     await application.close()
+
+
+# =====================================================================
+# 0.8.0 — the wrong-form incident (production, project 621237): the
+# proposal was POSTed to /project-report/<id>/new because the old
+# heuristic took "the first form with a textarea", the POST bounced to
+# /login with a JavaScript alert, and the pipeline hard-stopped the
+# whole scheduler as "session expired". Each test pins one link of
+# that chain so it can never reassemble.
+# =====================================================================
+
+_BID_CFG = {
+    "fields": {
+        "amount": ["input[name='amount']"],
+        "description": ["textarea"],
+        "days": ["input[name='days']"],
+    }
+}
+
+_REPORT_FORM_HTML = """
+<form action="/project-report/621237/new" method="post">
+  <textarea name="report-textarea-report"></textarea>
+  <input type="hidden" name="_csrf" value="tok">
+  <button type="submit">ثبت گزارش</button>
+</form>"""
+
+_REAL_BID_FORM_HTML = """
+<form id="frm-proposal" action="/project/621237/bid" method="post">
+  <label>مبلغ پیشنهادی</label><input name="amount" type="number">
+  <label>مدت انجام</label><input name="days" type="number">
+  <textarea name="description"></textarea>
+  <button type="submit">ثبت پیشنهاد</button>
+</form>"""
+
+
+def test_bid_form_scoring_prefers_real_bid_form_over_earlier_report_form():
+    html = f"<html><body>{_REPORT_FORM_HTML}{_REAL_BID_FORM_HTML}</body></html>"
+    form, _payload = parser.find_bid_form(html, _BID_CFG)
+    assert form is not None
+    assert form.get("id") == "frm-proposal"
+    assert "report" not in (form.get("action") or "")
+
+
+def test_report_form_alone_is_never_a_bid_form():
+    html = f"<html><body>{_REPORT_FORM_HTML}</body></html>"
+    form, _payload = parser.find_bid_form(html, _BID_CFG)
+    assert form is None
+    # …even when a stale configured selector matches it directly
+    form, _payload = parser.find_bid_form(html, {**_BID_CFG, "form_selectors": ["form[action*='report']"]})
+    assert form is None
+
+
+def test_login_form_with_password_is_disqualified_even_with_textarea_and_price():
+    html = """
+    <html><body>
+      <form action="/login" method="post">
+        <input name="amount" type="number">
+        <textarea name="description"></textarea>
+        <input type="password" name="password">
+      </form>
+    </body></html>"""
+    form, _payload = parser.find_bid_form(html, _BID_CFG)
+    assert form is None
+
+
+def test_textarea_only_form_is_not_trusted_without_an_amount():
+    html = """
+    <html><body>
+      <form action="/project/621237" method="post">
+        <textarea name="description"></textarea>
+        <button type="submit">ارسال</button>
+      </form>
+    </body></html>"""
+    form, _payload = parser.find_bid_form(html, _BID_CFG)
+    assert form is None
+
+
+def test_proposal_cta_url_is_found_but_login_and_hash_ctas_are_ignored():
+    page_url = "https://example.com/project/621237"
+    html = '<a href="/project/621237/proposal-form" class="btn btn-primary">ارسال پیشنهاد</a>'
+    assert parser.find_proposal_cta_url(html, page_url) == "https://example.com/project/621237/proposal-form"
+
+    login_only = '<a href="/login">ارسال پیشنهاد</a><a href="#">ثبت پیشنهاد</a>'
+    assert parser.find_proposal_cta_url(login_only, page_url) is None
+
+
+def test_js_cookie_assignments_extracts_only_static_values():
+    html = """
+    <script>
+      document.cookie = "human_check=ok; path=/";
+      Cookies.set('js_verified', '1');
+      document.cookie = "token=" + location.hash;
+      document.cookie = "ts=" + Date.now();
+    </script>"""
+    assert parser.extract_js_cookie_assignments(html) == {
+        "human_check": "ok",
+        "js_verified": "1",
+    }
+
+
+def test_generic_amount_and_days_field_name_fallbacks():
+    from bs4 import BeautifulSoup
+
+    form = BeautifulSoup(
+        """
+        <form action="/bid" method="post">
+          <input name="my_price" type="text">
+          <input name="delivery_time" type="text">
+          <textarea name="proposal_text"></textarea>
+        </form>""",
+        "lxml",
+    ).find("form")
+    mapping = parser.map_bid_fields(form, {})
+    assert mapping == {
+        "amount": "my_price",
+        "days": "delivery_time",
+        "description": "proposal_text",
+    }
+
+
+# ------------------------------------------------------- submit-level pinning
+@respx.mock
+async def test_submit_never_posts_to_the_report_form():
+    from bidpilot.models import Proposal
+
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=f"<html><body>{_REPORT_FORM_HTML}</body></html>")
+    )
+    post_route = respx.post(url__regex=r"https://parscoders\.com/.*").mock(
+        return_value=httpx.Response(200, text="unexpected")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "failed"
+    assert "شناسایی نشد" in result.message
+    assert post_route.call_count == 0
+    await source.aclose()
+
+
+@respx.mock
+async def test_submit_follows_proposal_cta_and_finds_form_on_the_next_page():
+    from bidpilot.models import Proposal
+
+    landing = """
+    <html><body>
+      <a href="/project/12345/proposal-form" class="btn btn-primary">ارسال پیشنهاد</a>
+    </body></html>"""
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=landing))
+    respx.get("https://parscoders.com/project/12345/proposal-form").mock(
+        return_value=httpx.Response(200, text=PROJECT_HTML)
+    )
+    post_route = respx.post("https://parscoders.com/project/12345/bid").mock(
+        return_value=httpx.Response(200, text="<div>پیشنهاد شما با موفقیت ثبت شد.</div>")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "submitted"
+    assert post_route.call_count == 1
+    await source.aclose()
+
+
+@respx.mock
+async def test_submit_replays_static_js_cookies_from_the_project_page():
+    from bidpilot.models import Proposal
+
+    page = PROJECT_HTML.replace(
+        "<body>", '<body><script>document.cookie = "human_check=ok; path=/";</script>'
+    )
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
+    post_route = respx.post("https://parscoders.com/project/12345/bid").mock(
+        return_value=httpx.Response(200, text="<div>پیشنهاد شما با موفقیت ثبت شد.</div>")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "submitted"
+    cookie_header = post_route.calls[0].request.headers.get("cookie", "")
+    assert "human_check=ok" in cookie_header
+    await source.aclose()
+
+
+@respx.mock
+async def test_post_redirect_to_login_with_js_alert_is_javascript_not_expired_session():
+    """The exact response shape from the incident log."""
+    from bidpilot.models import Proposal
+
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=PROJECT_HTML)
+    )
+    respx.post("https://parscoders.com/project/12345/bid").mock(
+        return_value=httpx.Response(302, headers={"Location": "/login"})
+    )
+    respx.get("https://parscoders.com/login").mock(
+        return_value=httpx.Response(200, text=f"<html><body>{JS_ALERT}</body></html>")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "x"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
+
+    assert result.status.value == "failed"
+    assert result.javascript_required
+    assert "نشست منقضی" not in result.message
+    await source.aclose()
+
+
+# ------------------------------------------ auth failures are confirmed first
+async def _run_live_cycle(tmp_path, *, session_alive: bool):
+    from bidpilot.app import Application
+    from bidpilot.config import SourceConfig
+    from bidpilot.models import Proposal, SubmissionResult, SubmissionStatus
+
+    config = AppConfig(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.sqlite3'}",
+        profile=Profile(first_name="محمد", full_name="محمد رضایی"),
+        runtime=RuntimeConfig(
+            submit_mode="live",
+            max_bids_per_hour=50,
+            max_bids_per_day=100,
+            min_seconds_between_bids=0,
+            notify_on_skip=False,
+        ),
+        filters=FiltersConfig(require_budget=False, require_skill_match=False),
+        sources=[
+            SourceConfig(
+                type="mock",
+                settings={
+                    "projects": [
+                        {
+                            "external_id": "1",
+                            "title": "ساخت ربات تلگرام فروشگاهی",
+                            "description": "ربات تلگرام با سبد خرید و درگاه پرداخت",
+                            "budget": {"min": 500_000, "max": 1_500_000},
+                            "skills": ["Python"],
+                        }
+                    ],
+                    "latency": 0,
+                },
+            )
+        ],
+        llm={"enabled": False},
+    )
+    application = Application.build(config, Secrets(_env_file=None))
+    await application.setup()
+    source = application.sources["mock"]
+
+    async def not_bidded(project: Project) -> bool:
+        return False
+
+    async def bounced_to_login(
+        project: Project, proposal: Proposal, amount: int, delivery_days: int | None
+    ) -> SubmissionResult:
+        return SubmissionResult(
+            status=SubmissionStatus.FAILED,
+            message="لینک «ارسال پیشنهاد» به مسیر ورود هدایت می‌شود؛ نشست منقضی شده است.",
+        )
+
+    async def verify() -> tuple[bool, str]:
+        return session_alive, "verified" if session_alive else "no session"
+
+    source.check_bid_status = not_bidded  # type: ignore[method-assign]
+    source.submit_bid = bounced_to_login  # type: ignore[method-assign]
+    source.verify_session = verify  # type: ignore[method-assign]
+
+    report = (await application.cycle())[0]
+    await application.close()
+    return report
+
+
+async def test_pipeline_does_not_hard_stop_when_the_session_still_verifies(tmp_path):
+    report = await _run_live_cycle(tmp_path, session_alive=True)
+    assert report.failed == 1
+    assert report.authentication_failed is False
+
+
+async def test_pipeline_hard_stops_when_the_session_really_is_dead(tmp_path):
+    report = await _run_live_cycle(tmp_path, session_alive=False)
+    assert report.authentication_failed is True
+
+
+# ------------------------------------------------------------- LLM refusals
+def test_looks_like_refusal_catches_the_game_cheat_incident_shape():
+    from bidpilot.proposals.generator import looks_like_refusal
+
+    refusal = (
+        "سلام و وقت بخیر. ساخت ابزار تقلب مخالف قوانین بازی و سیاست‌های ناشر است؛ "
+        "نمی‌توانم در این پروژه همکاری کنم."
+    )
+    assert looks_like_refusal(refusal)
+    assert looks_like_refusal("I'm sorry, but I can't help with creating a game cheat.")
+    assert not looks_like_refusal("سلام و وقت بخیر 🌱 من محمد رضایی هستم و پیشنهاد من ۱,۰۰۰,۰۰۰ تومان است.")
+
+
+def test_validate_proposal_rejects_refusals():
+    from bidpilot.proposals.generator import validate_proposal
+
+    report = validate_proposal(
+        "سلام و وقت بخیر، نمی‌توانم در این پروژه همکاری کنم؛ برخلاف قوانین است.",
+        make_config().proposal,
+        1_000_000,
+    )
+    assert not report.ok
+    assert any("refusal" in issue for issue in report.issues)
+
+
+@respx.mock
+async def test_generator_raises_on_refusal_without_repair_or_template_fallback():
+    from bidpilot.proposals.generator import ProposalError, ProposalGenerator
+    from bidpilot.proposals.llm_client import LLMClient
+
+    refusal = "سلام و وقت بخیر، نمی‌توانم در این پروژه همکاری کنم؛ ساخت چیت برخلاف قوانین است."
+    route = respx.post("https://llm.test/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"model": "m", "choices": [{"message": {"content": refusal}}]})
+    )
+    llm = LLMClient("https://llm.test/v1", "key", "test-model")
+    generator = ProposalGenerator(make_config(), llm=llm)
+    project = Project(
+        source="mock",
+        external_id="1",
+        title="ساخت ابزار بازی",
+        description="ابزار کمکی بازی",
+        budget=Budget(min=500_000, max=1_500_000),
+    )
+
+    with pytest.raises(ProposalError):
+        await generator.generate(project, 1_000_000, 14)
+
+    # exactly one call: no repair pass ever ran on the refusal
+    assert route.call_count == 1
+    await generator.aclose()

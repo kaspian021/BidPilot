@@ -591,13 +591,13 @@ class HtmlMarketSource(Source):
         seen: set[str] = set()
         log.info(
             "[SELECTORS][START] source=%s base_url=%s list_path=%s max_pages=%s "
-            "card_selectors=%r detail_enabled=%s detail_path=%s",
+            "card_selectors=%r detail_mode=%s detail_path=%s",
             self.name,
             self.base_url,
             path,
             max_pages,
             list_cfg.get("card_selectors") or [],
-            bool(list_cfg.get("fetch_details", True)),
+            self.detail_mode(),
             (self.settings.get("detail") or {}).get("path", "{external_id}"),
         )
         for page in range(1, max_pages + 1):
@@ -871,6 +871,69 @@ class HtmlMarketSource(Source):
         return list(await asyncio.gather(*(enrich(p) for p in projects)))
 
     # -------------------------------------------------------------- bidding
+    def _apply_js_cookies(self, client: httpx.AsyncClient, html: str, page_url: str) -> None:
+        """Replay static ``document.cookie`` assignments found in the page."""
+        cookies = parser.extract_js_cookie_assignments(html)
+        if not cookies:
+            return
+        host = urlsplit(page_url).hostname or ""
+        for name, value in cookies.items():
+            try:
+                client.cookies.set(name, value, domain=host)
+            except Exception:  # a mock/minimal client must not break bidding
+                log.debug("[BID][JS-COOKIES] could not set cookie %s", name)
+        log.info(
+            "[BID][JS-COOKIES] source=%s applied_names=%r host=%s",
+            self.name,
+            sorted(cookies),
+            host,
+        )
+
+    async def _follow_proposal_cta(
+        self,
+        client: httpx.AsyncClient,
+        html: str,
+        page_url: str,
+        bid_cfg: dict[str, Any],
+        project: Project,
+    ) -> tuple[Any, dict[str, Any], str] | None:
+        """GET the «ارسال پیشنهاد» target once and look for the real form there."""
+        cta_url = parser.find_proposal_cta_url(html, page_url)
+        if not cta_url or urlsplit(cta_url).path == urlsplit(page_url).path:
+            return None
+        log.info(
+            "[BID][CTA-FOLLOW] source=%s id=%s cta_path=%s",
+            self.name,
+            project.external_id,
+            urlsplit(cta_url).path,
+        )
+        try:
+            cta_page = await client.get(
+                cta_url,
+                headers={"Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
+            )
+        except httpx.HTTPError as exc:
+            log.warning(
+                "[BID][CTA-FOLLOW] source=%s id=%s outcome=network_error error_type=%s",
+                self.name,
+                project.external_id,
+                type(exc).__name__,
+            )
+            return None
+        if cta_page.status_code >= 400:
+            log.warning(
+                "[BID][CTA-FOLLOW] source=%s id=%s outcome=http_%s",
+                self.name,
+                project.external_id,
+                cta_page.status_code,
+            )
+            return None
+        self._apply_js_cookies(client, cta_page.text, str(cta_page.url))
+        form, payload = parser.find_bid_form(cta_page.text, bid_cfg)
+        if form is None:
+            return None
+        return form, payload, str(cta_page.url)
+
     async def submit_bid(
         self,
         project: Project,
@@ -915,11 +978,24 @@ class HtmlMarketSource(Source):
         if page.status_code >= 400:
             return self.fail(f"صفحه پروژه قابل دریافت نبود (HTTP {page.status_code}).", page.status_code)
 
+        # Some sites gate POSTs on a trivial cookie their own JS sets
+        # ("document.cookie = ...") and bounce everyone else to /login with
+        # a «جاوا اسکریپت غیر فعال است» alert. Replaying those static
+        # assignments is faithful browser behaviour, no JS engine needed.
+        self._apply_js_cookies(client, page.text, str(page.url))
+
         # Functional evidence beats textual banners: many pages render a
         # "JavaScript را فعال کنید" notice server-side and hide it with JS.
         # If the real bid form is right there, the page is usable — only a
         # missing form + JS notice means the flow truly needs a browser.
+        form_page_url = str(page.url)
         form, payload = parser.find_bid_form(page.text, bid_cfg)
+        if form is None:
+            # The form often lives behind the «ارسال پیشنهاد» button (its own
+            # page or an AJAX modal). Follow that URL once before diagnosing.
+            followed = await self._follow_proposal_cta(client, page.text, form_page_url, bid_cfg, project)
+            if followed is not None:
+                form, payload, form_page_url = followed
         if form is None:
             # A login-gated CTA is more specific/actionable than a JS banner
             # (a logged-out page can show both), so it wins the diagnosis.
@@ -966,14 +1042,14 @@ class HtmlMarketSource(Source):
         if delivery_days and "days" in mapping:
             payload[mapping["days"]] = str(delivery_days)
 
-        action = urljoin(str(page.url), form.get("action") or str(page.url))
+        action = urljoin(form_page_url, form.get("action") or form_page_url)
         method = (form.get("method") or "post").upper()
 
         try:
             if method == "POST":
-                response = await client.post(action, data=payload, headers={"Referer": str(page.url)})
+                response = await client.post(action, data=payload, headers={"Referer": form_page_url})
             else:
-                response = await client.get(action, params=payload, headers={"Referer": str(page.url)})
+                response = await client.get(action, params=payload, headers={"Referer": form_page_url})
         except httpx.HTTPError as exc:
             return self.fail(f"خطای شبکه هنگام ارسال پیشنهاد: {exc}")
 
@@ -987,6 +1063,42 @@ class HtmlMarketSource(Source):
         login_path_re = re.compile(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", re.I)
         redirected_paths = [final_path, location_path, *(item["path"] for item in redirect_history)]
         notices = parser.extract_response_notices(response.text)
+        # Diagnosis order matters (this exact response shape occurred in
+        # production): POST -> 302 -> /login page whose visible alert says
+        # «جاوا اسکریپت غیر فعال است». The old order called that "session
+        # expired", hard-stopped the scheduler and sent the user on a futile
+        # cookie-refresh loop while the cookie was perfectly valid. So:
+        #   1) an explicit success confirmation outranks everything;
+        #   2) an explicit visible JavaScript alert outranks a login redirect
+        #      (the site is telling us the *reason* for the bounce);
+        #   3) only then does a bare login redirect mean "session expired".
+        _ok_preview, _ = parser.detect_success(response.status_code, response.text, bid_cfg)
+        js_notice = next((item for item in notices if parser.requires_javascript(item)), "")
+        if not _ok_preview and js_notice:
+            message = _javascript_required_message(js_notice)
+            log.warning(
+                "[BID][SUBMIT-RESPONSE] source=%s id=%s status=%s action_path=%s final_path=%s "
+                "location_path=%s redirects=%r response_chars=%s notices=%r "
+                "outcome=javascript_required message=%r",
+                self.name,
+                project.external_id,
+                response.status_code,
+                urlsplit(action).path,
+                final_path,
+                location_path,
+                redirect_history,
+                len(response.text or ""),
+                notices,
+                message,
+            )
+            return SubmissionResult(
+                status=SubmissionStatus.FAILED,
+                message=message,
+                http_status=response.status_code,
+                payload_debug={"action": action, "fields": sorted(payload)},
+                javascript_required=True,
+            )
+
         if any(login_path_re.search(path) for path in redirected_paths if path):
             message = (
                 "نشست منقضی شده است؛ ارسال متوقف شد. از /market ورود/کوکی را به‌روز کن و با /test بررسی کن."
@@ -1006,10 +1118,8 @@ class HtmlMarketSource(Source):
             )
             return self.fail(message, response.status_code)
 
-        # An explicit success confirmation from the site outranks everything:
-        # never reclassify a *submitted* bid as "JavaScript required" because
-        # the surrounding page also carries a (hidden-by-JS) banner.
-        _ok_preview, _ = parser.detect_success(response.status_code, response.text, bid_cfg)
+        # (Success was already ruled in/out above via _ok_preview; a
+        # whole-page JS banner with no alert notice is the last JS signal.)
         if not _ok_preview and parser.requires_javascript(response.text):
             notice = next((item for item in notices if parser.requires_javascript(item)), "")
             message = _javascript_required_message(notice)

@@ -1139,11 +1139,48 @@ def inspect(
                 text = node.get_text(" ", strip=True)[:80] if node else "—"
                 console.print(f"  {'✅' if node else '❌'} {escape(selector)}  →  {escape(text)}")
 
+        from .sources.html_parser import (
+            detect_existing_bid,
+            extract_js_cookie_assignments,
+            find_bid_form,
+            find_proposal_cta_url,
+            map_bid_fields,
+            score_bid_form,
+        )
+
         forms = soup.find_all("form")
-        console.print(f"\nتعداد فرم‌ها در صفحه: [bold]{len(forms)}[/bold]")
-        for i, form in enumerate(forms[:5]):
+        console.print(f"\nتعداد فرم‌ها در صفحه: [bold]{len(forms)}[/bold] (امتیاز احتمال «فرم پیشنهاد» بودن)")
+        bid_cfg = defaults.get("bid", {}) or {}
+        for i, form in enumerate(forms[:12]):
             fields = [inp.get("name") for inp in form.select("input,textarea,select") if inp.get("name")]
-            console.print(f"  form#{i} action={form.get('action')} fields={fields}")
+            mapping = map_bid_fields(form, bid_cfg)
+            console.print(
+                f"  form#{i} score=[bold]{score_bid_form(form, bid_cfg)}[/bold] "
+                f"action={form.get('action')} method={(form.get('method') or 'get')}\n"
+                f"         fields={fields} mapped_bid_fields={mapping}"
+            )
+        chosen, _payload = find_bid_form(html, bid_cfg)
+        if chosen is not None:
+            console.print(
+                f"[green]فرم پیشنهاد انتخاب‌شده:[/green] action={chosen.get('action')} "
+                f"mapped={map_bid_fields(chosen, bid_cfg)}"
+            )
+        else:
+            console.print(
+                "[red]هیچ فرم پیشنهادی قابل‌اعتماد پیدا نشد (فرم باید متن و مبلغ هر دو را داشته باشد).[/red]"
+            )
+        base_url = str(defaults.get("base_url") or "")
+        cta = find_proposal_cta_url(html, shown_url if shown_url.startswith("http") else base_url)
+        console.print(f"دکمه/لینک «ارسال پیشنهاد»: {cta or '—'}")
+        js_cookies = extract_js_cookie_assignments(html)
+        console.print(
+            "کوکی‌های ست‌شده با JavaScript (فقط نام): " + (", ".join(js_cookies.keys()) if js_cookies else "—")
+        )
+        existing = detect_existing_bid(html, bid_cfg)
+        console.print(
+            "پیشنهاد قبلی روی این صفحه: "
+            + ("دیده می‌شود" if existing else "دیده نمی‌شود" if existing is False else "نامشخص")
+        )
 
         config_file = getattr(get_source_class(active), "config_file", None)
         console.print(

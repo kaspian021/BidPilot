@@ -260,12 +260,9 @@ class BidPipeline:
             await self._emit_skip(project, decision.reason, report)
             return plan
 
-        # Check the marketplace's current UI before pricing/LLM work. This is
-        # the source of truth for prior bids; the database is not a seen-project cache.
-        project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
-        latest_bid = (
-            await self.repo.latest_bid_for_project(project_row.id) if project_row is not None else None
-        )
+        # The marketplace project page is the only authority for whether we
+        # already bid. The database stores submission history for rate limits,
+        # but must never determine whether a scanned project is a duplicate.
         bid_state: bool | None = False
         if self.live:
             try:
@@ -313,30 +310,19 @@ class BidPipeline:
             )
             return None
 
-        if bid_state is None:
-            if latest_bid is not None and latest_bid.status == SubmissionStatus.SUBMITTED.value:
-                report.duplicates += 1
-                log.warning(
-                    "[PIPELINE][BID-STATUS-FALLBACK] source=%s id=%s "
-                    "page_state=unknown fallback=confirmed_submission_history",
-                    project.source,
-                    project.external_id,
-                )
-                return None
-            if getattr(self.sources[project.source], "requires_bid_status_check", False):
-                reason = "وضعیت پیشنهاد در صفحهٔ پروژه قابل تشخیص نبود؛ برای جلوگیری از ارسال تکراری رد شد."
-                report.skipped += 1
-                await self._emit_skip(project, reason, report)
-                log.warning(
-                    "[PIPELINE][BID-STATUS-UNKNOWN] source=%s id=%s action=skip_to_avoid_duplicate",
-                    project.source,
-                    project.external_id,
-                )
-                return None
+        if bid_state is None and getattr(self.sources[project.source], "requires_bid_status_check", False):
+            reason = "وضعیت پیشنهاد در صفحهٔ پروژه قابل تشخیص نبود؛ برای جلوگیری از ارسال تکراری رد شد."
+            report.skipped += 1
+            await self._emit_skip(project, reason, report)
+            log.warning(
+                "[PIPELINE][BID-STATUS-UNKNOWN] source=%s id=%s action=skip_to_avoid_duplicate",
+                project.source,
+                project.external_id,
+            )
+            return None
 
-        # "New" is a report metric only, never a persistent seen-project marker.
-        if project_row is None:
-            report.new += 1
+        # This count describes the current run; it is not persisted or deduped.
+        report.new += 1
 
         if not self.config.runtime.notify_digest:
             await self.notifiers.dispatch(
@@ -459,10 +445,11 @@ class BidPipeline:
             )
 
         if result.status == SubmissionStatus.SUBMITTED:
+            # Keep a minimal project identity only, so the bid row can reference
+            # the marketplace item without storing the full scraped page data.
+            project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
             if project_row is None:
                 project_row = await self.repo.save_project(project)
-            else:
-                project_row = await self.repo.refresh_project_row(project_row, project)
             await self.repo.save_bid(project_row.id, plan)
             report.submitted += 1
         else:

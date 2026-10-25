@@ -24,10 +24,13 @@ _FIXTURE = Path(__file__).with_name("fixtures") / "projects.json"
 @register_source("mock")
 class MockSource(Source):
     name = "mock"
+    # Simulate the marketplace's current proposal state for deterministic tests.
+    requires_bid_status_check = True
 
     def __init__(self, settings, config, secrets, client: httpx.AsyncClient | None = None) -> None:
         super().__init__(settings, config, secrets, client)
         self.submitted: list[dict[str, Any]] = []
+        self._submitted_uids: set[str] = set()
         self.failure_rate = float(self.settings.get("failure_rate", 0.0))
 
     async def fetch_projects(self) -> list[Project]:
@@ -37,6 +40,10 @@ class MockSource(Source):
             raw = json.loads(fixture.read_text(encoding="utf-8"))
         await asyncio.sleep(float(self.settings.get("latency", 0)))
         return [Project(source=self.name, **item) for item in raw]
+
+    async def check_bid_status(self, project: Project) -> bool:
+        """Return the mock marketplace's state, independent of database history."""
+        return project.uid in self._submitted_uids
 
     async def submit_bid(
         self,
@@ -56,6 +63,7 @@ class MockSource(Source):
                 "proposal": proposal.text,
             }
         )
+        self._submitted_uids.add(project.uid)
         return SubmissionResult(
             status=SubmissionStatus.SUBMITTED,
             message="پیشنهاد در محیط آزمایشی ثبت شد.",

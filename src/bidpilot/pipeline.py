@@ -293,10 +293,7 @@ class BidPipeline:
                         project.external_id,
                     )
                 else:
-                    reason = (
-                        "وضعیت پیشنهاد از صفحه قابل بررسی نبود؛ این بار ارسال نمی‌شود "
-                        f"({detail[:100]})."
-                    )
+                    reason = f"وضعیت پیشنهاد از صفحه قابل بررسی نبود؛ این بار ارسال نمی‌شود ({detail[:100]})."
                     report.skipped += 1
                     await self._emit_skip(project, reason, report)
                     log.warning(

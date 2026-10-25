@@ -318,13 +318,29 @@ class BidPipeline:
                     marker in folded
                     for marker in ("احراز هویت", "نشست منقضی", "وارد حساب کاربری", "ورود به حساب")
                 ):
-                    report.authentication_failed = True
-                    report.errors.append("ورود به حساب تأیید نشد؛ رصد و ارسال پیشنهاد متوقف می‌شود.")
-                    log.error(
-                        "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stage=bid_status_check",
-                        project.source,
-                        project.external_id,
-                    )
+                    if await self._session_really_dead(project.source):
+                        report.authentication_failed = True
+                        report.errors.append("ورود به حساب تأیید نشد؛ رصد و ارسال پیشنهاد متوقف می‌شود.")
+                        log.error(
+                            "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stage=bid_status_check",
+                            project.source,
+                            project.external_id,
+                        )
+                    else:
+                        # The account page proves we are logged in; the status
+                        # check hit something else (JS gate/wrong endpoint).
+                        # Skip this project once, never kill the scheduler.
+                        reason = (
+                            "بررسی وضعیت پیشنهاد ناموفق بود، اما ورود به حساب سالم است؛ "
+                            "این پروژه این دور رد شد."
+                        )
+                        report.skipped += 1
+                        await self._emit_skip(project, reason, report)
+                        log.warning(
+                            "[PIPELINE][AUTH-FALSE-ALARM] source=%s id=%s stage=bid_status_check",
+                            project.source,
+                            project.external_id,
+                        )
                 elif isinstance(exc, JavaScriptRequiredError):
                     report.javascript_required = True
                     report.errors.append(
@@ -475,13 +491,24 @@ class BidPipeline:
                 "ورود به حساب کاربری نیست",
             )
         ):
-            report.authentication_failed = True
-            report.errors.append("ورود به حساب کاربری تأیید نشد؛ جست‌وجو و ارسال پیشنهاد متوقف می‌شود.")
-            log.error(
-                "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stopping after response indicated login/session failure",
-                project.source,
-                project.external_id,
-            )
+            if await self._session_really_dead(project.source):
+                report.authentication_failed = True
+                report.errors.append("ورود به حساب کاربری تأیید نشد؛ جست‌وجو و ارسال پیشنهاد متوقف می‌شود.")
+                log.error(
+                    "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stopping after response indicated login/session failure",
+                    project.source,
+                    project.external_id,
+                )
+            else:
+                # The POST bounced to /login but the session verifies fine:
+                # an ordinary bid failure (JS gate / changed flow), not a
+                # dead cookie. Count it as failed and keep the batch alive.
+                log.warning(
+                    "[PIPELINE][AUTH-FALSE-ALARM] source=%s id=%s submit bounced to login "
+                    "but the session is verified; treating as an ordinary bid failure",
+                    project.source,
+                    project.external_id,
+                )
         if result.javascript_required:
             report.javascript_required = True
             report.errors.append(
@@ -525,6 +552,37 @@ class BidPipeline:
         return plan
 
     # ------------------------------------------------------------- helpers
+    async def _session_really_dead(self, source_name: str) -> bool:
+        """Confirm a suspected auth failure with the account page itself.
+
+        A submit/status redirect to /login is *not* proof the cookie died:
+        in production the ParsCoders POST bounced to /login (JavaScript
+        gate / wrong endpoint) while /dashboard verified the same session
+        seconds earlier. Hard-stopping the scheduler on that guess sent the
+        user through futile cookie-refresh loops. Only a failed
+        ``verify_session`` may declare authentication dead; a verification
+        *error* stays conservative (treats the session as dead).
+        """
+        source = self.sources.get(source_name)
+        if source is None:
+            return True
+        try:
+            ok, detail = await source.verify_session()
+        except Exception as exc:
+            log.warning(
+                "[PIPELINE][AUTH-CONFIRM-FAILED] source=%s error_type=%s",
+                source_name,
+                type(exc).__name__,
+            )
+            return True
+        log.info(
+            "[PIPELINE][AUTH-CONFIRM] source=%s session_ok=%s detail=%r",
+            source_name,
+            ok,
+            detail,
+        )
+        return not ok
+
     def _note_skip(self, report: RunReport, reason: str) -> None:
         key = (reason or "دلیل نامشخص").strip()
         report.skip_reasons[key] = report.skip_reasons.get(key, 0) + 1

@@ -1288,25 +1288,243 @@ def find_proposal_login_link(html: str, base_url: str = "") -> str | None:
     return None
 
 
+#: Forms whose identity (action/id/class) smells like these are never bid
+#: forms, no matter how many textareas they have. The 2026-10-25 incident:
+#: none of the configured selectors matched ParsCoders' real bid form, the
+#: old "first form with a textarea" heuristic picked the *project report*
+#: form (``/project-report/<id>/new``), and the proposal was POSTed there.
+_BID_FORM_DISQUALIFIERS = (
+    "report",
+    "گزارش",
+    "تخلف",
+    "شکایت",
+    "contact",
+    "تماس با",
+    "search",
+    "جستجو",
+    "جست‌وجو",
+    "login",
+    "signin",
+    "sign-in",
+    "register",
+    "ثبت نام",
+    "ثبت‌نام",
+    "comment",
+    "دیدگاه",
+    "newsletter",
+    "خبرنامه",
+    "forgot",
+    "بازیابی رمز",
+    "subscribe",
+)
+
+#: Words a genuine bid form's action/labels tend to carry.
+_BID_FORM_HINTS = ("bid", "proposal", "offer", "پیشنهاد")
+_PROPOSAL_CTA_LABELS = (
+    "ارسال پیشنهاد",
+    "ثبت پیشنهاد",
+    "ارسال درخواست",
+    "پیشنهاد بدهید",
+    "پیشنهاد خود را ثبت",
+    "submit proposal",
+    "send proposal",
+    "place bid",
+    "make an offer",
+)
+
+
+def _form_identity(form: Tag) -> str:
+    classes = form.get("class") or []
+    if not isinstance(classes, list):
+        classes = [str(classes)]
+    return " ".join(
+        [
+            str(form.get("action") or ""),
+            str(form.get("id") or ""),
+            str(form.get("name") or ""),
+            *[str(c) for c in classes],
+        ]
+    ).casefold()
+
+
+def _is_disqualified_form(form: Tag) -> bool:
+    identity = _form_identity(form)
+    if any(marker in identity for marker in _BID_FORM_DISQUALIFIERS):
+        return True
+    # A password field means login/registration, never a bid.
+    return form.find("input", attrs={"type": "password"}) is not None
+
+
+def score_bid_form(form: Tag, settings: dict[str, Any]) -> int:
+    """How likely is this ``<form>`` the *bid* form? Higher is likelier.
+
+    A bid form essentially needs a price and a text; a report/contact/search
+    form never has a price. Scoring every candidate (instead of taking the
+    first textarea) is what keeps proposals out of the wrong endpoint.
+    """
+    if _is_disqualified_form(form):
+        return -100
+    mapping = map_bid_fields(form, settings)
+    score = 0
+    if "description" in mapping:
+        score += 30
+    if "amount" in mapping:
+        score += 40
+    if "days" in mapping:
+        score += 15
+    identity = _form_identity(form)
+    if any(hint in identity for hint in _BID_FORM_HINTS):
+        score += 25
+    elif "project" in identity:
+        score += 5
+    if str(form.get("method") or "post").lower() == "get":
+        score -= 20  # bids are POSTed; GET forms are search/filter widgets
+    button_labels = " ".join(
+        clean_text(node.get_text(" ", strip=True) or str(node.get("value") or ""))
+        for node in form.select("button, input[type='submit'], input[type='button']")
+    ).casefold()
+    if any(label in button_labels for label in ("ارسال پیشنهاد", "ثبت پیشنهاد", "submit proposal")):
+        score += 25
+    elif "پیشنهاد" in button_labels:
+        score += 10
+    visible = clean_text(form.get_text(" ", strip=True))
+    if any(term in visible for term in ("مبلغ پیشنهادی", "قیمت پیشنهادی", "مبلغ پیشنهاد", "قیمت پیشنهاد")):
+        score += 15
+    if any(term in visible for term in ("مدت انجام", "زمان تحویل", "مهلت انجام", "مدت زمان")):
+        score += 5
+    return score
+
+
+def find_proposal_cta_url(html: str, base_url: str = "") -> str | None:
+    """URL behind an «ارسال پیشنهاد» call-to-action, when the form lives elsewhere.
+
+    Many marketplaces keep only a button on the project page; the real form
+    is behind that link (a dedicated page or an AJAX-loaded modal). Returns
+    None for login links (see :func:`find_proposal_login_link`), bare ``#``
+    anchors and pure-JS toggles with no URL to follow.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    login_path = re.compile(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", re.IGNORECASE)
+    candidates: list[tuple[int, str]] = []
+    nodes = soup.select("a[href], a[data-url], button[data-url], [data-proposal-url], [data-bid-url]")
+    for node in nodes:
+        label = clean_text(node.get_text(" ", strip=True)).casefold()
+        raw_url = str(
+            node.get("href")
+            or node.get("data-url")
+            or node.get("data-proposal-url")
+            or node.get("data-bid-url")
+            or ""
+        ).strip()
+        if not raw_url or raw_url.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        url = urljoin(base_url or "https://invalid.local/", raw_url)
+        path = urlsplit(url).path
+        if login_path.search(path):
+            continue
+        score = 0
+        if any(term in label for term in _PROPOSAL_CTA_LABELS):
+            score += 30
+        if any(hint in path.casefold() for hint in ("proposal", "bid", "offer")):
+            score += 20
+        identity = " ".join(
+            [str(node.get("id") or ""), *[str(c) for c in (node.get("class") or [])]]
+        ).casefold()
+        if any(hint in identity for hint in ("proposal", "bid", "offer")):
+            score += 10
+        if score:
+            candidates.append((score, url if base_url else path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: -item[0])
+    return candidates[0][1]
+
+
+# The value must be non-empty: the ``+`` is what stops
+# ``document.cookie = "token=" + location.hash`` from matching with an empty
+# value (which would *clear* a real cookie instead of replaying one).
+_JS_COOKIE_SET_RE = re.compile(
+    r"""document\.cookie\s*=\s*['"]([A-Za-z0-9_\-\.]+)=([A-Za-z0-9_\-\.%]+)"""
+)
+_JS_COOKIE_LIB_RE = re.compile(
+    r"""Cookies\.set\(\s*['"]([A-Za-z0-9_\-\.]+)['"]\s*,\s*['"]([A-Za-z0-9_\-\.%]+)['"]"""
+)
+
+
+def extract_js_cookie_assignments(html: str) -> dict[str, str]:
+    """Static cookies the page's own JS would set (``document.cookie = ...``).
+
+    Some sites gate POST endpoints on a trivial JS-set cookie ("prove a
+    browser ran") and bounce everyone else to /login with a "JavaScript
+    disabled" alert — exactly the ParsCoders behaviour in the incident log.
+    Plain static assignments can be replayed faithfully over HTTP; computed
+    values (Date/Math/concatenation) intentionally do not match the regexes.
+    Cookie *values* from markup are not secrets, but callers log names only.
+    """
+    cookies: dict[str, str] = {}
+    for pattern in (_JS_COOKIE_SET_RE, _JS_COOKIE_LIB_RE):
+        for match in pattern.finditer(html or ""):
+            name, value = match.group(1), match.group(2)
+            if name not in cookies:
+                cookies[name] = value
+    return cookies
+
+
 def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict[str, Any]]:
-    """Locate the bid form and build the payload skeleton from its inputs."""
+    """Locate the bid form and build the payload skeleton from its inputs.
+
+    Selection order: configured selectors first (but never a disqualified
+    form such as report/search/login), then the highest-scoring remaining
+    form — which must map *both* a description and an amount to be trusted.
+    """
     soup = BeautifulSoup(html, "lxml")
     form_selectors = settings.get("form_selectors") or ["form"]
     form: Tag | None = None
+    selected_score: int | None = None
     for selector in form_selectors:
         try:
-            form = soup.select_one(selector)
+            candidate = soup.select_one(selector)
         except Exception:
-            form = None
-        if form is not None:
-            break
+            candidate = None
+        if candidate is None:
+            continue
+        candidate_score = score_bid_form(candidate, settings)
+        mapping = map_bid_fields(candidate, settings)
+        # A bid form carries *both* a text and a price — even via a configured
+        # selector. The incident form (project report) had a textarea but no
+        # amount; description-only forms (report/contact/questions) must
+        # never receive a proposal.
+        if candidate_score <= -50 or "description" not in mapping or "amount" not in mapping:
+            log.warning(
+                "[BID][FORM-REJECTED] selector=%r action=%r score=%s mapped=%r "
+                "reason=disqualified_or_missing_bid_fields",
+                selector,
+                str(candidate.get("action") or "")[:120],
+                candidate_score,
+                sorted(mapping),
+            )
+            continue
+        form, selected_score = candidate, candidate_score
+        break
 
     if form is None:
-        # Heuristic: the form that contains a textarea and an amount-ish input.
-        for candidate in soup.find_all("form"):
-            if candidate.find("textarea") or candidate.find("input", {"name": re.compile("amount|price")}):
-                form = candidate
+        scored = sorted(
+            ((score_bid_form(candidate, settings), candidate) for candidate in soup.find_all("form")),
+            key=lambda item: -item[0],
+        )
+        for candidate_score, candidate in scored:
+            mapping = map_bid_fields(candidate, settings)
+            if candidate_score >= 55 and "description" in mapping and "amount" in mapping:
+                form, selected_score = candidate, candidate_score
                 break
+    if form is not None:
+        log.info(
+            "[BID][FORM-SELECTED] action=%r method=%s score=%s fields=%r",
+            str(form.get("action") or "")[:160],
+            str(form.get("method") or "post").lower(),
+            selected_score,
+            sorted(map_bid_fields(form, settings)),
+        )
     if form is None:
         body_text = clean_text(soup.get_text(" ", strip=True))
         title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
@@ -1322,7 +1540,7 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
         marker_hits = [marker for marker in marker_candidates if marker.casefold() in lowered]
 
         form_summaries: list[dict[str, Any]] = []
-        for candidate in soup.find_all("form")[:8]:
+        for candidate in soup.find_all("form")[:12]:
             controls: list[dict[str, Any]] = []
             for control in candidate.select("input, textarea, select, button")[:16]:
                 controls.append(
@@ -1344,6 +1562,8 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
                     "class": (candidate.get("class") or [])[:6],
                     "action_path": action_path[:160],
                     "method": str(candidate.get("method") or "get").lower(),
+                    "bid_score": score_bid_form(candidate, settings),
+                    "mapped_fields": sorted(map_bid_fields(candidate, settings)),
                     "controls": controls,
                 }
             )
@@ -1412,6 +1632,22 @@ def map_bid_fields(form: Tag, settings: dict[str, Any]) -> dict[str, str]:
         textarea = form.find("textarea")
         if textarea is not None and textarea.get("name"):
             mapping["description"] = str(textarea["name"])
+    # Generic fallbacks for sites whose config has no field selectors yet:
+    # match on input name/id vocabulary instead of guessing positions.
+    generic = {
+        "amount": re.compile(r"amount|price|cost|fee|budget|offer|bid", re.I),
+        "days": re.compile(r"day|duration|delivery|deadline|period", re.I),
+    }
+    for key, pattern in generic.items():
+        if key in mapping:
+            continue
+        for node in form.select("input[name], select[name]"):
+            if node.get("type") in ("hidden", "submit", "button", "checkbox", "radio", "file"):
+                continue
+            identity = f"{node.get('name') or ''} {node.get('id') or ''}"
+            if pattern.search(identity):
+                mapping[key] = str(node["name"])
+                break
     return mapping
 
 
@@ -1548,10 +1784,13 @@ __all__ = [
     "requires_javascript",
     "enrich_from_detail",
     "extract_external_id",
+    "extract_js_cookie_assignments",
     "fallback_id",
     "find_bid_form",
+    "find_proposal_cta_url",
     "find_proposal_login_link",
     "map_bid_fields",
+    "score_bid_form",
     "parse_list_page",
     "parse_project_card",
     "parse_published",

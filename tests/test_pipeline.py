@@ -150,7 +150,6 @@ async def test_projects_and_bids_persisted(tmp_path):
     await application.close()
 
 
-
 async def test_database_startup_prunes_legacy_scan_only_rows(tmp_path):
     from bidpilot.models import BidPlan, SubmissionResult, SubmissionStatus
 

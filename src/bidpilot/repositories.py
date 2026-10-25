@@ -70,22 +70,26 @@ class Repository:
         return row
 
     async def save_project(self, project: Project) -> ProjectRow:
-        budget = project.budget
+        """Persist only the identity anchor for a confirmed successful bid.
+
+        Scraped title, description, budget, skills, and raw markup are transient
+        pipeline inputs; they are intentionally not retained in the database.
+        """
         row = ProjectRow(
             source=project.source,
             external_id=project.external_id,
-            title=project.title,
-            url=project.url,
-            description=project.description,
-            budget_min=budget.min if budget else None,
-            budget_max=budget.max if budget else None,
-            budget_text=budget.as_text() if budget else "",
-            skills=json.dumps(project.skills, ensure_ascii=False),
-            category=project.category,
-            employer=project.employer,
-            published_at=project.published_at,
+            title="",
+            url="",
+            description="",
+            budget_min=None,
+            budget_max=None,
+            budget_text="",
+            skills="[]",
+            category=None,
+            employer=None,
+            published_at=None,
             fetched_at=project.fetched_at,
-            raw_json=json.dumps(project.raw, ensure_ascii=False, default=str),
+            raw_json="{}",
         )
         self.session.add(row)
         await self.session.flush()

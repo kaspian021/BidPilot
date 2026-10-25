@@ -115,6 +115,11 @@ async def test_dry_run_mode_sends_nothing(tmp_path):
     assert report.dry_run == 2
     assert report.submitted == 0
     assert len(notifier.kinds(EventKind.BID_DRY_RUN)) == 2
+    session = application.db.session()
+    stats = await Repository(session).stats()
+    assert stats["projects"] == 0
+    assert "dry_run" not in stats
+    await session.close()
     await application.close()
 
 
@@ -136,12 +141,46 @@ async def test_projects_and_bids_persisted(tmp_path):
     stats = await repo.stats()
     rows = await repo.recent_bids(limit=10)
 
-    assert stats["projects"] == 3
+    assert stats["projects"] == 2  # only projects with confirmed successful bids are retained
     assert stats["submitted"] == 2
     filled = [row for row in rows if row.proposal_text]
     assert filled and filled[0].proposal_text.startswith("سلام")
     assert filled[0].pricing_rationale
     await session.close()
+    await application.close()
+
+
+async def test_database_startup_prunes_legacy_scan_only_rows(tmp_path):
+    from bidpilot.models import BidPlan, SubmissionResult, SubmissionStatus
+
+    application, _ = await build_app(make_config(tmp_path))
+    session = application.db.session()
+    repo = Repository(session)
+    project = Project(source="mock", external_id="legacy", title="پروژه قدیمی")
+    row = await repo.save_project(project)
+    await repo.save_bid(
+        row.id,
+        BidPlan(
+            project=project,
+            result=SubmissionResult(status=SubmissionStatus.SKIPPED, message="فقط مشاهده شده بود"),
+        ),
+    )
+    await repo.log_event(
+        Event(kind=EventKind.BID_SKIPPED, title=project.title, project=project, body="legacy skip")
+    )
+    await repo.commit()
+    await session.close()
+
+    # Re-running init applies compatibility cleanup to databases created by older versions.
+    await application.db.init()
+    clean_session = application.db.session()
+    clean_repo = Repository(clean_session)
+    stats = await clean_repo.stats()
+    assert stats["projects"] == 0
+    assert "skipped" not in stats
+    events = await clean_repo.recent_events()
+    assert not any(event.kind == EventKind.BID_SKIPPED.value for event in events)
+    await clean_session.close()
     await application.close()
 
 
@@ -169,8 +208,8 @@ async def test_duplicate_projects_are_not_counted_as_skipped(tmp_path):
     await application.cycle()
     second = (await application.cycle())[0]
 
-    assert second.duplicates == 3
-    assert second.skipped == 0
+    assert second.duplicates == 2  # confirmed bids are duplicates; filtered projects are rechecked
+    assert second.skipped == 1
     assert second.dry_run == 0
     await application.close()
 
@@ -213,7 +252,9 @@ async def test_one_digest_per_cycle_instead_of_one_message_per_project(tmp_path)
 
 async def test_digest_lists_why_projects_were_skipped(tmp_path):
     config = make_digest_config(tmp_path)
-    config.sources = [SourceConfig(type="mock", settings={"projects": PROJECTS[2:], "latency": 0})]
+    config.sources = [
+        SourceConfig(type="mock", settings={"projects": [PROJECTS[0], PROJECTS[2]], "latency": 0})
+    ]
     application, notifier = await build_app(config)
     report = (await application.cycle())[0]
 
@@ -225,13 +266,20 @@ async def test_digest_lists_why_projects_were_skipped(tmp_path):
     await application.close()
 
 
-async def test_digest_is_silent_when_nothing_happened(tmp_path):
-    application, notifier = await build_app(make_digest_config(tmp_path))
+async def test_dry_run_candidates_are_rechecked_without_database_deduplication(tmp_path):
+    application, notifier = await build_app(make_digest_config(tmp_path, submit_mode="dry_run"))
     await application.cycle()
     notifier.events.clear()
-    await application.cycle()  # everything is a duplicate now
+    second = (await application.cycle())[0]
 
-    assert not notifier.kinds(EventKind.DIGEST)
+    assert second.dry_run == 1
+    assert second.new == 1
+    assert len(notifier.kinds(EventKind.DIGEST)) == 1
+    session = application.db.session()
+    stats = await Repository(session).stats()
+    assert stats["projects"] == 0
+    assert "dry_run" not in stats
+    await session.close()
     await application.close()
 
 
@@ -360,6 +408,6 @@ async def test_pipeline_revisits_skipped_project_when_new_skills_are_found(tmp_p
 
     assert first.skipped == 1
     assert second.submitted == 1
-    assert second.new == 0
+    assert second.new == 1  # skipped projects are not remembered in the database
     assert second.duplicates == 0
     await application.close()

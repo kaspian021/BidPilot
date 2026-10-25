@@ -22,6 +22,8 @@ class SourceError(RuntimeError):
 
 class Source(abc.ABC):
     name: str = "base"
+    #: HTML-backed marketplaces override this and require a verifiable page state.
+    requires_bid_status_check: bool = False
 
     def __init__(
         self,
@@ -92,6 +94,10 @@ class Source(abc.ABC):
     async def verify_session(self) -> tuple[bool, str]:
         """Is the stored account usable right now? Sources override this."""
         return True, "این منبع ورود لازم ندارد."
+
+    async def check_bid_status(self, project: Project) -> bool | None:
+        """Check the marketplace page for an existing bid; None means unknown."""
+        return None
 
     # ---------------------------------------------------------------- helpers
     async def get_html(self, path: str, **kwargs: Any) -> str:

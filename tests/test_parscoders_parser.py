@@ -59,6 +59,26 @@ def test_bid_form_payload_and_field_mapping():
     assert mapping["days"] == "delivery_days"
 
 
+def test_detect_existing_bid_from_edit_proposal_controls():
+    html = """
+    <html><body>
+      <h1>ساخت اپلیکیشن</h1>
+      <p>پروژه باز است و فریلنسرها می‌توانند پیشنهاد بدهند.</p>
+      <a class="btn btn-primary" href="/project/12345/edit-bid">ویرایش پیشنهاد</a>
+    </body></html>
+    """
+    assert parser.detect_existing_bid(html, SETTINGS["bid"]) is True
+
+
+def test_detect_existing_bid_from_active_form_and_unknown_page():
+    html = (FIXTURES / "sample_project.html").read_text(encoding="utf-8")
+    assert parser.detect_existing_bid(html, SETTINGS["bid"]) is False
+    assert (
+        parser.detect_existing_bid("<html><body><h1>ساخت اپلیکیشن</h1></body></html>", SETTINGS["bid"])
+        is None
+    )
+
+
 def test_detect_success_and_failure():
     ok, message = parser.detect_success(200, "<div>پیشنهاد شما با موفقیت ثبت شد.</div>", SETTINGS["bid"])
     assert ok, message

@@ -6,7 +6,6 @@ one project never stops the batch and every decision can be explained later.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -208,75 +207,8 @@ class BidPipeline:
         return report
 
     # -------------------------------------------------------------- one item
-    def _existing_project_revisit_reason(self, existing, project: Project, latest_bid) -> str:
-        """Revisit only records whose previous skip/failure is demonstrably recoverable."""
-        if latest_bid is None:
-            return ""
-        status = str(latest_bid.status or "").casefold()
-        message = str(latest_bid.message or "")
-
-        if status == SubmissionStatus.SKIPPED.value:
-            try:
-                old_skills = set(json.loads(existing.skills or "[]"))
-            except (TypeError, ValueError):
-                old_skills = set()
-            new_skills = {str(skill).strip() for skill in (project.skills or []) if str(skill).strip()}
-            skills_improved = bool(new_skills - old_skills)
-            description_improved = len(project.description or "") > len(existing.description or "") + 40
-            budget_was_known = existing.budget_min is not None and existing.budget_max is not None
-            budget_is_known = bool(project.budget and project.budget.is_known)
-            if "مهارت" in message and (skills_improved or description_improved):
-                return "اطلاعات مهارت/شرح پروژه بهتر شده است"
-            if "بودجه" in message and not budget_was_known and budget_is_known:
-                return "بودجه‌ای که قبلاً پیدا نشده بود اکنون مشخص است"
-            return ""
-
-        # Retry only failures known to happen before a proposal POST. An ambiguous
-        # POST/network failure is intentionally excluded to avoid duplicate bids.
-        safe_pre_submit_failures = (
-            "فرم HTML ارسال پیشنهاد شناسایی نشد",
-            "فیلد متن پیشنهاد در فرم شناسایی نشد",
-            "مسیر ورود",
-            "نشست منقضی شده است",
-            "صفحه پروژه قابل دریافت نبود",
-            "صفحهٔ پروژه دریافت شد",
-            "خطای شبکه هنگام باز کردن صفحه پروژه",
-        )
-        if status != SubmissionStatus.FAILED.value or not self.live:
-            return ""
-        if not any(marker in message for marker in safe_pre_submit_failures):
-            return ""
-        failed_at = getattr(latest_bid, "updated_at", None) or getattr(latest_bid, "created_at", None)
-        if failed_at is not None:
-            if failed_at.tzinfo is None:
-                failed_at = failed_at.replace(tzinfo=timezone.utc)
-            age_seconds = (datetime.now(timezone.utc) - failed_at).total_seconds()
-            if age_seconds < 900:
-                return ""
-        return "تلاش دوباره پس از خطای قطعیِ قبل از ارسال"
-
     async def process_project(self, project: Project, report: RunReport) -> BidPlan | None:
-        # Duplicates normally stop here. Reconsider an old skip only when fresh
-        # evidence fixes the exact reason it was skipped; retry failed records
-        # only when the log proves the POST did not happen.
-        project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
-        if project_row is not None:
-            latest_bid = await self.repo.latest_bid_for_project(project_row.id)
-            revisit_reason = self._existing_project_revisit_reason(project_row, project, latest_bid)
-            if not revisit_reason:
-                report.duplicates += 1
-                return None
-            project_row = await self.repo.refresh_project_row(project_row, project)
-            log.info(
-                "[PIPELINE][REVISIT] source=%s id=%s title=%r reason=%r previous_status=%s",
-                project.source,
-                project.external_id,
-                project.title,
-                revisit_reason,
-                getattr(latest_bid, "status", None),
-            )
-
-        # 2) filtering
+        # 1) Filter first; a rejected/observed project is never persisted.
         budget_debug = project.budget.model_dump() if project.budget else None
         raw = project.raw or {}
         log.info(
@@ -311,28 +243,100 @@ class BidPipeline:
             self.config.filters.require_skill_match,
             self.project_filter.skill_keywords,
         )
-        if project_row is None:
-            project_row = await self.repo.save_project(project)
-            report.new += 1
-
         if not decision.allowed:
-            log.warning(
-                "[PIPELINE][SKIPPED] source=%s id=%s title=%r reason=%r budget=%r raw=%r",
+            log.info(
+                "[PIPELINE][SKIPPED] source=%s id=%s title=%r reason=%r budget=%r",
                 project.source,
                 project.external_id,
                 project.title,
                 decision.reason,
                 budget_debug,
-                raw,
             )
             report.skipped += 1
             plan = BidPlan(
                 project=project,
                 result=SubmissionResult(status=SubmissionStatus.SKIPPED, message=decision.reason),
             )
-            await self.repo.save_bid(project_row.id, plan)
             await self._emit_skip(project, decision.reason, report)
             return plan
+
+        # Check the marketplace's current UI before pricing/LLM work. This is
+        # the source of truth for prior bids; the database is not a seen-project cache.
+        project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
+        latest_bid = (
+            await self.repo.latest_bid_for_project(project_row.id) if project_row is not None else None
+        )
+        bid_state: bool | None = False
+        if self.live:
+            try:
+                bid_state = await self.sources[project.source].check_bid_status(project)
+            except SourceError as exc:
+                detail = str(exc).strip() or type(exc).__name__
+                folded = detail.casefold()
+                if any(
+                    marker in folded
+                    for marker in ("احراز هویت", "نشست منقضی", "وارد حساب کاربری", "ورود به حساب")
+                ):
+                    report.authentication_failed = True
+                    report.errors.append("ورود به حساب تأیید نشد؛ رصد و ارسال پیشنهاد متوقف می‌شود.")
+                    log.error(
+                        "[PIPELINE][AUTH-REQUIRED] source=%s id=%s stage=bid_status_check",
+                        project.source,
+                        project.external_id,
+                    )
+                elif "javascript" in folded or "جاوا اسکریپت" in folded:
+                    report.javascript_required = True
+                    report.errors.append("صفحهٔ پروژه اجرای JavaScript در مرورگر را لازم دانست؛ رصد متوقف شد.")
+                    log.error(
+                        "[PIPELINE][STOP-JAVASCRIPT] source=%s id=%s stage=bid_status_check",
+                        project.source,
+                        project.external_id,
+                    )
+                else:
+                    reason = f"وضعیت پیشنهاد از صفحه قابل بررسی نبود؛ این بار ارسال نمی‌شود ({detail[:100]})."
+                    report.skipped += 1
+                    await self._emit_skip(project, reason, report)
+                    log.warning(
+                        "[PIPELINE][BID-STATUS-UNKNOWN] source=%s id=%s error=%r",
+                        project.source,
+                        project.external_id,
+                        detail[:180],
+                    )
+                return None
+
+        if bid_state is True:
+            report.duplicates += 1
+            log.info(
+                "[PIPELINE][ALREADY-BIDDED] source=%s id=%s detected_by=project_page",
+                project.source,
+                project.external_id,
+            )
+            return None
+
+        if bid_state is None:
+            if latest_bid is not None and latest_bid.status == SubmissionStatus.SUBMITTED.value:
+                report.duplicates += 1
+                log.warning(
+                    "[PIPELINE][BID-STATUS-FALLBACK] source=%s id=%s "
+                    "page_state=unknown fallback=confirmed_submission_history",
+                    project.source,
+                    project.external_id,
+                )
+                return None
+            if getattr(self.sources[project.source], "requires_bid_status_check", False):
+                reason = "وضعیت پیشنهاد در صفحهٔ پروژه قابل تشخیص نبود؛ برای جلوگیری از ارسال تکراری رد شد."
+                report.skipped += 1
+                await self._emit_skip(project, reason, report)
+                log.warning(
+                    "[PIPELINE][BID-STATUS-UNKNOWN] source=%s id=%s action=skip_to_avoid_duplicate",
+                    project.source,
+                    project.external_id,
+                )
+                return None
+
+        # "New" is a report metric only, never a persistent seen-project marker.
+        if project_row is None:
+            report.new += 1
 
         if not self.config.runtime.notify_digest:
             await self.notifiers.dispatch(
@@ -367,7 +371,6 @@ class BidPipeline:
                     message="قیمت‌گذاری امکان‌پذیر نبود.",
                 ),
             )
-            await self.repo.save_bid(project_row.id, plan)
             await self._emit_skip(project, "قیمت‌گذاری امکان‌پذیر نبود.", report)
             return plan
 
@@ -385,7 +388,6 @@ class BidPipeline:
             report.skipped += 1
             plan = BidPlan(project=project, amount=amount, rationale=pricing.rationale)
             plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=str(exc))
-            await self.repo.save_bid(project_row.id, plan)
             await self._emit_skip(project, f"متن پیشنهاد تولید نشد: {exc}", report)
             return plan
 
@@ -405,7 +407,6 @@ class BidPipeline:
         if not rate.allowed:
             report.skipped += 1
             plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
-            await self.repo.save_bid(project_row.id, plan)
             await self._emit_skip(project, rate.reason, report)
             return plan
 
@@ -416,7 +417,6 @@ class BidPipeline:
                 status=SubmissionStatus.DRY_RUN, message="حالت آزمایشی: پیشنهاد ارسال نشد."
             )
             report.dry_run += 1
-            await self.repo.save_bid(project_row.id, plan)
             await self.notifiers.dispatch(
                 Event(
                     kind=EventKind.BID_DRY_RUN,
@@ -458,12 +458,16 @@ class BidPipeline:
                 project.external_id,
             )
 
-        bid_row = await self.repo.save_bid(project_row.id, plan)
         if result.status == SubmissionStatus.SUBMITTED:
+            if project_row is None:
+                project_row = await self.repo.save_project(project)
+            else:
+                project_row = await self.repo.refresh_project_row(project_row, project)
+            await self.repo.save_bid(project_row.id, plan)
             report.submitted += 1
         else:
+            # Failed attempts stay in logs/reports only; persist accepted bids only.
             report.failed += 1
-            await self.repo.update_bid_status(bid_row.id, result.status, result.message)
             log.warning(
                 "Bid failed for %s: %s (%.0f ms)",
                 project.uid,
@@ -491,18 +495,9 @@ class BidPipeline:
     async def _emit_skip(self, project: Project, reason: str, report: RunReport | None = None) -> None:
         if report is not None:
             self._note_skip(report, reason)
-        # In digest mode the cycle sends one grouped message instead of one per
-        # project; the decision is still stored in the DB as an event.
-        if self.config.runtime.notify_digest:
-            await self.repo.log_event(
-                Event(kind=EventKind.BID_SKIPPED, title=project.title, project=project, body=reason)
-            )
+        # Skip decisions are summarized in logs/digests, never persisted per project.
+        if self.config.runtime.notify_digest or not self.config.runtime.notify_on_skip:
             return
-        if not self.config.runtime.notify_on_skip:
-            return
-        await self.repo.log_event(
-            Event(kind=EventKind.BID_SKIPPED, title=project.title, project=project, body=reason)
-        )
         await self.notifiers.dispatch(
             Event(
                 kind=EventKind.BID_SKIPPED,

@@ -1139,6 +1139,91 @@ def enrich_from_detail(html: str, project: Project, settings: dict[str, Any]) ->
     return project.model_copy(update=update)
 
 
+def detect_existing_bid(html: str, settings: dict[str, Any]) -> bool | None:
+    """Return True/False only when the project page provides clear bid-state evidence.
+
+    None means that the page does not expose a reliable state. Callers must not
+    submit when state is unknown on a marketplace that requires this check.
+    """
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+    body_text = _normalized_marker(clean_text(soup.get_text(" ", strip=True)))
+    already_markers = settings.get("already_bid_text_contains") or [
+        "ویرایش پیشنهاد",
+        "تغییر پیشنهاد",
+        "اصلاح پیشنهاد",
+        "پیشنهاد خود را ویرایش",
+        "پیشنهاد خود را تغییر",
+        "شما قبلاً پیشنهاد داده‌اید",
+        "شما قبلا پیشنهاد داده اید",
+        "قبلاً پیشنهاد داده‌اید",
+        "قبلا پیشنهاد داده اید",
+        "قبلاً پیشنهاد ثبت کرده‌اید",
+        "قبلا پیشنهاد ثبت کرده اید",
+        "پیشنهاد شما قبلاً ثبت شده",
+        "پیشنهاد شما قبلا ثبت شده",
+        "پیشنهاد شما با موفقیت ثبت شد",
+        "پیشنهاد با موفقیت ثبت شد",
+        "edit proposal",
+        "edit bid",
+        "update proposal",
+        "modify proposal",
+        "you have already bid",
+        "already submitted a proposal",
+        "proposal already submitted",
+        "already applied",
+    ]
+    normalized_already = [
+        _normalized_marker(str(marker)) for marker in already_markers if str(marker).strip()
+    ]
+    if any(marker and marker in body_text for marker in normalized_already):
+        return True
+
+    actionable_nodes = soup.select("a, button, input[type='submit'], input[type='button'], [role='button']")
+    action_labels: list[str] = []
+    for node in actionable_nodes:
+        values = [
+            clean_text(node.get_text(" ", strip=True)),
+            clean_text(str(node.get("aria-label") or "")),
+            clean_text(str(node.get("title") or "")),
+            clean_text(str(node.get("value") or "")),
+        ]
+        for value in values:
+            normalized = _normalized_marker(value)
+            if not normalized:
+                continue
+            action_labels.append(normalized)
+            if any(marker and marker in normalized for marker in normalized_already):
+                return True
+            if re.search(r"(?:edit|update|modify).{0,30}(?:proposal|bid|offer)", normalized):
+                return True
+
+    # A real editable proposal form is strong evidence that no proposal has
+    # been submitted yet. Positive "edit proposal" markers above take priority.
+    form, _ = find_bid_form(html, settings)
+    if form is not None and "description" in map_bid_fields(form, settings):
+        return False
+
+    submit_markers = (
+        "ارسال پیشنهاد",
+        "ثبت پیشنهاد",
+        "ارسال درخواست",
+        "پیشنهاد بدهید",
+        "پیشنهاد خود را ثبت",
+        "submit proposal",
+        "send proposal",
+        "place bid",
+        "make an offer",
+    )
+    normalized_submit_markers = tuple(_normalized_marker(marker) for marker in submit_markers)
+    if any(marker and marker in label for label in action_labels for marker in normalized_submit_markers):
+        return False
+
+    return None
+
+
 def find_proposal_login_link(html: str, base_url: str = "") -> str | None:
     """Return a safe path when a proposal CTA sends the user to a login page."""
     soup = BeautifulSoup(html, "lxml")
@@ -1371,6 +1456,7 @@ def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tup
 __all__ = [
     "DEFAULT_ID_REGEX",
     "detect_success",
+    "detect_existing_bid",
     "extract_response_notices",
     "requires_javascript",
     "enrich_from_detail",

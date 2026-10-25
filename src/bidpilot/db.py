@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    delete,
     func,
     select,
 )
@@ -108,6 +109,13 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Older versions stored every discovered/skipped project. Keep only
+            # confirmed successful bids and their project rows; discard scan-only
+            # records, dry runs, failed attempts, and per-project skip events.
+            await conn.execute(delete(BidRow).where(BidRow.status != "submitted"))
+            submitted_project_ids = select(BidRow.project_id).where(BidRow.status == "submitted")
+            await conn.execute(delete(ProjectRow).where(~ProjectRow.id.in_(submitted_project_ids)))
+            await conn.execute(delete(EventRow).where(EventRow.kind == "bid_skipped"))
 
     async def dispose(self) -> None:
         await self.engine.dispose()

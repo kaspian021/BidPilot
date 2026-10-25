@@ -146,27 +146,36 @@ detail:
 bid:
   mode: "form"           # "form" = parse & POST the real HTML form
   # form on the project page that submits a proposal
+  # VERIFIED on the live DOM (2026-10-25, `bidpilot inspect` on project
+  # 621237): the real bid form has NO action/method (JS submits it) and
+  # carries _token + bidAmount + deadline + initEscrowPercent +
+  # expertGuaranteePercent + validDays + message. The :has() selector pins
+  # exactly that form; the generic selectors below stay as fallbacks.
   form_selectors:
+    - "form:has(input[name='bidAmount'])"
     - "form#bid-form"
     - "form#proposal-form"
     - "form[action*='bid']"
     - "form[action*='proposal']"
     - "form[action*='offer']"
     - ".bid-form form"
-  # where each value goes inside that form
+  # where each value goes inside that form (exact live names first)
   fields:
     amount:
+      - "input[name='bidAmount']"
       - "input[name*='amount']"
       - "input[name*='price']"
       - "input[name*='budget']"
       - "input[name*='offer']"
     description:
+      - "textarea[name='message']"
       - "textarea[name*='description']"
       - "textarea[name*='proposal']"
       - "textarea[name*='content']"
       - "textarea[name*='message']"
       - "textarea"
     days:
+      - "input[name='deadline']"
       - "input[name*='day']"
       - "input[name*='delivery']"
       - "input[name*='duration']"

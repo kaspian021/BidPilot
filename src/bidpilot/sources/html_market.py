@@ -1042,8 +1042,24 @@ class HtmlMarketSource(Source):
         if delivery_days and "days" in mapping:
             payload[mapping["days"]] = str(delivery_days)
 
-        action = urljoin(form_page_url, form.get("action") or form_page_url)
+        # JS-driven forms (like the real ParsCoders bid form) often have no
+        # action/method at all — the endpoint then hides in data-action /
+        # data-url, and only as a last resort is it the page URL itself.
+        raw_action = str(form.get("action") or form.get("data-action") or form.get("data-url") or "")
+        action_source = "action" if form.get("action") else ("data-attr" if raw_action else "page-url")
+        action = urljoin(form_page_url, raw_action or form_page_url)
         method = (form.get("method") or "post").upper()
+        log.info(
+            "[BID][SUBMIT-REQUEST] source=%s id=%s method=%s action_path=%s action_source=%s "
+            "fields=%r referer_path=%s",
+            self.name,
+            project.external_id,
+            method,
+            urlsplit(action).path,
+            action_source,
+            sorted(payload),
+            urlsplit(form_page_url).path,
+        )
 
         try:
             if method == "POST":
@@ -1062,7 +1078,7 @@ class HtmlMarketSource(Source):
         ]
         login_path_re = re.compile(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", re.I)
         redirected_paths = [final_path, location_path, *(item["path"] for item in redirect_history)]
-        notices = parser.extract_response_notices(response.text)
+        notices = parser.extract_response_notices(response.text) + parser.extract_json_notices(response.text)
         # Diagnosis order matters (this exact response shape occurred in
         # production): POST -> 302 -> /login page whose visible alert says
         # «جاوا اسکریپت غیر فعال است». The old order called that "session

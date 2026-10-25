@@ -7,6 +7,7 @@ marketplaces (Ponisha, Karlancer, …) started reusing it.
 from ..html_parser import (  # noqa: F401
     DEFAULT_ID_REGEX,
     detect_success,
+    detect_existing_bid,
     enrich_from_detail,
     extract_external_id,
     fallback_id,
@@ -21,6 +22,7 @@ from ..html_parser import (  # noqa: F401
 __all__ = [
     "DEFAULT_ID_REGEX",
     "detect_success",
+    "detect_existing_bid",
     "enrich_from_detail",
     "extract_external_id",
     "fallback_id",

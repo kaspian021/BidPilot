@@ -634,6 +634,57 @@ class HtmlMarketSource(Source):
             )
         return projects
 
+    requires_bid_status_check = True
+
+    async def check_bid_status(self, project: Project) -> bool | None:
+        """Inspect a fresh project page before generating or posting another bid."""
+        detail_cfg = self.settings.get("detail") or {}
+        bid_cfg = self.settings.get("bid") or {}
+        detail_path = detail_cfg.get("path", "{external_id}")
+        page_path = detail_path.format(external_id=project.external_id, url=project.url)
+        client = await self.client()
+        try:
+            page = await client.get(page_path)
+        except httpx.HTTPError as exc:
+            log.warning(
+                "[BID][STATUS-CHECK] source=%s id=%s outcome=network_error error_type=%s",
+                self.name,
+                project.external_id,
+                type(exc).__name__,
+            )
+            raise SourceError(f"خطای شبکه هنگام بررسی وضعیت پیشنهاد پروژه: {type(exc).__name__}") from exc
+
+        final_path = urlsplit(str(page.url)).path
+        log.info(
+            "[BID][STATUS-CHECK-RESPONSE] source=%s id=%s status=%s final_path=%s html_chars=%s",
+            self.name,
+            project.external_id,
+            page.status_code,
+            final_path,
+            len(page.text or ""),
+        )
+        if (
+            page.status_code in (401, 403)
+            or re.search(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", final_path, re.IGNORECASE)
+        ):
+            raise SourceError("نشست منقضی شده است؛ برای جلوگیری از ارسال تکراری وضعیت پیشنهاد بررسی نشد.")
+        if page.status_code >= 400:
+            raise SourceError(
+                f"صفحه پروژه برای بررسی وضعیت پیشنهاد قابل دریافت نبود (HTTP {page.status_code})."
+            )
+        if parser.requires_javascript(page.text):
+            raise SourceError(_javascript_required_message())
+
+        state = parser.detect_existing_bid(page.text, bid_cfg)
+        outcome = "already_submitted" if state is True else "not_submitted" if state is False else "unknown"
+        log.info(
+            "[BID][STATUS-CHECK] source=%s id=%s outcome=%s",
+            self.name,
+            project.external_id,
+            outcome,
+        )
+        return state
+
     async def _attach_details(self, projects: list[Project], concurrency: int) -> list[Project]:
         detail_cfg = dict(self.settings.get("detail") or {})
         detail_cfg["_diagnostics"] = bool(self.discovery_settings().get("log_extraction_details"))

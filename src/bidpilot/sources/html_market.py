@@ -663,9 +663,8 @@ class HtmlMarketSource(Source):
             final_path,
             len(page.text or ""),
         )
-        if (
-            page.status_code in (401, 403)
-            or re.search(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", final_path, re.IGNORECASE)
+        if page.status_code in (401, 403) or re.search(
+            r"/(?:login|signin|sign-in|auth/login)(?:/|$)", final_path, re.IGNORECASE
         ):
             raise SourceError("نشست منقضی شده است؛ برای جلوگیری از ارسال تکراری وضعیت پیشنهاد بررسی نشد.")
         if page.status_code >= 400:

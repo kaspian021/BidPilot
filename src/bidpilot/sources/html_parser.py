@@ -1443,9 +1443,7 @@ def find_proposal_cta_url(html: str, base_url: str = "") -> str | None:
 # The value must be non-empty: the ``+`` is what stops
 # ``document.cookie = "token=" + location.hash`` from matching with an empty
 # value (which would *clear* a real cookie instead of replaying one).
-_JS_COOKIE_SET_RE = re.compile(
-    r"""document\.cookie\s*=\s*['"]([A-Za-z0-9_\-\.]+)=([A-Za-z0-9_\-\.%]+)"""
-)
+_JS_COOKIE_SET_RE = re.compile(r"""document\.cookie\s*=\s*['"]([A-Za-z0-9_\-\.]+)=([A-Za-z0-9_\-\.%]+)""")
 _JS_COOKIE_LIB_RE = re.compile(
     r"""Cookies\.set\(\s*['"]([A-Za-z0-9_\-\.]+)['"]\s*,\s*['"]([A-Za-z0-9_\-\.%]+)['"]"""
 )

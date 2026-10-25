@@ -1166,14 +1166,15 @@ def inspect(
                 f"mapped={map_bid_fields(chosen, bid_cfg)}"
             )
         else:
-            console.print("[red]هیچ فرم پیشنهادی قابل‌اعتماد پیدا نشد (فرم باید متن و مبلغ هر دو را داشته باشد).[/red]")
+            console.print(
+                "[red]هیچ فرم پیشنهادی قابل‌اعتماد پیدا نشد (فرم باید متن و مبلغ هر دو را داشته باشد).[/red]"
+            )
         base_url = str(defaults.get("base_url") or "")
         cta = find_proposal_cta_url(html, shown_url if shown_url.startswith("http") else base_url)
         console.print(f"دکمه/لینک «ارسال پیشنهاد»: {cta or '—'}")
         js_cookies = extract_js_cookie_assignments(html)
         console.print(
-            "کوکی‌های ست‌شده با JavaScript (فقط نام): "
-            + (", ".join(js_cookies.keys()) if js_cookies else "—")
+            "کوکی‌های ست‌شده با JavaScript (فقط نام): " + (", ".join(js_cookies.keys()) if js_cookies else "—")
         )
         existing = detect_existing_bid(html, bid_cfg)
         console.print(

@@ -113,9 +113,7 @@ def validate_proposal(
     if not stripped:
         return ValidationReport(["متن خالی است."])
     if looks_like_refusal(stripped):
-        return ValidationReport(
-            ["خروجی مدل ردّ همکاری (refusal) است، نه متن پیشنهاد؛ نباید ارسال شود."]
-        )
+        return ValidationReport(["خروجی مدل ردّ همکاری (refusal) است، نه متن پیشنهاد؛ نباید ارسال شود."])
     if not stripped.startswith(_SALAM):
         issues.append("متن باید با سلام/وقت بخیر شروع شود.")
     if strict_length and len(stripped) < config.min_chars:

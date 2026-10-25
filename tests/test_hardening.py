@@ -313,9 +313,7 @@ def test_report_form_alone_is_never_a_bid_form():
     form, _payload = parser.find_bid_form(html, _BID_CFG)
     assert form is None
     # …even when a stale configured selector matches it directly
-    form, _payload = parser.find_bid_form(
-        html, {**_BID_CFG, "form_selectors": ["form[action*='report']"]}
-    )
+    form, _payload = parser.find_bid_form(html, {**_BID_CFG, "form_selectors": ["form[action*='report']"]})
     assert form is None
 
 
@@ -569,9 +567,7 @@ def test_looks_like_refusal_catches_the_game_cheat_incident_shape():
     )
     assert looks_like_refusal(refusal)
     assert looks_like_refusal("I'm sorry, but I can't help with creating a game cheat.")
-    assert not looks_like_refusal(
-        "سلام و وقت بخیر 🌱 من محمد رضایی هستم و پیشنهاد من ۱,۰۰۰,۰۰۰ تومان است."
-    )
+    assert not looks_like_refusal("سلام و وقت بخیر 🌱 من محمد رضایی هستم و پیشنهاد من ۱,۰۰۰,۰۰۰ تومان است.")
 
 
 def test_validate_proposal_rejects_refusals():
@@ -593,9 +589,7 @@ async def test_generator_raises_on_refusal_without_repair_or_template_fallback()
 
     refusal = "سلام و وقت بخیر، نمی‌توانم در این پروژه همکاری کنم؛ ساخت چیت برخلاف قوانین است."
     route = respx.post("https://llm.test/v1/chat/completions").mock(
-        return_value=httpx.Response(
-            200, json={"model": "m", "choices": [{"message": {"content": refusal}}]}
-        )
+        return_value=httpx.Response(200, json={"model": "m", "choices": [{"message": {"content": refusal}}]})
     )
     llm = LLMClient("https://llm.test/v1", "key", "test-model")
     generator = ProposalGenerator(make_config(), llm=llm)

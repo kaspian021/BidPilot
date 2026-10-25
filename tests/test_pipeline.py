@@ -141,11 +141,16 @@ async def test_projects_and_bids_persisted(tmp_path):
     stats = await repo.stats()
     rows = await repo.recent_bids(limit=10)
 
-    assert stats["projects"] == 2  # only projects with confirmed successful bids are retained
+    assert stats["projects"] == 2  # only minimal identity anchors for confirmed bids are retained
     assert stats["submitted"] == 2
     filled = [row for row in rows if row.proposal_text]
     assert filled and filled[0].proposal_text.startswith("سلام")
     assert filled[0].pricing_rationale
+    refs = await repo.recent_projects(limit=10)
+    assert len(refs) == 2
+    assert all(row.title == "" and row.url == "" and row.description == "" for row in refs)
+    assert all(row.budget_min is None and row.budget_max is None for row in refs)
+    assert all(row.skills == "[]" and row.raw_json == "{}" for row in refs)
     await session.close()
     await application.close()
 
@@ -200,6 +205,60 @@ async def test_live_flag_override(tmp_path, live):
     application, _ = await build_app(make_config(tmp_path, submit_mode="live" if not live else "dry_run"))
     report = (await application.cycle(live=live))[0]
     assert (report.submitted > 0) is live
+    await application.close()
+
+
+async def test_database_submission_history_never_overrides_current_page_state(tmp_path):
+    application, _ = await build_app(make_config(tmp_path))
+    first = (await application.cycle())[0]
+    assert first.submitted == 2
+
+    # Simulate the marketplace page saying that no proposal exists, even though
+    # the DB still contains the prior confirmed-submission history.
+    source = application.sources["mock"]
+    source._submitted_uids.clear()
+    second = (await application.cycle())[0]
+
+    assert second.submitted == 2
+    assert second.duplicates == 0
+    assert second.new == 2
+    await application.close()
+
+
+async def test_database_redacts_legacy_project_details_but_keeps_bid_history(tmp_path):
+    from bidpilot.db import ProjectRow
+
+    application, _ = await build_app(make_config(tmp_path))
+    await application.cycle()
+
+    session = application.db.session()
+    rows = await Repository(session).recent_projects(limit=10)
+    assert rows
+    for row in rows:
+        row.title = "محتوای قدیمی"
+        row.url = "https://example.test/project"
+        row.description = "شرح کامل پروژه که نباید ذخیره بماند"
+        row.budget_min = 100
+        row.budget_max = 200
+        row.budget_text = "100-200"
+        row.skills = '["Python"]'
+        row.raw_json = '{"scraped":"data"}'
+    await session.commit()
+    await session.close()
+
+    await application.db.init()
+    clean_session = application.db.session()
+    repo = Repository(clean_session)
+    stats = await repo.stats()
+    refs = await repo.recent_projects(limit=10)
+
+    assert stats["submitted"] == 2
+    assert stats["projects"] == 2
+    assert len(refs) == 2
+    assert all(row.title == "" and row.url == "" and row.description == "" for row in refs)
+    assert all(row.budget_min is None and row.budget_max is None for row in refs)
+    assert all(row.budget_text == "" and row.skills == "[]" and row.raw_json == "{}" for row in refs)
+    await clean_session.close()
     await application.close()
 
 

@@ -116,14 +116,31 @@ def derive_skill_keywords(stack: list[str], role: str = "") -> list[str]:
     return words
 
 
+def _contains_keyword(haystack: str, needle: str) -> bool:
+    """Keyword containment with just enough boundary awareness.
+
+    Plain ``in`` matched «java» inside "javascript" (and its Persian alias
+    «جاوا» inside «جاوا اسکریپت»), and short Latin skills inside unrelated
+    words ("hive" in "archive", "dart" in "standard"). Pure-Latin keywords
+    therefore need non-word boundaries (``react`` still matches "react.js",
+    while ".net"/"c#"/"node.js" keep substring semantics on purpose).
+    """
+    if needle == "جاوا":
+        haystack = haystack.replace("جاوا اسکریپت", " ")
+    if re.fullmatch(r"[a-z0-9](?:[a-z0-9 ]*[a-z0-9])?", needle):
+        pattern = rf"(?<![a-z0-9+#.]){re.escape(needle)}(?![a-z0-9+#])"
+        return re.search(pattern, haystack) is not None
+    return needle in haystack
+
+
 def _matches(haystack: str, keyword: str) -> bool:
     needle = normalise_keyword(keyword)
     if not needle:
         return False
-    if needle in haystack:
+    if _contains_keyword(haystack, needle):
         return True
     for alias in _SKILL_ALIASES.get(needle, ()):
-        if normalise_keyword(alias) in haystack:
+        if _contains_keyword(haystack, normalise_keyword(alias)):
             return True
     return False
 

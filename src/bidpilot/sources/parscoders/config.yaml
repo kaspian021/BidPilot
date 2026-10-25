@@ -100,14 +100,27 @@ list:
       - "time"
       - ".date"
   id_regex: "/projects?/(\\d+)"
-  # fetch each project page for the full description & exact budget
-  fetch_details: true
-  detail_concurrency: 3
+  # Detail pages are fetched lazily ("on_demand"): only for projects that
+  # already passed the filters. Eagerly opening all ~25 project pages on
+  # every poll made ParsCoders disconnect/throttle the client
+  # (RemoteProtocolError) and drowned the logs. "eager" restores the old
+  # behaviour; "off" never fetches detail pages.
+  detail_mode: "on_demand"
+  detail_concurrency: 2
+
+# --- HTTP politeness ----------------------------------------------------------
+http:
+  get_attempts: 3
+  # jittered pause before each detail-page request (seconds, ±50%)
+  request_delay_seconds: 0.7
 
 detail:
   path: "/project/{external_id}"
   # Reuse successful project detail HTML across poll cycles; submission pages are always fetched fresh.
   cache_seconds: 900
+  # A bid-status check may reuse detail HTML fetched within this window
+  # (same poll cycle) instead of downloading the page a second time.
+  status_reuse_seconds: 120
   detail_fields:
     description:
       - "#project-description"

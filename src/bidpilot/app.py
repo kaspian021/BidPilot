@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 
 from .config import AppConfig, Secrets, get_secrets
@@ -29,6 +30,10 @@ class Application:
     sources: dict[str, Source] = field(default_factory=dict)
     generator: ProposalGenerator | None = None
     notifiers: NotifierDispatcher | None = None
+    #: source -> monotonic time of the last JavaScript alert (anti-spam: the
+    #: scheduler now retries after a cooldown, so re-alerting every cycle
+    #: would flood the owner with the same message)
+    _js_alerted_at: dict[str, float] = field(default_factory=dict)
 
     # ------------------------------------------------------------- lifecycle
     @classmethod
@@ -140,6 +145,14 @@ class Application:
         javascript_failures = [r for r in reports if getattr(r, "javascript_required", False)]
         if javascript_failures:
             source = javascript_failures[0].source or "marketplace"
+            # The scheduler retries this source after a cooldown; do not
+            # re-send the identical alert on every failed retry.
+            cooldown = max(0, int(self.config.runtime.notify_error_cooldown_seconds or 0))
+            last_alert = self._js_alerted_at.get(source, 0.0)
+            if cooldown and time.monotonic() - last_alert < cooldown:
+                log.debug("JavaScript alert throttled for %s", source)
+                return
+            self._js_alerted_at[source] = time.monotonic()
             detail = next(
                 (
                     str(error)
@@ -149,6 +162,8 @@ class Application:
                 ),
                 "سایت اجرای JavaScript در مرورگر را لازم دانست.",
             )
+            pause = int(getattr(self.config.runtime, "javascript_cooldown_seconds", 1800) or 0)
+            pause_text = f" حدود {max(1, pause // 60)} دقیقه" if pause else ""
             await self.notifiers.dispatch(
                 Event(
                     kind=EventKind.ERROR,
@@ -157,10 +172,10 @@ class Application:
                         f"⛔ سایت «{source}» پاسخ داده که JavaScript مرورگر باید فعال باشد.\n"
                         f"دلیل: {detail}\n"
                         "این نسخه از BidPilot با HTTP مستقیم کار می‌کند و JavaScript اجرا نمی‌کند؛ "
-                        "رصد متوقف شد و ثبت پیشنهاد تأیید نشده است.\n"
-                        "فعلاً از مرورگر عادی سایت برای ارسال دستی استفاده کن؛ صرفاً تغییر کوکی "
-                        "ممکن است مشکل را حل نکند. تا پشتیبانی از جریان مبتنی بر مرورگر اضافه نشده، "
-                        "برای همین وضعیت /run را تکرار نکن."
+                        "ثبت پیشنهاد تأیید نشده است.\n"
+                        f"این منبع{pause_text} موقتاً متوقف می‌شود و سپس خودش دوباره تلاش می‌کند؛ "
+                        "لازم نیست دستی /run بزنی. اگر این پیام مداوم تکرار شد، یعنی سایت واقعاً "
+                        "به مرورگر نیاز دارد و فعلاً باید پیشنهاد را دستی از خود سایت بفرستی."
                     ),
                 )
             )

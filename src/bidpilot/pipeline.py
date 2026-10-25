@@ -27,7 +27,12 @@ from .pricing.strategy import PricingConfig, PricingStrategy
 from .proposals.generator import ProposalError, ProposalGenerator
 from .ratelimit import RateLimiter
 from .repositories import Repository
-from .sources.base import Source, SourceError
+from .sources.base import (
+    AuthenticationRequiredError,
+    JavaScriptRequiredError,
+    Source,
+    SourceError,
+)
 from .text import parse_days
 
 log = logging.getLogger(__name__)
@@ -46,7 +51,8 @@ class RunReport:
     errors: list[str] = field(default_factory=list)
     #: True when the account session is invalid; the scheduler must stop searching.
     authentication_failed: bool = False
-    #: True when the site requires JavaScript in a real browser.
+    #: True when the site (transiently) demands browser JavaScript; the
+    #: scheduler pauses this source with a cooldown instead of stopping.
     javascript_required: bool = False
     #: human-readable reason -> how many projects were skipped for it
     skip_reasons: dict[str, int] = field(default_factory=dict)
@@ -174,9 +180,9 @@ class BidPipeline:
                     log.exception("Project %s failed", project.uid)
                     report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
                 if report.authentication_failed or report.javascript_required:
-                    stop_reason = "AUTH" if report.authentication_failed else "JAVASCRIPT"
+                    stop_reason = "STOP-AUTH" if report.authentication_failed else "PAUSE-JAVASCRIPT"
                     log.error(
-                        "[PIPELINE][STOP-%s] source=%s stopping the current project batch",
+                        "[PIPELINE][%s] source=%s stopping the current project batch",
                         stop_reason,
                         source.name,
                     )
@@ -184,17 +190,20 @@ class BidPipeline:
         except Exception as exc:  # fetch/auth failure for the whole source
             detail = str(exc).strip() or type(exc).__name__
             report.errors.append(detail)
-            report.authentication_failed = any(
+            report.authentication_failed = isinstance(exc, AuthenticationRequiredError) or any(
                 marker in detail.casefold()
                 for marker in ("احراز هویت", "نشست منقضی", "وارد حساب کاربری", "ورود به حساب")
             )
+            # A JS interstitial on the *listing* page used to fall through as a
+            # generic error and be retried (hammered) every poll interval.
+            report.javascript_required = isinstance(exc, JavaScriptRequiredError)
             log.error(
                 "Source cycle failed for %s: %s",
                 source.name,
                 detail,
                 exc_info=log.isEnabledFor(logging.DEBUG),
             )
-            if not report.authentication_failed:
+            if not (report.authentication_failed or report.javascript_required):
                 await self._notify_error(source.name, f"اجرای منبع «{source.name}» ناموفق بود: {detail}")
             else:
                 log.error(
@@ -206,12 +215,44 @@ class BidPipeline:
         log.info(report.summary())
         return report
 
+    async def _filter_skip_plan(self, project: Project, report: RunReport) -> BidPlan | None:
+        """Evaluate the filters; return a SKIPPED plan when the project is out."""
+        decision = self.project_filter.evaluate(project)
+        log.debug(
+            "[PIPELINE][FILTER] source=%s id=%s title=%r allowed=%s reason=%r "
+            "require_budget=%s require_skill_match=%s profile_skills=%r",
+            project.source,
+            project.external_id,
+            project.title,
+            decision.allowed,
+            decision.reason,
+            self.config.filters.require_budget,
+            self.config.filters.require_skill_match,
+            self.project_filter.skill_keywords,
+        )
+        if decision.allowed:
+            return None
+        log.info(
+            "[PIPELINE][SKIPPED] source=%s id=%s title=%r reason=%r",
+            project.source,
+            project.external_id,
+            project.title,
+            decision.reason,
+        )
+        report.skipped += 1
+        plan = BidPlan(
+            project=project,
+            result=SubmissionResult(status=SubmissionStatus.SKIPPED, message=decision.reason),
+        )
+        await self._emit_skip(project, decision.reason, report)
+        return plan
+
     # -------------------------------------------------------------- one item
     async def process_project(self, project: Project, report: RunReport) -> BidPlan | None:
         # 1) Filter first; a rejected/observed project is never persisted.
         budget_debug = project.budget.model_dump() if project.budget else None
         raw = project.raw or {}
-        log.info(
+        log.debug(
             "[PIPELINE][CANDIDATE] source=%s id=%s title=%r url=%s "
             "budget=%r raw_budget_text=%r detail_budget_selector_text=%r "
             "detail_budget_text_used=%r detail_budget_source=%r skills=%r "
@@ -230,35 +271,36 @@ class BidPipeline:
             project.employer_deadline,
             len(project.description or ""),
         )
-        decision = self.project_filter.evaluate(project)
-        log.info(
-            "[PIPELINE][FILTER] source=%s id=%s title=%r allowed=%s reason=%r "
-            "require_budget=%s require_skill_match=%s profile_skills=%r",
-            project.source,
-            project.external_id,
-            project.title,
-            decision.allowed,
-            decision.reason,
-            self.config.filters.require_budget,
-            self.config.filters.require_skill_match,
-            self.project_filter.skill_keywords,
-        )
-        if not decision.allowed:
-            log.info(
-                "[PIPELINE][SKIPPED] source=%s id=%s title=%r reason=%r budget=%r",
-                project.source,
-                project.external_id,
-                project.title,
-                decision.reason,
-                budget_debug,
-            )
-            report.skipped += 1
-            plan = BidPlan(
-                project=project,
-                result=SubmissionResult(status=SubmissionStatus.SKIPPED, message=decision.reason),
-            )
-            await self._emit_skip(project, decision.reason, report)
-            return plan
+        skipped_plan = await self._filter_skip_plan(project, report)
+        if skipped_plan is not None:
+            return skipped_plan
+
+        # 2) Only now — for a project we might actually bid on — pay for the
+        # detail page (full description, exact budget range, deadline).
+        # Fetching details for every listing card used to mean ~25 extra
+        # requests per poll for projects that were mostly filtered out, which
+        # is what got the client throttled/disconnected by the marketplace.
+        enrich = getattr(self.sources.get(project.source), "enrich_project", None)
+        if enrich is not None:
+            try:
+                enriched = await enrich(project)
+            except Exception as exc:  # detail data is an upgrade, not a gate
+                log.warning(
+                    "[PIPELINE][ENRICH-FAILED] source=%s id=%s error_type=%s",
+                    project.source,
+                    project.external_id,
+                    type(exc).__name__,
+                )
+                enriched = project
+            if enriched is not project:
+                project = enriched
+                budget_debug = project.budget.model_dump() if project.budget else None
+                raw = project.raw or {}
+                # The exact budget range/skills from the detail page can
+                # legitimately change the verdict (e.g. max-only -> range).
+                skipped_plan = await self._filter_skip_plan(project, report)
+                if skipped_plan is not None:
+                    return skipped_plan
 
         # The marketplace project page is the only authority for whether we
         # already bid. The database stores submission history for rate limits,
@@ -270,7 +312,9 @@ class BidPipeline:
             except SourceError as exc:
                 detail = str(exc).strip() or type(exc).__name__
                 folded = detail.casefold()
-                if any(
+                # Prefer the typed errors; substring matching on human-readable
+                # Persian text stays only as a fallback for third-party sources.
+                if isinstance(exc, AuthenticationRequiredError) or any(
                     marker in folded
                     for marker in ("احراز هویت", "نشست منقضی", "وارد حساب کاربری", "ورود به حساب")
                 ):
@@ -281,11 +325,14 @@ class BidPipeline:
                         project.source,
                         project.external_id,
                     )
-                elif "javascript" in folded or "جاوا اسکریپت" in folded:
+                elif isinstance(exc, JavaScriptRequiredError):
                     report.javascript_required = True
-                    report.errors.append("صفحهٔ پروژه اجرای JavaScript در مرورگر را لازم دانست؛ رصد متوقف شد.")
+                    report.errors.append(
+                        "صفحهٔ پروژه اجرای JavaScript در مرورگر را لازم دانست؛ "
+                        "این منبع موقتاً متوقف می‌شود و خودکار دوباره تلاش می‌کند."
+                    )
                     log.error(
-                        "[PIPELINE][STOP-JAVASCRIPT] source=%s id=%s stage=bid_status_check",
+                        "[PIPELINE][PAUSE-JAVASCRIPT] source=%s id=%s stage=bid_status_check",
                         project.source,
                         project.external_id,
                     )
@@ -437,9 +484,12 @@ class BidPipeline:
             )
         if result.javascript_required:
             report.javascript_required = True
-            report.errors.append("سایت اجرای JavaScript در مرورگر را لازم دانست؛ ارسال خودکار متوقف می‌شود.")
+            report.errors.append(
+                "سایت اجرای JavaScript در مرورگر را لازم دانست؛ "
+                "این منبع موقتاً متوقف می‌شود و خودکار دوباره تلاش می‌کند."
+            )
             log.error(
-                "[PIPELINE][STOP-JAVASCRIPT] source=%s id=%s stopping after JavaScript requirement",
+                "[PIPELINE][PAUSE-JAVASCRIPT] source=%s id=%s pausing after JavaScript requirement",
                 project.source,
                 project.external_id,
             )

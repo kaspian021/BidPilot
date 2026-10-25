@@ -85,7 +85,13 @@ async def test_scheduler_stops_after_a_report_marks_authentication_failed(tmp_pa
     assert scheduler._stop.is_set()
 
 
-async def test_scheduler_stops_after_a_report_requires_javascript(tmp_path):
+async def test_scheduler_pauses_javascript_source_instead_of_stopping(tmp_path):
+    """A JavaScript interstitial is transient: pause the source, keep running.
+
+    Regression test for the production incident where one such response
+    killed the whole daemon (``Scheduler stopped.``) until a manual /run.
+    """
+
     class JavaScriptReport:
         source = "parscoders"
         authentication_failed = False
@@ -100,23 +106,44 @@ async def test_scheduler_stops_after_a_report_requires_javascript(tmp_path):
             super().__init__()
             self.sources = {"parscoders": object()}
             self.cycles = 0
+            self.seen_sources = []
 
         async def cycle(self, sources=None):
             self.cycles += 1
+            self.seen_sources.append(sources)
             return [JavaScriptReport()]
 
     app = JavaScriptApp()
     callback_reports = []
     scheduler = Scheduler(
         app,
-        interval=600,
+        interval=5,
         jitter=0,
         store=SettingsStore(tmp_path / "settings.json"),
         on_report=lambda reports: callback_reports.extend(reports),
+        javascript_cooldown=1,
     )
 
-    await asyncio.wait_for(scheduler.run_forever(), timeout=2)
+    task = asyncio.create_task(scheduler.run_forever())
+    try:
+        # first cycle runs, the source gets paused, the scheduler stays alive
+        for _ in range(100):
+            if app.cycles >= 1 and "parscoders" in scheduler._paused_until:
+                break
+            await asyncio.sleep(0.05)
+        assert app.cycles == 1
+        assert len(callback_reports) == 1
+        assert not scheduler._stop.is_set()
+        assert not task.done()
 
-    assert app.cycles == 1
-    assert len(callback_reports) == 1
-    assert scheduler._stop.is_set()
+        # after the short cooldown the very same source is polled again
+        for _ in range(200):
+            if app.cycles >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert app.cycles >= 2
+        # second failure doubles down the streak (exponential pause growth)
+        assert scheduler._js_streak["parscoders"] >= 2
+    finally:
+        scheduler.request_stop()
+        await asyncio.wait_for(task, timeout=5)

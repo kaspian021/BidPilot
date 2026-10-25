@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ from ..credentials import SiteCredentials, site_credentials
 from ..llm_providers import build_client, resolve_chain
 from ..models import Project, Proposal, SubmissionResult, SubmissionStatus
 from . import html_parser as parser
-from .base import Source, SourceError
+from .base import AuthenticationRequiredError, JavaScriptRequiredError, Source, SourceError
 from .discovery import (
     MAX_DETAIL_PAGES,
     MAX_PROJECTS,
@@ -59,8 +60,25 @@ def _javascript_required_message(site_notice: str = "") -> str:
     )
     return (
         f"{detail} BidPilot در این اتصال HTTP مستقیم کار می‌کند و JavaScript "
-        "اجرا نمی‌کند؛ رصد خودکار متوقف شد. ثبت پیشنهاد تأیید نشده است."
+        "اجرا نمی‌کند؛ این منبع موقتاً متوقف می‌شود و پس از مکث خودکار دوباره تلاش می‌کند. "
+        "ثبت پیشنهاد تأیید نشده است."
     )
+
+
+def _retry_delay(attempt: int, *, retry_after: str | None = None) -> float:
+    """Exponential backoff with jitter for idempotent GET retries.
+
+    The old fixed ``0.5 * attempt`` (<=1.5s) schedule retried a throttling
+    server almost immediately, which is exactly how a polite client becomes
+    a banned one (the ``RemoteProtocolError`` disconnects in production logs).
+    A server-provided ``Retry-After`` always wins.
+    """
+    if retry_after:
+        try:
+            return min(60.0, max(1.0, float(retry_after)))
+        except (TypeError, ValueError):
+            pass  # HTTP-date form: rare here; fall through to backoff
+    return min(16.0, (2.0 ** max(0, attempt - 1)) + random.uniform(0.0, 0.5))
 
 
 def merge_settings(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -164,15 +182,17 @@ class HtmlMarketSource(Source):
                 response = await client.get(path, **kwargs)
             except httpx.HTTPError as exc:
                 if attempt < attempts:
+                    delay = _retry_delay(attempt)
                     log.warning(
-                        "[HTTP][RETRY] source=%s url=%s attempt=%s/%s error_type=%s",
+                        "[HTTP][RETRY] source=%s url=%s attempt=%s/%s error_type=%s retry_in=%.1fs",
                         self.name,
                         safe_requested,
                         attempt,
                         attempts,
                         type(exc).__name__,
+                        delay,
                     )
-                    await asyncio.sleep(min(1.5, 0.5 * attempt))
+                    await asyncio.sleep(delay)
                     continue
                 log.error(
                     "[HTTP][FAILED] source=%s url=%s attempts=%s error_type=%s",
@@ -187,15 +207,17 @@ class HtmlMarketSource(Source):
 
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < attempts:
+                    delay = _retry_delay(attempt, retry_after=response.headers.get("retry-after"))
                     log.warning(
-                        "[HTTP][RETRY] source=%s url=%s attempt=%s/%s status=%s",
+                        "[HTTP][RETRY] source=%s url=%s attempt=%s/%s status=%s retry_in=%.1fs",
                         self.name,
                         safe_requested,
                         attempt,
                         attempts,
                         response.status_code,
+                        delay,
                     )
-                    await asyncio.sleep(min(1.5, 0.5 * attempt))
+                    await asyncio.sleep(delay)
                     continue
             break
 
@@ -479,7 +501,7 @@ class HtmlMarketSource(Source):
                 result.notes,
             )
             for project in result.projects:
-                log.info(
+                log.debug(
                     "[DISCOVERY][PROJECT] source=%s id=%s title=%r url=%s "
                     "budget=%r raw_budget_text=%r skills=%r deadline=%r description_chars=%s",
                     project.source,
@@ -614,13 +636,18 @@ class HtmlMarketSource(Source):
             if len(page_projects) < int(list_cfg.get("min_items_per_page", 1)):
                 break
 
-        if list_cfg.get("fetch_details", True) and projects:
+        # "eager" keeps the historical behaviour (detail page for every card).
+        # "on_demand" (preferred) defers detail pages to the pipeline, which
+        # only enriches projects that already passed the filters — in the
+        # production log that turned 25 detail requests per poll into ~2 and
+        # stopped the marketplace from disconnecting us.
+        if self.detail_mode() == "eager" and projects:
             projects = await self._attach_details(projects, int(list_cfg.get("detail_concurrency", 3)))
 
         projects.sort(key=lambda p: (p.published_at is not None, p.published_at), reverse=True)
         log.info("[FETCH][FINAL] source=%s projects=%s", self.name, len(projects))
         for project in projects:
-            log.info(
+            log.debug(
                 "[FETCH][FINAL-PROJECT] source=%s id=%s title=%r url=%s "
                 "budget=%r raw_budget_text=%r skills=%r description_chars=%s",
                 project.source,
@@ -637,44 +664,75 @@ class HtmlMarketSource(Source):
     requires_bid_status_check = True
 
     async def check_bid_status(self, project: Project) -> bool | None:
-        """Inspect a fresh project page before generating or posting another bid."""
+        """Inspect the project page before generating or posting another bid.
+
+        Two deliberate orderings live here:
+
+        * a *freshly cached* detail page (fetched seconds ago by
+          :meth:`enrich_project` in this same cycle) is reused instead of
+          downloading the identical 300 KB page again;
+        * the page's actual bid state is evaluated **before** any
+          "JavaScript required" banner: many sites render that banner
+          server-side and hide it with JS, so a fully usable page (bid form
+          present, state readable) must never be reported as JS-blocked.
+          The banner only matters when the state is otherwise unreadable.
+        """
         detail_cfg = self.settings.get("detail") or {}
         bid_cfg = self.settings.get("bid") or {}
-        detail_path = detail_cfg.get("path", "{external_id}")
-        page_path = detail_path.format(external_id=project.external_id, url=project.url)
-        client = await self.client()
-        try:
-            page = await client.get(page_path)
-        except httpx.HTTPError as exc:
-            log.warning(
-                "[BID][STATUS-CHECK] source=%s id=%s outcome=network_error error_type=%s",
+        page_path = self._detail_path(project)
+        html: str | None = None
+
+        reuse_seconds = max(0.0, float(detail_cfg.get("status_reuse_seconds", 120) or 0))
+        if reuse_seconds:
+            cached = self._detail_html_cache.get(self._detail_cache_key(project, page_path))
+            if cached and time.monotonic() - cached[0] <= reuse_seconds:
+                html = cached[1]
+                log.debug(
+                    "[BID][STATUS-CHECK-CACHE-HIT] source=%s id=%s age_seconds=%.1f",
+                    self.name,
+                    project.external_id,
+                    time.monotonic() - cached[0],
+                )
+
+        if html is None:
+            client = await self.client()
+            try:
+                page = await client.get(page_path)
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "[BID][STATUS-CHECK] source=%s id=%s outcome=network_error error_type=%s",
+                    self.name,
+                    project.external_id,
+                    type(exc).__name__,
+                )
+                raise SourceError(f"خطای شبکه هنگام بررسی وضعیت پیشنهاد پروژه: {type(exc).__name__}") from exc
+
+            final_path = urlsplit(str(page.url)).path
+            log.info(
+                "[BID][STATUS-CHECK-RESPONSE] source=%s id=%s status=%s final_path=%s html_chars=%s",
                 self.name,
                 project.external_id,
-                type(exc).__name__,
+                page.status_code,
+                final_path,
+                len(page.text or ""),
             )
-            raise SourceError(f"خطای شبکه هنگام بررسی وضعیت پیشنهاد پروژه: {type(exc).__name__}") from exc
+            if page.status_code in (401, 403) or re.search(
+                r"/(?:login|signin|sign-in|auth/login)(?:/|$)", final_path, re.IGNORECASE
+            ):
+                raise AuthenticationRequiredError(
+                    "نشست منقضی شده است؛ برای جلوگیری از ارسال تکراری وضعیت پیشنهاد بررسی نشد."
+                )
+            if page.status_code >= 400:
+                raise SourceError(
+                    f"صفحه پروژه برای بررسی وضعیت پیشنهاد قابل دریافت نبود (HTTP {page.status_code})."
+                )
+            html = page.text
 
-        final_path = urlsplit(str(page.url)).path
-        log.info(
-            "[BID][STATUS-CHECK-RESPONSE] source=%s id=%s status=%s final_path=%s html_chars=%s",
-            self.name,
-            project.external_id,
-            page.status_code,
-            final_path,
-            len(page.text or ""),
-        )
-        if page.status_code in (401, 403) or re.search(
-            r"/(?:login|signin|sign-in|auth/login)(?:/|$)", final_path, re.IGNORECASE
-        ):
-            raise SourceError("نشست منقضی شده است؛ برای جلوگیری از ارسال تکراری وضعیت پیشنهاد بررسی نشد.")
-        if page.status_code >= 400:
-            raise SourceError(
-                f"صفحه پروژه برای بررسی وضعیت پیشنهاد قابل دریافت نبود (HTTP {page.status_code})."
-            )
-        if parser.requires_javascript(page.text):
-            raise SourceError(_javascript_required_message())
-
-        state = parser.detect_existing_bid(page.text, bid_cfg)
+        state = parser.detect_existing_bid(html, bid_cfg)
+        if state is None:
+            snippet = parser.javascript_requirement_snippet(html)
+            if snippet:
+                raise JavaScriptRequiredError(_javascript_required_message(snippet))
         outcome = "already_submitted" if state is True else "not_submitted" if state is False else "unknown"
         log.info(
             "[BID][STATUS-CHECK] source=%s id=%s outcome=%s",
@@ -684,79 +742,131 @@ class HtmlMarketSource(Source):
         )
         return state
 
-    async def _attach_details(self, projects: list[Project], concurrency: int) -> list[Project]:
+    # --------------------------------------------------------- detail pages
+    def detail_mode(self) -> str:
+        """``eager`` (detail for every card) | ``on_demand`` (only candidates) | ``off``."""
+        list_cfg = self.settings.get("list") or {}
+        # The legacy boolean remains a hard kill-switch for existing overrides.
+        if list_cfg.get("fetch_details") is False:
+            return "off"
+        mode = str(list_cfg.get("detail_mode") or "").strip().lower()
+        if mode in {"eager", "on_demand", "off"}:
+            return mode
+        # Backwards compatibility with configs that only know fetch_details.
+        return "eager" if list_cfg.get("fetch_details", True) else "off"
+
+    def _detail_path(self, project: Project) -> str:
+        template = (self.settings.get("detail") or {}).get("path", "{external_id}")
+        return template.format(external_id=project.external_id, url=project.url)
+
+    @staticmethod
+    def _detail_cache_key(project: Project, path: str) -> str:
+        return f"{project.external_id}:{path}"
+
+    def _detail_cache_seconds(self) -> float:
+        return max(0.0, float((self.settings.get("detail") or {}).get("cache_seconds", 900) or 0))
+
+    def _prune_detail_cache(self) -> None:
+        cache_seconds = self._detail_cache_seconds()
+        if not cache_seconds:
+            self._detail_html_cache.clear()
+            return
+        now = time.monotonic()
+        for key, (cached_at, _) in list(self._detail_html_cache.items()):
+            if now - cached_at >= cache_seconds:
+                self._detail_html_cache.pop(key, None)
+
+    def _detail_settings(self) -> dict[str, Any]:
         detail_cfg = dict(self.settings.get("detail") or {})
         detail_cfg["_diagnostics"] = bool(self.discovery_settings().get("log_extraction_details"))
-        template = detail_cfg.get("path", "{external_id}")
-        cache_seconds = max(0.0, float(detail_cfg.get("cache_seconds", 900) or 0))
-        now = time.monotonic()
+        return detail_cfg
+
+    async def _fetch_detail_html(self, project: Project, path: str) -> str | None:
+        """Detail HTML from cache or network (with a polite jittered delay)."""
+        cache_seconds = self._detail_cache_seconds()
+        cache_key = self._detail_cache_key(project, path)
+        cached = self._detail_html_cache.get(cache_key) if cache_seconds else None
+        if cached and time.monotonic() - cached[0] < cache_seconds:
+            log.debug(
+                "[SELECTORS][DETAIL-CACHE-HIT] source=%s id=%s age_seconds=%.1f",
+                self.name,
+                project.external_id,
+                time.monotonic() - cached[0],
+            )
+            return cached[1]
+        # A human does not open 25 project pages in the same second; the old
+        # zero-delay burst is what earned us server disconnects.
+        delay = float((self.settings.get("http") or {}).get("request_delay_seconds", 0) or 0)
+        if delay > 0:
+            await asyncio.sleep(delay * random.uniform(0.5, 1.5))
+        try:
+            html = await self.get_html(path)
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            log.warning(
+                "[SELECTORS][DETAIL-FAILED] source=%s id=%s path=%s error_type=%s detail=%r",
+                self.name,
+                project.external_id,
+                self._safe_diagnostic_url(urljoin(self.base_url + "/", path.lstrip("/"))),
+                type(exc).__name__,
+                detail[:180],
+            )
+            return None
         if cache_seconds:
-            for key, (cached_at, _) in list(self._detail_html_cache.items()):
-                if now - cached_at >= cache_seconds:
-                    self._detail_html_cache.pop(key, None)
-        else:
-            self._detail_html_cache.clear()
+            self._detail_html_cache[cache_key] = (time.monotonic(), html)
+        return html
+
+    async def _enrich_one(self, project: Project, detail_cfg: dict[str, Any]) -> Project:
+        path = self._detail_path(project)
+        log.debug(
+            "[SELECTORS][GET-DETAIL] source=%s id=%s title=%r project_url=%s "
+            "configured_detail_path=%s resolved_request=%s",
+            self.name,
+            project.external_id,
+            project.title,
+            project.url,
+            path,
+            urljoin(self.base_url + "/", path.lstrip("/")),
+        )
+        html = await self._fetch_detail_html(project, path)
+        if html is None:
+            return project
+        try:
+            enriched = parser.enrich_from_detail(html, project, detail_cfg)
+        except Exception:
+            log.exception(
+                "[SELECTORS][DETAIL-PARSE-FAILED] source=%s id=%s path=%s",
+                self.name,
+                project.external_id,
+                path,
+            )
+            return project
+        log.debug(
+            "[SELECTORS][DETAIL-RESULT] source=%s id=%s title=%r budget_before=%r budget_after=%r",
+            self.name,
+            project.external_id,
+            project.title,
+            project.budget.model_dump() if project.budget else None,
+            enriched.budget.model_dump() if enriched.budget else None,
+        )
+        return enriched
+
+    async def enrich_project(self, project: Project) -> Project:
+        """On-demand detail fetch for one project that passed the filters."""
+        if self.detail_mode() == "off":
+            return project
+        self._prune_detail_cache()
+        return await self._enrich_one(project, self._detail_settings())
+
+    async def _attach_details(self, projects: list[Project], concurrency: int) -> list[Project]:
+        """Eager mode: detail page for every card (legacy; prefer on_demand)."""
+        detail_cfg = self._detail_settings()
+        self._prune_detail_cache()
         semaphore = asyncio.Semaphore(max(1, concurrency))
 
         async def enrich(project: Project) -> Project:
-            path = template.format(external_id=project.external_id, url=project.url)
-            cache_key = f"{project.external_id}:{path}"
-            log.info(
-                "[SELECTORS][GET-DETAIL] source=%s id=%s title=%r project_url=%s "
-                "configured_detail_path=%s resolved_request=%s",
-                self.name,
-                project.external_id,
-                project.title,
-                project.url,
-                path,
-                urljoin(self.base_url + "/", path.lstrip("/")),
-            )
             async with semaphore:
-                cached = self._detail_html_cache.get(cache_key) if cache_seconds else None
-                if cached and time.monotonic() - cached[0] < cache_seconds:
-                    html = cached[1]
-                    log.info(
-                        "[SELECTORS][DETAIL-CACHE-HIT] source=%s id=%s age_seconds=%.1f",
-                        self.name,
-                        project.external_id,
-                        time.monotonic() - cached[0],
-                    )
-                else:
-                    try:
-                        html = await self.get_html(path)
-                    except Exception as exc:
-                        detail = str(exc).strip() or type(exc).__name__
-                        log.warning(
-                            "[SELECTORS][DETAIL-FAILED] source=%s id=%s path=%s error_type=%s detail=%r",
-                            self.name,
-                            project.external_id,
-                            self._safe_diagnostic_url(urljoin(self.base_url + "/", path.lstrip("/"))),
-                            type(exc).__name__,
-                            detail[:180],
-                        )
-                        return project
-                    if cache_seconds:
-                        self._detail_html_cache[cache_key] = (time.monotonic(), html)
-            try:
-                enriched = parser.enrich_from_detail(html, project, detail_cfg)
-                log.info(
-                    "[SELECTORS][DETAIL-RESULT] source=%s id=%s title=%r budget_before=%r budget_after=%r",
-                    self.name,
-                    project.external_id,
-                    project.title,
-                    project.budget.model_dump() if project.budget else None,
-                    enriched.budget.model_dump() if enriched.budget else None,
-                )
-                return enriched
-            except Exception as exc:
-                log.exception(
-                    "[SELECTORS][DETAIL-PARSE-FAILED] source=%s id=%s path=%s",
-                    self.name,
-                    project.external_id,
-                    path,
-                )
-                log.debug("detail parse error: %s", exc)
-                return project
+                return await self._enrich_one(project, detail_cfg)
 
         return list(await asyncio.gather(*(enrich(p) for p in projects)))
 
@@ -804,22 +914,15 @@ class HtmlMarketSource(Source):
             return self.fail("نشست منقضی شده است؛ در تلگرام «/market» کوکی را به‌روز کن.", page.status_code)
         if page.status_code >= 400:
             return self.fail(f"صفحه پروژه قابل دریافت نبود (HTTP {page.status_code}).", page.status_code)
-        if parser.requires_javascript(page.text):
-            message = _javascript_required_message()
-            log.warning(
-                "[BID][PAGE-RESPONSE] source=%s id=%s outcome=javascript_required",
-                self.name,
-                project.external_id,
-            )
-            return SubmissionResult(
-                status=SubmissionStatus.FAILED,
-                message=message,
-                http_status=page.status_code,
-                javascript_required=True,
-            )
 
+        # Functional evidence beats textual banners: many pages render a
+        # "JavaScript را فعال کنید" notice server-side and hide it with JS.
+        # If the real bid form is right there, the page is usable — only a
+        # missing form + JS notice means the flow truly needs a browser.
         form, payload = parser.find_bid_form(page.text, bid_cfg)
         if form is None:
+            # A login-gated CTA is more specific/actionable than a JS banner
+            # (a logged-out page can show both), so it wins the diagnosis.
             login_link = parser.find_proposal_login_link(page.text, str(page.url))
             if login_link:
                 log.warning(
@@ -832,6 +935,21 @@ class HtmlMarketSource(Source):
                     "لینک «ارسال پیشنهاد» در صفحه به مسیر ورود هدایت می‌شود؛ "
                     "نشست فعلی به‌عنوان واردشده تأیید نشد. کوکی پارس‌کدرز را در «/market» "
                     "دوباره ثبت کن و با «/test» بررسی کن."
+                )
+            snippet = parser.javascript_requirement_snippet(page.text)
+            if snippet:
+                message = _javascript_required_message(snippet)
+                log.warning(
+                    "[BID][PAGE-RESPONSE] source=%s id=%s outcome=javascript_required notice=%r",
+                    self.name,
+                    project.external_id,
+                    snippet,
+                )
+                return SubmissionResult(
+                    status=SubmissionStatus.FAILED,
+                    message=message,
+                    http_status=page.status_code,
+                    javascript_required=True,
                 )
             return self.fail(
                 "صفحهٔ پروژه دریافت شد، اما فرم HTML ارسال پیشنهاد شناسایی نشد؛ "
@@ -888,7 +1006,11 @@ class HtmlMarketSource(Source):
             )
             return self.fail(message, response.status_code)
 
-        if parser.requires_javascript(response.text):
+        # An explicit success confirmation from the site outranks everything:
+        # never reclassify a *submitted* bid as "JavaScript required" because
+        # the surrounding page also carries a (hidden-by-JS) banner.
+        _ok_preview, _ = parser.detect_success(response.status_code, response.text, bid_cfg)
+        if not _ok_preview and parser.requires_javascript(response.text):
             notice = next((item for item in notices if parser.requires_javascript(item)), "")
             message = _javascript_required_message(notice)
             log.warning(

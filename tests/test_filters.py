@@ -33,9 +33,56 @@ def test_keywords_come_from_the_profile():
     words = derive_skill_keywords(PROFILE.stack, PROFILE.role)
 
     assert "flutter" in words and "fastapi" in words
-    # role words are split on separators but the generic ones are dropped
+    # Generic role words are dropped, including when they lead a role phrase.
     assert "برنامه‌نویس" not in words
+    assert "برنامه نویس" not in words
     assert normalise_keyword("ASP.NET  Core") == "asp.net core"
+
+
+def test_compound_role_extracts_each_skill():
+    words = derive_skill_keywords(["Dart"], "مهندس Flutter و .NET")
+
+    assert "dart" in words
+    assert "flutter" in words
+    assert ".net" in words
+    assert "مهندس flutter و .net" not in words
+
+
+def test_aspnet_core_profile_skill_matches_dotnet_project():
+    flt = ProjectFilter(
+        FiltersConfig(),
+        profile_skills=["ASP.NET Core"],
+    )
+    project = Project(
+        source="mock",
+        external_id="2",
+        title="توسعه نرم افزار بک‌اند",
+        budget=Budget(min=500_000, max=1_000_000),
+        skills=[".NET"],
+    )
+
+    decision = flt.evaluate(project)
+
+    assert decision.allowed, decision.reason
+
+
+def test_dotnet_in_compound_profile_role_matches_dotnet_project():
+    flt = ProjectFilter(
+        FiltersConfig(),
+        profile_skills=["Flutter"],
+        profile_role="مهندس Flutter و .NET",
+    )
+    project = Project(
+        source="mock",
+        external_id="3",
+        title="ساخت ربات",
+        budget=Budget(min=500_000, max=1_000_000),
+        skills=[".NET"],
+    )
+
+    decision = flt.evaluate(project)
+
+    assert decision.allowed, decision.reason
 
 
 def test_a_project_without_a_budget_is_skipped_by_default():

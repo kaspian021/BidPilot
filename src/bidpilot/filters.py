@@ -23,6 +23,7 @@ from .text import has_any
 _STOPWORDS = {
     "برنامه",
     "نویس",
+    "نویسی",
     "برنامه‌نویس",
     "developer",
     "engineer",
@@ -45,6 +46,7 @@ _SKILL_ALIASES: dict[str, tuple[str, ...]] = {
     "react native": ("ری‌اکت نیتیو", "اپلیکیشن موبایل"),
     "unity": ("یونیتی", "بازی"),
     "asp.net": ("ای اس پی", "دات نت", "dotnet", "asp net"),
+    "asp.net core": ("asp.net", ".net", "دات نت", "dotnet", "asp net"),
     ".net": ("دات نت", "dotnet"),
     "c#": ("سی شارپ", "c sharp"),
     "wordpress": ("وردپرس",),
@@ -85,15 +87,32 @@ def normalise_keyword(value: str) -> str:
 
 
 def derive_skill_keywords(stack: list[str], role: str = "") -> list[str]:
-    """Skill words taken from the profile — short, concrete, deduplicated."""
+    """Extract concrete skills from stack items and compound job titles."""
     words: list[str] = []
-    for item in [*stack, role]:
+
+    def add_keyword(value: str) -> None:
+        cleaned = normalise_keyword(value)
+        if not cleaned or len(cleaned) < 2 or cleaned in _STOPWORDS:
+            return
+        if cleaned not in words:
+            words.append(cleaned)
+
+    for item in stack:
         for chunk in re.split(r"[,،/|+]", str(item or "")):
-            cleaned = normalise_keyword(chunk)
-            if not cleaned or len(cleaned) < 2 or cleaned in _STOPWORDS:
-                continue
-            if cleaned not in words:
-                words.append(cleaned)
+            add_keyword(chunk)
+
+    # Roles often combine a generic job title with the actual technologies,
+    # e.g. "مهندس Flutter و .NET". Split conjunctions and strip leading/trailing
+    # role words so ".NET" and "Flutter" can match project skill tags directly.
+    for chunk in re.split(r"[,،/|+]", str(role or "")):
+        for part in re.split(r"\s+(?:و|and)\s+", chunk, flags=re.IGNORECASE):
+            tokens = normalise_keyword(part).split()
+            while tokens and tokens[0] in _STOPWORDS:
+                tokens.pop(0)
+            while tokens and tokens[-1] in _STOPWORDS:
+                tokens.pop()
+            add_keyword(" ".join(tokens))
+
     return words
 
 

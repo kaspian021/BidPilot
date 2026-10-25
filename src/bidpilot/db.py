@@ -1,9 +1,8 @@
-"""Persistence layer.
+"""Persistence layer for confirmed submissions and submission rate limits.
 
-SQLite by default (zero-ops, perfect for a single box), Postgres by changing one
-URL: ``postgresql+asyncpg://user:pass@host/db``. The models are intentionally
-source-agnostic and indexed for the two hot queries: "have I seen this project?"
-and "how many bids did I send in the last hour?".
+Discovered projects are evaluated from the marketplace's current page and are
+not stored as a scan cache. Project rows are minimal identity anchors for the
+confirmed-submission history; scraped project details are not persisted.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     func,
+    update,
     select,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -109,13 +109,30 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Older versions stored every discovered/skipped project. Keep only
-            # confirmed successful bids and their project rows; discard scan-only
-            # records, dry runs, failed attempts, and per-project skip events.
+            # Remove legacy scan-only records, dry runs, failed attempts, and
+            # per-project skip events. Only confirmed submissions remain.
             await conn.execute(delete(BidRow).where(BidRow.status != "submitted"))
             submitted_project_ids = select(BidRow.project_id).where(BidRow.status == "submitted")
             await conn.execute(delete(ProjectRow).where(~ProjectRow.id.in_(submitted_project_ids)))
             await conn.execute(delete(EventRow).where(EventRow.kind == "bid_skipped"))
+
+            # Keep only the identity fields needed by the bid foreign key/history.
+            # Old releases stored full scraped project content, so redact that too.
+            await conn.execute(
+                update(ProjectRow).values(
+                    title="",
+                    url="",
+                    description="",
+                    budget_min=None,
+                    budget_max=None,
+                    budget_text="",
+                    skills="[]",
+                    category=None,
+                    employer=None,
+                    published_at=None,
+                    raw_json="{}",
+                )
+            )
 
     async def dispose(self) -> None:
         await self.engine.dispose()

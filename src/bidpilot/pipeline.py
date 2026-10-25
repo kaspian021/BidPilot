@@ -458,12 +458,16 @@ class BidPipeline:
                 project.external_id,
             )
 
-        bid_row = await self.repo.save_bid(project_row.id, plan)
         if result.status == SubmissionStatus.SUBMITTED:
+            if project_row is None:
+                project_row = await self.repo.save_project(project)
+            else:
+                project_row = await self.repo.refresh_project_row(project_row, project)
+            await self.repo.save_bid(project_row.id, plan)
             report.submitted += 1
         else:
+            # Failed attempts stay in logs/reports only; persist accepted bids only.
             report.failed += 1
-            await self.repo.update_bid_status(bid_row.id, result.status, result.message)
             log.warning(
                 "Bid failed for %s: %s (%.0f ms)",
                 project.uid,

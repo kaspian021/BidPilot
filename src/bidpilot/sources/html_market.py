@@ -1061,11 +1061,21 @@ class HtmlMarketSource(Source):
             urlsplit(form_page_url).path,
         )
 
+        submit_headers = {
+            "Referer": form_page_url,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        }
+        if payload.get("_token"):
+            submit_headers["X-CSRF-TOKEN"] = str(payload["_token"])
+        if isinstance(bid_cfg.get("headers"), dict):
+            submit_headers.update({str(k): str(v) for k, v in bid_cfg["headers"].items()})
+
         try:
             if method == "POST":
-                response = await client.post(action, data=payload, headers={"Referer": form_page_url})
+                response = await client.post(action, data=payload, headers=submit_headers)
             else:
-                response = await client.get(action, params=payload, headers={"Referer": form_page_url})
+                response = await client.get(action, params=payload, headers=submit_headers)
         except httpx.HTTPError as exc:
             return self.fail(f"خطای شبکه هنگام ارسال پیشنهاد: {exc}")
 

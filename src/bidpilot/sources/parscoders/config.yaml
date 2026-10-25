@@ -181,6 +181,9 @@ bid:
       - "input[name*='duration']"
       - "select[name*='day']"
   include_hidden: true
+  headers:
+    X-Requested-With: "XMLHttpRequest"
+    Accept: "application/json, text/javascript, */*; q=0.01"
   success_text_contains:
     - "پیشنهاد شما با موفقیت ثبت شد"
     - "پیشنهاد با موفقیت ثبت شد"

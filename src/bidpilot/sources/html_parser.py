@@ -1689,6 +1689,8 @@ def map_bid_fields(form: Tag, settings: dict[str, Any]) -> dict[str, str]:
 def extract_response_notices(html: str) -> list[str]:
     """Collect concise visible form/alert notices without dumping the whole response."""
     soup = BeautifulSoup(html or "", "lxml")
+    for node in soup(["script", "style", "noscript", "template"]):
+        node.decompose()
     selectors = (
         ".alert-danger",
         ".alert-error",
@@ -1829,6 +1831,22 @@ def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tup
     notices = extract_response_notices(html) + json_notices
     error_words = ("خطا", "ناموفق", "خطای", "failed", "error")
 
+    # Check for structured JSON success response first
+    body_raw = (html or "").strip()
+    if body_raw.startswith("{"):
+        try:
+            data = json.loads(body_raw)
+            if isinstance(data, dict):
+                if (
+                    data.get("status") in ("success", True, 1)
+                    or data.get("success") is True
+                    or data.get("ok") is True
+                ):
+                    msg = str(data.get("message") or "پیشنهاد با پاسخ موفقیت‌آمیز (JSON) سایت تأیید شد.")
+                    return True, msg
+        except (ValueError, TypeError):
+            pass
+
     # A specific response alert is much stronger evidence than the surrounding
     # project page, which can mention the word "error" in unrelated content.
     for notice in notices:
@@ -1849,7 +1867,10 @@ def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tup
         suffix = f": {detail[:180]}" if detail else ""
         return False, f"سایت درخواست را رد کرد (HTTP {status_code}){suffix}"
 
-    body = clean_text(BeautifulSoup(html or "", "lxml").get_text(" ", strip=True))
+    soup = BeautifulSoup(html or "", "lxml")
+    for node in soup(["script", "style", "noscript", "template"]):
+        node.decompose()
+    body = clean_text(soup.get_text(" ", strip=True))
     if has_any(body, failure_texts):
         snippet = next((t for t in failure_texts if clean_text(t) in body), "پیام رد مشخص")
         return False, f"سایت درخواست را رد کرد: {snippet}"

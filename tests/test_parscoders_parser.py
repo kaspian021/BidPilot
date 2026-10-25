@@ -74,7 +74,10 @@ def test_detect_existing_bid_from_edit_proposal_controls():
 def test_detect_existing_bid_from_active_form_and_unknown_page():
     html = (FIXTURES / "sample_project.html").read_text(encoding="utf-8")
     assert parser.detect_existing_bid(html, SETTINGS["bid"]) is False
-    assert parser.detect_existing_bid("<html><body><h1>ساخت اپلیکیشن</h1></body></html>", SETTINGS["bid"]) is None
+    assert (
+        parser.detect_existing_bid("<html><body><h1>ساخت اپلیکیشن</h1></body></html>", SETTINGS["bid"])
+        is None
+    )
 
 
 def test_detect_success_and_failure():

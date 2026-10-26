@@ -20,7 +20,7 @@ if (-not $python) {
 & $python -VV
 
 Write-Host "== 2) بررسی سلامت runpy (منشأ خطای null bytes) ==" -ForegroundColor Cyan
-& $python -c "import runpy; print('runpy OK:', runpy.__file__)"
+& $python -c "import runpy; print(runpy.__file__)"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "نصب پایتون خراب است. آن را حذف و از python.org دوباره نصب کن، سپس این اسکریپت را دوباره اجرا کن." -ForegroundColor Red
     exit 1

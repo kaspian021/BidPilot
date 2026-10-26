@@ -222,29 +222,27 @@ class Flow:
         return self.questions[self.index] if self.index < len(self.questions) else None
 
 
-HELP_TEXT = """<b>BidPilot — راهنما</b>
+HELP_TEXT = """<b>BidPilot — راهنمای حرفه‌ای</b>  <i>✦ دستیار هوشمند پیشنهاددهی</i>
 
-/setup — راه‌اندازی کامل (تلگرام، هوش مصنوعی رایگان، حساب سایت، پروفایل، لحن، قیمت، حالت ارسال)
-/run — 🚀 شروع فعالیت: رصد پروژه‌ها و ارسال پیشنهادها
-/stop — ⏸ توقف ارسال
-/check — بررسی اینکه هنوز وارد حساب سایت هستیم یا نه
-/style — لحن، دستورهای نوشتن و درصد قیمت
-/profile — ساخت پروفایل از رزومه PDF، گیت‌هاب یا پورتفولیو (یا ورود دستی)
-/llm — انتخاب سرویس هوش مصنوعی رایگان و کلید آن
-/proxy — پروکسی برای هوش مصنوعی (وقتی سرویس ۴۰۳/Forbidden می‌دهد)
-/sites — همه‌ی سایت‌های فریلنسری و وضعیت هرکدام
-/site <name> — عوض کردن سایت فعال (مثلاً /site ponisha)
-/market — حساب سایت فعال: روش ورود + کوکی یا نام کاربری/رمز
-/status — چه چیزهایی تنظیم شده است؟
-/preview — یک پیشنهاد نمونه از یک پروژه‌ی واقعی (بدون ارسال)
-/filters — کدام پروژه‌ها بررسی می‌شوند؟ (بودجه، مهارت، کلیدواژه‌ها)
-/mode — جابه‌جایی بین حالت آزمایشی و واقعی
-/test — تست کلید هوش مصنوعی و تلگرام
-/deps — بسته‌های لازم (مثل pypdf برای خواندن PDF) و نصب خودکارشان
-/settings — دیدن مقادیر ذخیره‌شده
-/cancel — لغو پرسش جاری
+<b>شروع سریع (۱ دقیقه)</b>
+• /start — منوی اصلی حرفه‌ای (پروفایل، پلن، وضعیت زنده)
+• /plans — مشاهده پلن‌ها و خرید اشتراک (زرین‌پال)
+• /account — حساب من + سقف‌های ساعتی/روزانه
+• /status — داشبورد با گراف مصرف
 
-هیچ فایل .env لازم نیست؛ همه‌ی پاسخ‌ها امن در data/settings.json ذخیره می‌شوند."""
+<b>هسته</b>
+/setup — راه‌اندازی کامل
+/run — 🚀 شروع رصد خودکار
+/stop — ⏸ توقف
+/style — لحن و درصد قیمت (۵۰٪ = نصف بودجه ثابت — اصلاح‌شده)
+/profile, /llm, /market, /sites, /filters — تنظیم پروفایل، هوش، سایت، فیلتر
+/preview — پیش‌نمایش بدون ارسال
+/mode, /proxy, /check, /test, /deps — حالت، پروکسی، تست‌ها
+/settings, /cancel — تنظیمات، لغو
+
+هر کاربر حساب و سقف جدا دارد: رایگان ۵/ساعت، پولی تا ۸۰/ساعت.
+پرداخت‌ها با زرین‌پال (شاپرک) امن و با راهنمای کامل داخل ربات.
+هیچ .env لازم نیست؛ همه امن در data/settings.json ذخیره می‌شود."""
 
 
 class BotService:
@@ -494,6 +492,25 @@ class BotService:
             await self.handle_command(chat, "/sites", "")
         elif data == "cmd:market":
             await self.handle_command(chat, "/market", "")
+        elif data == "cmd:plans":
+            await self.handle_command(chat, "/plans", "")
+        elif data == "cmd:home":
+            await self.handle_command(chat, "/start", "")
+        elif data.startswith("plan:"):
+            await self._cmd_plan_detail(chat, data.split(":", 1)[1])
+        elif data.startswith("buy:"):
+            await self._cmd_buy(chat, data.split(":", 1)[1])
+        elif data.startswith("verify:"):
+            await self._cmd_verify(chat, data.split(":", 1)[1])
+        elif data == "zarinpal:guide":
+            await self._cmd_zarinpal_guide(chat)
+        elif data == "payments:history":
+            await self._cmd_payments(chat)
+        elif data == "plans:compare":
+            from .bot_ui import compare_table_text
+            await self.send(chat_id, compare_table_text(), {"inline_keyboard": [[{"text": "↩️ پلن‌ها", "callback_data": "cmd:plans"}]]})
+        elif data.startswith("flt:"):
+            await self._toggle_filter(chat, data.split(":", 1)[1])
         elif data == "cmd:help":
             await self.send(chat_id, HELP_TEXT)
         elif data == "cmd:cancel":
@@ -552,6 +569,15 @@ class BotService:
                 await self._consume_answer(chat_id, "/skip")
             else:
                 await self.send(chat_id, "الان پرسشی در جریان نیست.")
+        elif command in {"/plans", "/plan", "/subscription", "/اشتراک"}:
+            await self._cmd_plans(chat_id)
+        elif command in {"/account", "/اکانت", "/myplan"}:
+            await self._cmd_account(chat_id)
+        elif command == "/zarinpal":
+            await self._cmd_zarinpal_guide(chat_id)
+        elif command.startswith("/buy"):
+            plan = rest or "starter"
+            await self._cmd_buy(chat_id, plan)
         elif command == "/cancel":
             if self._flows.pop(chat_id, None):
                 await self.send(chat_id, "لغو شد. هر وقت خواستی /setup یا /help.")
@@ -1035,17 +1061,47 @@ class BotService:
 
     async def _cmd_start(self, chat_id: str) -> None:
         save_chat_id(self.store, chat_id)
+        # Ensure per-user account exists (non-blocking)
+        try:
+            await self._ensure_account(chat_id)
+        except Exception:
+            pass
         state = readiness(self.store)
         if not state["setup_completed"] or missing_steps(self.store, include_recommended=False):
             await self.send(
                 chat_id,
-                "خوش آمدی 👋\n"
-                "بیا در چند سؤال همه‌چیز را تنظیم کنیم؛ هیچ فایل .env لازم نیست.\n"
+                "✨ <b>به BidPilot خوش آمدی 👋</b>\n"
+                "<i>دستیار هوشمند پیشنهاددهی — بدون .env، همه در تلگرام</i>\n"
+                "─" * 28 + "\n"
+                "بیا در چند سؤال همه‌چیز را تنظیم کنیم — حساب شخصی تو ساخته می‌شود و سقف‌هات فعال می‌شود.\n"
                 "هر وقت خواستی با /cancel متوقف شوی.",
             )
             await self._start_flow(chat_id, "setup", all_questions(self.store), mark_complete=True)
             return
-        await self.send(chat_id, status_text(self.store) + "\n\n" + self._menu_hint(), self._menu_keyboard())
+        # Premium welcome with professional menu
+        try:
+            from .bot_ui import main_menu_keyboard, main_menu_text
+            from .subscriptions.plans import get_plan
+            # try to resolve user's plan title
+            plan_title = None
+            try:
+                from .db import Database
+                from .subscriptions.manager import SubscriptionManager
+                from .subscriptions.zarinpal import ZarinpalConfig
+                db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                await db.init()
+                async with db.session_factory() as s:
+                    mgr = SubscriptionManager(s, zarinpal_config=ZarinpalConfig(merchant_id=str(self.store.get("zarinpal.merchant_id") or "")))
+                    _, plan = await mgr.effective_plan(chat_id)
+                    plan_title = plan.title
+                await db.dispose()
+            except Exception:
+                pass
+            first = str(self.store.get("profile.first_name") or self.store.get("profile.full_name") or "").split()[0] if self.store.get("profile.full_name") else None
+            await self.send(chat_id, main_menu_text(first_name=first, plan_title=plan_title) + "\n\n" + status_text(self.store), main_menu_keyboard())
+            return
+        except Exception:
+            await self.send(chat_id, status_text(self.store) + "\n\n" + self._menu_hint(), self._menu_keyboard())
 
     async def _cmd_status(self, chat_id: str) -> None:
         text = status_text(self.store)
@@ -1590,43 +1646,225 @@ class BotService:
             },
         )
 
+    # ── Subscription & ZarinPal ────────────────────────────────────────
+    async def _ensure_account(self, chat_id: str) -> None:
+        """Create per-user account row if DB is reachable; never fail the UX."""
+        try:
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            # settings_store may hold zarinpal merchant
+            merchant = str(self.store.get("zarinpal.merchant_id") or self.store.get("payments.zarinpal_merchant_id") or "")
+            sandbox = bool(self.store.get("zarinpal.sandbox"))
+            cfg = ZarinpalConfig(merchant_id=merchant, sandbox=sandbox)
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=cfg)
+                await mgr.get_or_create_user(chat_id)
+                await s.commit()
+            await db.dispose()
+        except Exception:
+            log.debug("ensure_account failed (DB not ready yet)", exc_info=True)
+
+    async def _cmd_plans(self, chat_id: str) -> None:
+        from .bot_ui import plans_keyboard, plans_overview_text
+
+        await self._ensure_account(chat_id)
+        await self.send(chat_id, plans_overview_text(), plans_keyboard())
+
+    async def _cmd_plan_detail(self, chat_id: str, plan_id: str) -> None:
+        from .bot_ui import plan_detail_keyboard, plan_detail_text
+        from .subscriptions.plans import get_plan
+
+        plan = get_plan(plan_id)
+        await self.send(chat_id, plan_detail_text(plan), plan_detail_keyboard(plan))
+
+    async def _cmd_buy(self, chat_id: str, plan_id: str) -> None:
+        from .subscriptions.plans import get_plan
+
+        plan = get_plan(plan_id.strip().lower())
+        if plan.is_free():
+            await self.send(chat_id, "پلن رایگان فعال است — نیاز به پرداخت ندارد. ✅\nبرای سقف بالاتر یک پلن پولی بخرید: /plans")
+            return
+        await self.send(chat_id, f"⏳ در حال ساخت لینک پرداخت زرین‌پال برای <b>{escape(plan.title)}</b> ({escape(plan.formatted_price)}) ...")
+        try:
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            merchant = str(self.store.get("zarinpal.merchant_id") or self.store.get("payments.zarinpal_merchant_id") or "")
+            sandbox = bool(self.store.get("zarinpal.sandbox"))
+            cb = str(self.store.get("zarinpal.callback_url") or "https://bidpilot.local/payment/callback")
+            cfg = ZarinpalConfig(merchant_id=merchant, sandbox=sandbox, callback_url=cb)
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=cfg)
+                payment, url = await mgr.create_payment(chat_id, plan.id)
+                await s.commit()
+            await db.dispose()
+            from .bot_ui import payment_created_text, payment_keyboard
+
+            await self.send(chat_id, payment_created_text(plan, url, payment.authority or ""), payment_keyboard(payment.authority or "", url))
+        except Exception as exc:
+            log.exception("buy failed")
+            await self.send(chat_id, f"❌ ساخت پرداخت ناموفق: {escape(str(exc))}\n\nراهنما: /zarinpal")
+
+    async def _cmd_verify(self, chat_id: str, authority: str) -> None:
+        await self.send(chat_id, f"⏳ در حال بررسی پرداخت <code>{escape(authority)}</code> در زرین‌پال ...")
+        try:
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            merchant = str(self.store.get("zarinpal.merchant_id") or self.store.get("payments.zarinpal_merchant_id") or "")
+            sandbox = bool(self.store.get("zarinpal.sandbox"))
+            cfg = ZarinpalConfig(merchant_id=merchant, sandbox=sandbox)
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=cfg)
+                payment, sub = await mgr.verify_payment(authority)
+                await s.commit()
+                # refresh plan for message
+                from .subscriptions.plans import get_plan as _gp
+
+                plan = _gp(payment.plan_id)
+                from .bot_ui import payment_verified_text
+
+                await self.send(chat_id, payment_verified_text(plan, payment.ref_id or "—", sub.expires_at if sub else None))
+                await self._cmd_account(chat_id)
+            await db.dispose()
+        except Exception as exc:
+            await self.send(chat_id, f"❌ تأیید ناموفق: {escape(str(exc))}\nکد را چک کن یا دوباره /plans → خرید بزن.")
+
+    async def _cmd_account(self, chat_id: str) -> None:
+        try:
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            merchant = str(self.store.get("zarinpal.merchant_id") or "")
+            cfg = ZarinpalConfig(merchant_id=merchant)
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=cfg)
+                user, plan = await mgr.effective_plan(chat_id)
+                # per-user usage from bids table if available
+                from .repositories import Repository
+
+                repo = Repository(s)
+                ph = await repo.bids_per_hour(user_chat_id=chat_id)
+                pd = await repo.bids_per_day(user_chat_id=chat_id)
+                pm = await repo.bids_per_month(user_chat_id=chat_id)
+                from .bot_ui import status_card, progress_bar
+
+                exp = user.plan_expires_at.strftime("%Y/%m/%d") if user and user.plan_expires_at else "—"
+                usage = {"per_hour": ph, "per_day": pd}
+                card = (
+                    f"<b>👤 حساب {escape(str(chat_id))}</b>\n"
+                    f"{plan.badge} <b>{escape(plan.title)}</b> — {escape(plan.tagline)}\n"
+                    f"💳 {escape(plan.formatted_price)} · {escape(plan.price_per_day)}\n"
+                    f"⏰ انقضا: <b>{exp}</b>\n"
+                    f"{'─'*28}\n"
+                    f"<b>مصرف</b>\n"
+                    f"ساعتی: {ph}/{plan.limits.max_bids_per_hour} {progress_bar(ph, plan.limits.max_bids_per_hour)}\n"
+                    f"روزانه: {pd}/{plan.limits.max_bids_per_day} {progress_bar(pd, plan.limits.max_bids_per_day)}\n"
+                    f"ماهانه: {pm}/{plan.limits.max_bids_per_month if plan.limits.max_bids_per_month < 999999 else '∞'}\n"
+                    f"فاصله ایمن: {plan.limits.min_seconds_between_bids}s\n"
+                )
+                await self.send(chat_id, status_card(card, plan, usage), self._menu_keyboard())
+            await db.dispose()
+        except Exception as exc:
+            log.debug("account failed", exc_info=True)
+            await self.send(chat_id, f"⚠️ نمایش حساب فعلاً ممکن نیست: {escape(str(exc))}")
+
+    async def _cmd_zarinpal_guide(self, chat_id: str) -> None:
+        from .subscriptions.zarinpal import ZarinpalClient
+
+        guide = ZarinpalClient.setup_guide()
+        # also surface current merchant status
+        merchant = str(self.store.get("zarinpal.merchant_id") or "")
+        sandbox = bool(self.store.get("zarinpal.sandbox"))
+        status = f"\n\n<b>وضعیت فعلی:</b>\n• merchant_id: {'<code>'+escape(merchant)+'</code>' if merchant else '<i>تنظیم نشده — پرداخت شبیه‌سازی می‌شود</i>'}\n• حالت: {'سندباکس (تست)' if sandbox else 'واقعی (Production)'}\n\n<i>برای تنظیم: <code>/settings</code> → zarinpal.merchant_id یا دستور: <code>bidpilot settings set zarinpal.merchant_id &lt;MERCHANT&gt;</code></i>"
+        await self.send(chat_id, guide + status, {"inline_keyboard": [[{"text": "💳 دیدن پلن‌ها", "callback_data": "cmd:plans"}]]})
+
+    async def _cmd_payments(self, chat_id: str) -> None:
+        try:
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=ZarinpalConfig(merchant_id=str(self.store.get("zarinpal.merchant_id") or "")))
+                pays = await mgr.list_payments(chat_id, limit=8)
+                if not pays:
+                    await self.send(chat_id, "🧾 هنوز پرداختی ثبت نشده است.\n/plans برای خرید → زرین‌پال")
+                else:
+                    lines = ["<b>🧾 آخرین پرداخت‌ها</b>", "─"*28]
+                    for p in pays:
+                        lines.append(f"• {p.plan_id} — {p.amount_toman:,} تومان — <b>{escape(p.status)}</b> — <code>{escape(p.authority or '—')}</code>")
+                    await self.send(chat_id, "\n".join(lines))
+            await db.dispose()
+        except Exception as exc:
+            await self.send(chat_id, f"⚠️ {escape(str(exc))}")
+
     # ------------------------------------------------------------------ misc
     @staticmethod
     def _menu_hint() -> str:
+        # New professional hint — delegates to bot_ui but kept as text fallback
+        from .bot_ui import FOOTER
+
         return (
             "چه کاری می‌خواهی؟\n"
             "• /run شروع فعالیت (اول یک /preview یا دور آزمایشی لازم است)\n"
-            "• /style تغییر لحن، سبک و درصد قیمت\n"
+            "• /plans پلن‌ها و خرید اشتراک (زرین‌پال) — حرفه‌ای تا ۸۰/ساعت\n"
+            "• /account حساب من: سقف ساعتی/روزانه + تاریخ انقضا\n"
+            "• /status داشبورد حرفه‌ای با گراف مصرف\n"
             "• /preview دیدن یک پیشنهاد نمونه\n"
-            "• /filters تنظیم اینکه چه پروژه‌هایی بررسی شوند\n"
-            "• /stop توقف ارسال\n"
-            "• /mode آزمایشی یا ارسال واقعی\n"
-            "• /settings دیدن مقادیر ذخیره‌شده\n"
-            "• /deps نصب بسته‌های لازم (pypdf و…)\n"
-            "• /test تست کلید هوش مصنوعی"
+            "• /style تغییر لحن، سبک و درصد قیمت\n"
+            "• /filters فیلتر پروژه‌ها\n"
+            "• /test تست هوش مصنوعی\n"
+            f"\n<i>{FOOTER}</i>"
         )
 
     @staticmethod
     def _menu_keyboard() -> dict[str, Any]:
-        return {
-            "inline_keyboard": [
-                [{"text": "🚀 شروع فعالیت", "callback_data": "run:ask"}],
-                [
-                    {"text": "🧪 پیش‌نمایش", "callback_data": "cmd:preview"},
-                    {"text": "🎭 لحن", "callback_data": "cmd:style"},
-                ],
-                [
-                    {"text": "🌐 سایت‌ها", "callback_data": "cmd:sites"},
-                    {"text": "🔑 حساب سایت", "callback_data": "cmd:market"},
-                ],
-                [
-                    {"text": "👤 پروفایل", "callback_data": "cmd:profile"},
-                    {"text": "📊 وضعیت", "callback_data": "cmd:status"},
-                ],
-                [{"text": "🧹 فیلتر پروژه‌ها", "callback_data": "cmd:filters"}],
-                [{"text": "⚙️ تنظیم مجدد", "callback_data": "cmd:setup"}],
-            ]
-        }
+        # Professional main menu — uses bot_ui for consistency
+        try:
+            from .bot_ui import main_menu_keyboard
+
+            return main_menu_keyboard()
+        except Exception:
+            return {
+                "inline_keyboard": [
+                    [{"text": "🚀 شروع فعالیت", "callback_data": "run:ask"}],
+                    [
+                        {"text": "🧪 پیش‌نمایش", "callback_data": "cmd:preview"},
+                        {"text": "📊 داشبورد", "callback_data": "cmd:status"},
+                    ],
+                    [
+                        {"text": "🌐 سایت‌ها", "callback_data": "cmd:sites"},
+                        {"text": "🔑 حساب سایت", "callback_data": "cmd:market"},
+                    ],
+                    [
+                        {"text": "👤 پروفایل", "callback_data": "cmd:profile"},
+                        {"text": "💳 پلن‌ها", "callback_data": "cmd:plans"},
+                    ],
+                    [{"text": "🧹 فیلتر پروژه‌ها", "callback_data": "cmd:filters"}],
+                    [{"text": "⚙️ تنظیم مجدد", "callback_data": "cmd:setup"}],
+                ]
+            }
 
 
 def _pricing_for(cfg: Any):

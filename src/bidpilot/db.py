@@ -32,6 +32,14 @@ class Base(DeclarativeBase):
     pass
 
 
+# Import subscription/account tables so Base.metadata.create_all creates them.
+# They live in subscriptions.models and register themselves via Base subclass.
+try:
+    from .subscriptions.models import PaymentRow, SubscriptionRecord, UserAccountRow  # noqa: F401
+except Exception:
+    pass
+
+
 class ProjectRow(Base):
     __tablename__ = "projects"
     __table_args__ = (UniqueConstraint("source", "external_id", name="uq_project_source_ext"),)
@@ -58,12 +66,15 @@ class BidRow(Base):
     __table_args__ = (
         Index("ix_bid_source_created", "source", "created_at"),
         Index("ix_bid_status", "status"),
+        Index("ix_bid_user", "user_chat_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     source: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    # Per-user accounting for multi-tenant rate limiting (nullable for legacy rows)
+    user_chat_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     delivery_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     proposal_text: Mapped[str] = mapped_column(Text, default="")

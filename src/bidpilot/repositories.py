@@ -105,12 +105,13 @@ class Repository:
         return list((await self.session.execute(stmt)).scalars())
 
     # -------------------------------------------------------------------- bids
-    async def save_bid(self, project_row_id: int, plan: BidPlan) -> BidRow:
+    async def save_bid(self, project_row_id: int, plan: BidPlan, *, user_chat_id: str | None = None) -> BidRow:
         result = plan.result
         row = BidRow(
             project_id=project_row_id,
             source=plan.project.source,
             status=result.status.value if result else SubmissionStatus.SKIPPED.value,
+            user_chat_id=str(user_chat_id) if user_chat_id else None,
             amount=plan.amount,
             delivery_days=plan.delivery_days,
             proposal_text=plan.proposal.text if plan.proposal else "",
@@ -136,18 +137,26 @@ class Repository:
                 row.message = message
             await self.session.flush()
 
-    async def bids_since(self, since: datetime, status: str | None = SubmissionStatus.SUBMITTED.value) -> int:
+    async def bids_since(
+        self, since: datetime, status: str | None = SubmissionStatus.SUBMITTED.value, *, user_chat_id: str | None = None
+    ) -> int:
         stmt = select(func.count()).select_from(BidRow).where(BidRow.created_at >= since)
         if status:
             stmt = stmt.where(BidRow.status == status)
+        if user_chat_id is not None:
+            stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
         return int((await self.session.execute(stmt)).scalar_one())
 
-    async def last_bid_at(self) -> datetime | None:
+    async def last_bid_at(self, user_chat_id: str | None = None) -> datetime | None:
         stmt = select(func.max(BidRow.created_at)).where(BidRow.status == SubmissionStatus.SUBMITTED.value)
+        if user_chat_id is not None:
+            stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
         return _aware((await self.session.execute(stmt)).scalar_one_or_none())
 
-    async def recent_bids(self, limit: int = 20) -> list[BidRow]:
+    async def recent_bids(self, limit: int = 20, *, user_chat_id: str | None = None) -> list[BidRow]:
         stmt = select(BidRow).order_by(BidRow.id.desc()).limit(limit)
+        if user_chat_id is not None:
+            stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
         return list((await self.session.execute(stmt)).scalars())
 
     async def stats(self) -> dict[str, int]:
@@ -159,13 +168,17 @@ class Repository:
         counts["projects"] = projects
         return counts
 
-    async def bids_per_hour(self, now: datetime | None = None) -> int:
+    async def bids_per_hour(self, now: datetime | None = None, *, user_chat_id: str | None = None) -> int:
         now = now or datetime.now(timezone.utc)
-        return await self.bids_since(now - timedelta(hours=1))
+        return await self.bids_since(now - timedelta(hours=1), user_chat_id=user_chat_id)
 
-    async def bids_per_day(self, now: datetime | None = None) -> int:
+    async def bids_per_day(self, now: datetime | None = None, *, user_chat_id: str | None = None) -> int:
         now = now or datetime.now(timezone.utc)
-        return await self.bids_since(now - timedelta(days=1))
+        return await self.bids_since(now - timedelta(days=1), user_chat_id=user_chat_id)
+
+    async def bids_per_month(self, now: datetime | None = None, *, user_chat_id: str | None = None) -> int:
+        now = now or datetime.now(timezone.utc)
+        return await self.bids_since(now - timedelta(days=30), user_chat_id=user_chat_id)
 
     # ------------------------------------------------------------------ events
     async def log_event(self, event: Event) -> None:

@@ -455,33 +455,67 @@ async def submit_js_managed_form(
                             await control.fill(value)
                             await control.dispatch_event("change")
                     return
-                # For numeric fields (amount/days/validDays), prefer visible fill but fall back to JS
+                # For numeric fields (bidAmount/deadline/validDays) the inputs are
+                # often inside a transformed off-canvas; Playwright's
+                # visibility/actionability checks can still TimeoutError even
+                # when the element is technically in DOM. Set value directly
+                # via JS and dispatch the events the site's validator listens to.
                 try:
-                    if await control.is_visible():
-                        await control.click()
-                        await control.fill(value)
-                        await control.dispatch_event("change")
-                        await control.evaluate(
-                            "(el, val) => { if (el.value !== val) { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } }",
-                            value,
-                        )
-                    else:
-                        await control.evaluate(
-                            "(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); el.dispatchEvent(new Event('blur', {bubbles:true})); }",
-                            value,
-                        )
+                    # Scroll into view first (helps with fixed off-canvas)
+                    try:
+                        await control.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+                    await control.evaluate(
+                        "(el, val) => {"
+                        "  el.value = val;"
+                        "  el.dispatchEvent(new Event('input', {bubbles:true}));"
+                        "  el.dispatchEvent(new Event('change', {bubbles:true}));"
+                        "  el.dispatchEvent(new Event('blur', {bubbles:true}));"
+                        "  if (el.form) el.form.dispatchEvent(new Event('change', {bubbles:true}));"
+                        "}",
+                        value,
+                    )
+                    # Verify it stuck; if not, try native fill as last resort
+                    current = await control.evaluate("el => el.value")
+                    if current != value:
+                        if await control.is_visible():
+                            try:
+                                await control.fill(value)
+                            except Exception:
+                                pass
+                            await control.evaluate(
+                                "(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); }",
+                                value,
+                            )
                     # Give JS validators a moment
                     try:
                         await page.wait_for_timeout(200)
                     except Exception:
                         pass
+                    # Final check — if still not set, raise
+                    final_val = await control.evaluate("el => el.value")
+                    if final_val != value:
+                        raise ValueError(f"field value not applied: {logical_name} expected={value!r} got={final_val!r}")
                 except Exception as fill_exc:
-                    # Last resort: JS set even if visible fill failed
-                    await control.evaluate(
-                        "(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
-                        value,
-                    )
-                    raise fill_exc if await control.evaluate("el => el.value") != value else None
+                    # If JS set itself failed, bubble up
+                    if "field value not applied" in str(fill_exc):
+                        raise
+                    # Last resort: try pure JS again and verify
+                    try:
+                        await control.evaluate(
+                            "(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
+                            value,
+                        )
+                        if await control.evaluate("el => el.value") == value:
+                            try:
+                                await page.wait_for_timeout(200)
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        pass
+                    raise fill_exc
 
             # Determine a sensible validDays value (مدت اعتبار پیشنهاد).
             # The screenshot shows this field empty by default; the site's

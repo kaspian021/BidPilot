@@ -350,9 +350,24 @@ async def submit_js_managed_form(
             safe_debug["request_sent"] = True
             response_text = await response.text()
             ok, message = html_parser.detect_success(response.status, response_text, bid_cfg)
+            if not ok and response.status < 400:
+                # The captured ParsCoders page uses jQuery's .done() callback to
+                # show a success modal and mutate #bid_status_custom only after
+                # the server response. Wait for that UI evidence instead of
+                # treating an arbitrary HTTP 200 as a submitted proposal.
+                try:
+                    await page.wait_for_function(
+                        "() => ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes("
+                        "(document.querySelector('#bid_status_custom')?.textContent || '').trim())",
+                        timeout=3_000,
+                    )
+                    status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
+                    ok = True
+                    message = f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد: {status_text}"
+                except PlaywrightTimeoutError:
+                    pass
             if not ok:
-                # AJAX forms often place the confirmation/error in the UI rather
-                # than in the response body; inspect visible post-submit content too.
+                # Some responses confirm success only through a visible site alert.
                 try:
                     page_html = await page.content()
                     ui_ok, ui_message = html_parser.detect_success(200, page_html, bid_cfg)

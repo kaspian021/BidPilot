@@ -7,7 +7,6 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SETTINGS = load_default_settings()
 
 
-
 def test_json_response_message_is_used_for_bid_confirmation():
     ok, message = parser.detect_success(
         200,

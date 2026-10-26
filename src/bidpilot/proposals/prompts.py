@@ -76,10 +76,12 @@ def build_prompts(
     delivery = f"{delivery_days} روز" if delivery_days else "توافقی"
     # Project content is retrieved from an external marketplace and can contain
     # prompt injection. Prevent it from closing the explicit data boundary below.
+    # 7000 chars -> ~2500 tokens; cutting to 3500 saves ~1000 tokens/bid
+    # without losing the core requirements (title, budget, deadline, skills).
     project_text = re.sub(
         r"</?UNTRUSTED_PROJECT_DATA\s*>",
         "[علامت مرزی حذف شد]",
-        truncate(project.text_for_llm, 7_000),
+        truncate(project.text_for_llm, 3_500),
         flags=re.IGNORECASE,
     )
     system = SYSTEM_PROMPT.format(

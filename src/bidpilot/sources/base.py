@@ -30,6 +30,20 @@ class AuthenticationRequiredError(SourceError):
     """
 
 
+class SubscriptionRequiredError(SourceError):
+    """Account subscription expired or daily bid limit reached — needs user action.
+
+    Unlike a transient JavaScript interstitial, this is a terminal business-logic
+    failure: the marketplace explicitly refuses further bids until the user
+    purchases/renews a subscription. The scheduler must hard-stop and the user
+    must be told in clear Persian what to do.
+    """
+
+
+class DailyLimitReachedError(SubscriptionRequiredError):
+    """The free daily quota (e.g. 1 bid/day on ParsCoders) is exhausted."""
+
+
 class JavaScriptRequiredError(SourceError):
     """The marketplace page cannot be used without executing browser JavaScript.
 

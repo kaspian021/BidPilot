@@ -32,6 +32,7 @@ from .sources.base import (
     JavaScriptRequiredError,
     Source,
     SourceError,
+    SubscriptionRequiredError,
 )
 from .text import parse_days
 
@@ -54,6 +55,10 @@ class RunReport:
     #: True when the site (transiently) demands browser JavaScript; the
     #: scheduler pauses this source with a cooldown instead of stopping.
     javascript_required: bool = False
+    #: True when the site says the subscription/daily quota is exhausted — hard stop.
+    subscription_required: bool = False
+    #: the site's wording for the subscription problem (shown to the user)
+    subscription_message: str = ""
     #: human-readable reason -> how many projects were skipped for it
     skip_reasons: dict[str, int] = field(default_factory=dict)
     #: titles of the projects that made it all the way to a proposal
@@ -66,9 +71,9 @@ class RunReport:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def has_news(self) -> bool:
-        # Authentication failures are surfaced by the runner as a dedicated,
-        # actionable message rather than a duplicate generic digest.
-        if self.authentication_failed or self.javascript_required:
+        # Auth / subscription / JS failures are surfaced by the runner as a
+        # dedicated, actionable message rather than a duplicate generic digest.
+        if self.authentication_failed or self.javascript_required or self.subscription_required:
             return False
         return bool(self.new or self.submitted or self.failed or self.errors)
 
@@ -179,8 +184,13 @@ class BidPipeline:
                 except Exception as exc:  # never let one project kill the batch
                     log.exception("Project %s failed", project.uid)
                     report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
-                if report.authentication_failed or report.javascript_required:
-                    stop_reason = "STOP-AUTH" if report.authentication_failed else "PAUSE-JAVASCRIPT"
+                if report.authentication_failed or report.javascript_required or report.subscription_required:
+                    if report.subscription_required:
+                        stop_reason = "STOP-SUBSCRIPTION"
+                    elif report.authentication_failed:
+                        stop_reason = "STOP-AUTH"
+                    else:
+                        stop_reason = "PAUSE-JAVASCRIPT"
                     log.error(
                         "[PIPELINE][%s] source=%s stopping the current project batch",
                         stop_reason,
@@ -194,6 +204,10 @@ class BidPipeline:
                 marker in detail.casefold()
                 for marker in ("احراز هویت", "نشست منقضی", "وارد حساب کاربری", "ورود به حساب")
             )
+            report.subscription_required = isinstance(exc, SubscriptionRequiredError) or any(
+                marker in detail.casefold()
+                for marker in ("اشتراک", "اعتبار کافی نیست", "سقف ارسال", "محدودیت روزانه", "subscription", "daily limit")
+            )
             # A JS interstitial on the *listing* page used to fall through as a
             # generic error and be retried (hammered) every poll interval.
             report.javascript_required = isinstance(exc, JavaScriptRequiredError)
@@ -203,8 +217,14 @@ class BidPipeline:
                 detail,
                 exc_info=log.isEnabledFor(logging.DEBUG),
             )
-            if not (report.authentication_failed or report.javascript_required):
+            if not (report.authentication_failed or report.javascript_required or report.subscription_required):
                 await self._notify_error(source.name, f"اجرای منبع «{source.name}» ناموفق بود: {detail}")
+            elif report.subscription_required:
+                report.subscription_message = detail
+                log.error(
+                    "[PIPELINE][SUBSCRIPTION-REQUIRED] source=%s no further bidding until subscription renewed",
+                    source.name,
+                )
             else:
                 log.error(
                     "[PIPELINE][AUTH-REQUIRED] source=%s no project search or bidding will continue",
@@ -232,7 +252,7 @@ class BidPipeline:
         )
         if decision.allowed:
             return None
-        log.info(
+        log.debug(
             "[PIPELINE][SKIPPED] source=%s id=%s title=%r reason=%r",
             project.source,
             project.external_id,
@@ -341,6 +361,16 @@ class BidPipeline:
                             project.source,
                             project.external_id,
                         )
+                elif isinstance(exc, SubscriptionRequiredError):
+                    report.subscription_required = True
+                    report.subscription_message = str(exc)
+                    report.errors.append(str(exc))
+                    log.error(
+                        "[PIPELINE][STOP-SUBSCRIPTION] source=%s id=%s stage=bid_status_check message=%r",
+                        project.source,
+                        project.external_id,
+                        str(exc)[:180],
+                    )
                 elif isinstance(exc, JavaScriptRequiredError):
                     report.javascript_required = True
                     report.errors.append(
@@ -394,7 +424,7 @@ class BidPipeline:
 
         # 3) pricing
         pricing = self.pricing.price(project, project.budget)
-        log.info(
+        log.debug(
             "[PIPELINE][PRICING] source=%s id=%s title=%r budget=%r strategy=%s result=%r",
             project.source,
             project.external_id,
@@ -430,7 +460,16 @@ class BidPipeline:
         if hint and hint < delivery:
             delivery = hint
 
-        # 4) proposal
+        # 4) rate limit / caps — check before paying for LLM
+        rate = await self.rate_limiter.check()
+        if not rate.allowed:
+            report.skipped += 1
+            plan = BidPlan(project=project, amount=amount, rationale=pricing.rationale)
+            plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
+            await self._emit_skip(project, rate.reason, report)
+            return plan
+
+        # 5) proposal
         try:
             proposal = await self.generator.generate(project, amount, delivery)
         except ProposalError as exc:
@@ -450,14 +489,6 @@ class BidPipeline:
             proposal=proposal,
             rationale=pricing.rationale,
         )
-
-        # 5) rate limit / caps
-        rate = await self.rate_limiter.check()
-        if not rate.allowed:
-            report.skipped += 1
-            plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
-            await self._emit_skip(project, rate.reason, report)
-            return plan
 
         # 6) submit (or dry run)
         started = time.monotonic()
@@ -509,7 +540,17 @@ class BidPipeline:
                     project.source,
                     project.external_id,
                 )
-        if result.javascript_required:
+        if getattr(result, "subscription_required", False):
+            report.subscription_required = True
+            report.subscription_message = result.message or "اشتراک به پایان رسیده است."
+            report.errors.append(result.message or "اشتراک حساب به پایان رسیده؛ ادامهٔ ارسال ممکن نیست.")
+            log.error(
+                "[PIPELINE][STOP-SUBSCRIPTION] source=%s id=%s message=%r",
+                project.source,
+                project.external_id,
+                result.message[:180] if result.message else "",
+            )
+        elif result.javascript_required:
             report.javascript_required = True
             report.errors.append(
                 "سایت اجرای JavaScript در مرورگر را لازم دانست؛ "

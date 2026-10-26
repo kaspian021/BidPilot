@@ -7,10 +7,12 @@ Playwright is an optional extra so non-browser sources do not need Chromium.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -87,6 +89,162 @@ def _browser_cookies(cookies: Any, base_url: str) -> list[dict[str, Any]]:
     return result
 
 
+_EDITOR_SELECTOR = ", ".join(
+    [
+        "div.ql-editor",
+        "div.ck-editor__editable",
+        "div.cke_editable",
+        "div.trumbowyg-editor",
+        "div.note-editable",
+        "div.trix-content",
+        "[contenteditable='true']",
+        "[role='textbox']",
+    ]
+)
+_NUMERIC_FIELDS = {"amount", "days", "_validDays"}
+_STEP_TIMEOUT_MS = 3_000
+_browser_lock: asyncio.Lock | None = None
+
+
+def _digits(value: str) -> str:
+    """Compare numbers regardless of thousand separators / Persian digits added by input masks."""
+    table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    return re.sub(r"\D", "", str(value).translate(table))
+
+
+def _same_value(logical_name: str, actual: str, expected: str) -> bool:
+    if logical_name in _NUMERIC_FIELDS:
+        return _digits(actual) == _digits(expected)
+    return " ".join(str(actual).split()) == " ".join(str(expected).split())
+
+
+_SET_VALUE_JS = (
+    "(el, val) => {"
+    "  const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+    "  const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;"
+    "  setter.call(el, val);"
+    "  el.dispatchEvent(new Event('input', {bubbles: true}));"
+    "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+    "  el.dispatchEvent(new Event('blur', {bubbles: true}));"
+    "}"
+)
+
+
+async def _human_fill_input(page: Any, control: Any, logical_name: str, value: str) -> str:
+    """Fill an <input>/<textarea> like a person: focus it, clear it, type, leave it.
+
+    Each strategy has a short timeout so one stubborn control can never burn the
+    whole 12-second page budget. Returns the strategy that worked and always
+    verifies the value the page actually holds (input masks are tolerated).
+    """
+    attempts: list[str] = []
+
+    async def current() -> str:
+        return str(await control.evaluate("(el) => el.value || ''"))
+
+    try:
+        await control.scroll_into_view_if_needed(timeout=_STEP_TIMEOUT_MS)
+        await control.click(timeout=_STEP_TIMEOUT_MS)
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Delete")
+        await page.keyboard.type(value, delay=20)
+        await page.keyboard.press("Tab")  # blur: sites validate/format on change
+        if _same_value(logical_name, await current(), value):
+            return "typed"
+        attempts.append("typed:value_mismatch")
+    except Exception as exc:  # noqa: BLE001 - every strategy may fail independently
+        attempts.append(f"typed:{type(exc).__name__}")
+
+    try:
+        await control.fill(value, timeout=_STEP_TIMEOUT_MS, force=True)
+        await control.dispatch_event("change")
+        if _same_value(logical_name, await current(), value):
+            return "fill"
+        attempts.append("fill:value_mismatch")
+    except Exception as exc:  # noqa: BLE001
+        attempts.append(f"fill:{type(exc).__name__}")
+
+    await control.evaluate(_SET_VALUE_JS, value)
+    if _same_value(logical_name, await current(), value):
+        return "js"
+    raise ValueError(
+        f"field value not applied: {logical_name} (tried {', '.join(attempts)}; js:value_mismatch)"
+    )
+
+
+async def _human_fill_message(page: Any, form: Any, control: Any, value: str) -> str:
+    """Write the proposal into the visible rich editor and keep the hidden <textarea> in sync."""
+    editor = None
+    for scope in (form, page):
+        candidate = scope.locator(_EDITOR_SELECTOR).first
+        try:
+            if await candidate.count() and await candidate.is_visible():
+                editor = candidate
+                break
+        except Exception:  # noqa: BLE001
+            continue
+
+    if editor is not None:
+        try:
+            await editor.scroll_into_view_if_needed(timeout=_STEP_TIMEOUT_MS)
+            await editor.click(timeout=_STEP_TIMEOUT_MS)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Delete")
+            lines = value.replace("\r\n", "\n").split("\n")
+            for index, line in enumerate(lines):
+                if index:
+                    await page.keyboard.press("Enter")
+                if line:
+                    await page.keyboard.insert_text(line)
+            synced = str(await control.evaluate("(el) => el.value || ''"))
+            probe = " ".join(value.split())[:25]
+            if probe and probe in " ".join(re.sub(r"<[^>]+>", " ", synced).split()):
+                return "editor"
+            # The editor shows the text but did not mirror it to the textarea
+            # (custom editor wired to a different event): mirror it ourselves.
+            await control.evaluate(_SET_VALUE_JS, value)
+            return "editor+textarea_js"
+        except Exception as exc:  # noqa: BLE001
+            log.info("[BID][BROWSER-EDITOR] editor typing failed error_type=%s", type(exc).__name__)
+
+    try:
+        if await control.is_visible():
+            return await _human_fill_input(page, control, "description", value)
+    except Exception:  # noqa: BLE001
+        pass
+    await control.evaluate(_SET_VALUE_JS, value)
+    return "textarea_js"
+
+
+async def _dump_debug(
+    page: Any, form: Any, bid_cfg: dict[str, Any], source: str, project_id: str, reason: str
+) -> None:
+    """Best-effort screenshot + sanitized form HTML so a failure can be diagnosed from real data."""
+    if bid_cfg.get("browser_debug", True) is False:
+        return
+    try:
+        target = Path(str(bid_cfg.get("browser_debug_dir") or "data/browser_debug"))
+        target.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = target / f"{stamp}-{re.sub(r'[^A-Za-z0-9_.-]', '_', source)}-{project_id}-{reason}"
+        await page.screenshot(path=str(base.with_suffix(".png")), full_page=False, timeout=5_000)
+        html = ""
+        try:
+            html = await form.evaluate(
+                "(el) => { const c = el.cloneNode(true);"
+                " c.querySelectorAll('input[type=hidden]').forEach(i => i.setAttribute('value', '<redacted>'));"
+                " return c.outerHTML; }"
+            )
+        except Exception:  # noqa: BLE001
+            html = await page.content()
+        base.with_suffix(".html").write_text(str(html)[:200_000], encoding="utf-8")
+        log.warning(
+            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s", source, project_id, reason, base
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
+        log.info("[BID][BROWSER-DEBUG] capture failed error_type=%s", type(exc).__name__)
+
+
 def _failure(
     message: str,
     *,
@@ -103,7 +261,7 @@ def _failure(
     )
 
 
-async def submit_js_managed_form(
+async def _submit_once(
     *,
     source_name: str,
     base_url: str,
@@ -277,6 +435,14 @@ async def submit_js_managed_form(
                 form_selector = f"form:has({amount_selector}):has({text_selector})"
             form = page.locator(form_selector).first
             if await form.count() != 1:
+                guest_markers = ("ورود با گوگل", "ثبت‌نام رایگان", "ثبت نام رایگان")
+                if any(marker in body_text for marker in guest_markers):
+                    return _failure(
+                        "مرورگر صفحه را به‌صورت مهمان (وارد‌نشده) دید و دکمه «ارسال پیشنهاد» وجود نداشت؛ "
+                        "نشست منقضی شده است. کوکی را در /market تازه کن و /test را اجرا کن.",
+                        debug=safe_debug,
+                    )
+                await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-missing")
                 return _failure(
                     "فرم مورد انتظار در صفحه مرورگر پیدا نشد؛ هیچ پیشنهادی ارسال نشد.",
                     debug=safe_debug,
@@ -288,7 +454,9 @@ async def submit_js_managed_form(
             # class bid-send--button vs generic), so try several selectors.
             if not await form.is_visible():
                 cta_candidates = [
-                    "button.bid-send--button" + _attr_selector("data-project-id", str(project_id)) + ":visible",
+                    "button.bid-send--button"
+                    + _attr_selector("data-project-id", str(project_id))
+                    + ":visible",
                     "button.bid-send--button:visible",
                     "a.bid-send--button:visible",
                     "[data-project-id=" + json.dumps(str(project_id)) + "]:visible",
@@ -303,7 +471,12 @@ async def submit_js_managed_form(
                         cand = page.locator(sel).first
                         if await cand.count() and await cand.is_visible():
                             cta = cand
-                            log.info("[BID][BROWSER-CTA] source=%s id=%s cta_selector=%r", source_name, project_id, sel)
+                            log.info(
+                                "[BID][BROWSER-CTA] source=%s id=%s cta_selector=%r",
+                                source_name,
+                                project_id,
+                                sel,
+                            )
                             break
                     except Exception:
                         continue
@@ -343,236 +516,70 @@ async def submit_js_managed_form(
                     raise ValueError(f"mapped field missing or ambiguous: {logical_name} (count={count})")
                 properties = await control.evaluate(
                     "(el) => ({tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), "
-                    "disabled: Boolean(el.disabled), readOnly: Boolean(el.readOnly), "
-                    "visible: Boolean(el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none')})"
+                    "disabled: Boolean(el.disabled), readOnly: Boolean(el.readOnly)})"
                 )
                 if properties["disabled"] or properties["readOnly"] or properties["type"] == "hidden":
                     raise ValueError(f"mapped field is not editable: {logical_name}")
                 if properties["tag"] == "select":
-                    await control.select_option(value=value)
-                    try:
-                        await control.dispatch_event("change")
-                    except Exception:
-                        pass
-                    return
-                # For the rich-text proposal field, the underlying <textarea> is
-                # often hidden (display:none) and replaced by a contenteditable
-                # editor (Quill/CKEditor/Trumbowyg/TinyMCE). `fill()` requires a
-                # visible element and would TimeoutError on such hidden fields.
-                # Set the value via JS and, if a visible editor exists, mirror it there.
-                if logical_name == "description":
-                    # Always set the hidden textarea value directly
-                    try:
-                        await control.evaluate(
-                            "(el, val) => {"
-                            "  el.value = val;"
-                            "  el.dispatchEvent(new Event('input', {bubbles:true}));"
-                            "  el.dispatchEvent(new Event('change', {bubbles:true}));"
-                            "  if (el._valueTracker) el._valueTracker.setValue('');"
-                            "}",
-                            value,
-                        )
-                    except Exception:
-                        pass
-                    # Try to find and fill the visible rich editor as well
-                    editor_selectors = [
-                        "div[contenteditable='true']",
-                        "div.ql-editor",
-                        "div.ck-editor__editable",
-                        "div.ck-content",
-                        "div.cke_editable",
-                        "div.trumbowyg-editor",
-                        "div.note-editable",
-                        "div.trix-content",
-                        "div[role='textbox']",
-                    ]
-                    filled_editor = False
-                    for sel in editor_selectors:
-                        try:
-                            editor = form.locator(sel).first
-                            if await editor.count() == 0:
-                                # Some editors are outside the <form> but inside the offcanvas
-                                editor = page.locator(sel).first
-                                if await editor.count() == 0:
-                                    continue
-                            if not await editor.is_visible():
-                                continue
-                            # Clear and insert via execCommand for editors that expect it
-                            try:
-                                await editor.click()
-                            except Exception:
-                                pass
-                            try:
-                                await editor.evaluate(
-                                    "(el, val) => {"
-                                    "  el.focus();"
-                                    "  el.innerHTML = '';"
-                                    "  document.execCommand('selectAll', false, null);"
-                                    "  document.execCommand('insertText', false, val);"
-                                    "  el.dispatchEvent(new Event('input', {bubbles:true}));"
-                                    "  el.dispatchEvent(new Event('change', {bubbles:true}));"
-                                    "}",
-                                    value,
-                                )
-                                filled_editor = True
-                                break
-                            except Exception:
-                                try:
-                                    await editor.evaluate(
-                                        "(el, val) => { el.textContent = val; el.innerText = val; el.innerHTML = val.replace(/\\n/g, '<br>'); el.dispatchEvent(new Event('input', {bubbles:true})); }",
-                                        value,
-                                    )
-                                    filled_editor = True
-                                    break
-                                except Exception:
-                                    continue
-                        except Exception:
-                            continue
-                    # Handle TinyMCE iframe case
-                    if not filled_editor:
-                        try:
-                            iframe_loc = form.locator("iframe.tox-edit-area__iframe, iframe.cke_wysiwyg_frame").first
-                            if await iframe_loc.count():
-                                frame = iframe_loc.content_frame
-                                if frame:
-                                    body = frame.locator("body").first
-                                    if await body.count():
-                                        await body.evaluate(
-                                            "(el, val) => { el.focus(); document.execCommand('selectAll', false, null); document.execCommand('insertText', false, val); el.dispatchEvent(new Event('input', {bubbles:true})); }",
-                                            value,
-                                        )
-                                        filled_editor = True
-                        except Exception:
-                            pass
-                    # Verify textarea now holds the value; if not, try visible fill as last resort
-                    try:
-                        current = await control.evaluate("el => el.value")
-                        if current != value and await control.is_visible():
-                            await control.fill(value)
-                            await control.dispatch_event("change")
-                    except Exception:
-                        if await control.is_visible():
-                            await control.fill(value)
-                            await control.dispatch_event("change")
-                    return
-                # For numeric fields (bidAmount/deadline/validDays) the inputs are
-                # often inside a transformed off-canvas; Playwright's
-                # visibility/actionability checks can still TimeoutError even
-                # when the element is technically in DOM. Set value directly
-                # via JS and dispatch the events the site's validator listens to.
-                try:
-                    # Scroll into view first (helps with fixed off-canvas)
-                    try:
-                        await control.scroll_into_view_if_needed()
-                    except Exception:
-                        pass
-                    await control.evaluate(
-                        "(el, val) => {"
-                        "  el.value = val;"
-                        "  el.dispatchEvent(new Event('input', {bubbles:true}));"
-                        "  el.dispatchEvent(new Event('change', {bubbles:true}));"
-                        "  el.dispatchEvent(new Event('blur', {bubbles:true}));"
-                        "  if (el.form) el.form.dispatchEvent(new Event('change', {bubbles:true}));"
-                        "}",
-                        value,
-                    )
-                    # Verify it stuck; if not, try native fill as last resort
-                    current = await control.evaluate("el => el.value")
-                    if current != value:
-                        if await control.is_visible():
-                            try:
-                                await control.fill(value)
-                            except Exception:
-                                pass
-                            await control.evaluate(
-                                "(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); }",
-                                value,
-                            )
-                    # Give JS validators a moment
-                    try:
-                        await page.wait_for_timeout(200)
-                    except Exception:
-                        pass
-                    # Final check — if still not set, raise
-                    final_val = await control.evaluate("el => el.value")
-                    if final_val != value:
-                        raise ValueError(f"field value not applied: {logical_name} expected={value!r} got={final_val!r}")
-                except Exception as fill_exc:
-                    # If JS set itself failed, bubble up
-                    if "field value not applied" in str(fill_exc):
-                        raise
-                    # Last resort: try pure JS again and verify
-                    try:
-                        await control.evaluate(
-                            "(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
-                            value,
-                        )
-                        if await control.evaluate("el => el.value") == value:
-                            try:
-                                await page.wait_for_timeout(200)
-                            except Exception:
-                                pass
-                            return
-                    except Exception:
-                        pass
-                    raise fill_exc
+                    await control.select_option(value=value, timeout=_STEP_TIMEOUT_MS)
+                    await control.dispatch_event("change")
+                    method = "select"
+                elif logical_name == "description":
+                    method = await _human_fill_message(page, form, control, value)
+                else:
+                    method = await _human_fill_input(page, control, logical_name, value)
+                log.info(
+                    "[BID][BROWSER-FIELD] source=%s id=%s field=%s method=%s",
+                    source_name,
+                    project_id,
+                    logical_name,
+                    method,
+                )
 
-            # Determine a sensible validDays value (مدت اعتبار پیشنهاد).
-            # The screenshot shows this field empty by default; the site's
-            # client-side validation will keep the submit button disabled
-            # until it is filled. Use config if provided, else 7 days.
+            # «مدت اعتبار پیشنهاد» (validDays) is empty by default and keeps the
+            # site's submit button disabled until filled: use config, else 7 days.
             valid_days_value: str | None = None
             try:
                 vd_field = form.locator(_attr_selector("name", "validDays"))
-                if await vd_field.count() == 1:
-                    # Check if already has a value; if empty, we need to fill it.
-                    vd_current = await vd_field.evaluate("el => el.value || ''")
-                    if not str(vd_current).strip():
-                        # Prefer explicit config, else default 7
-                        cfg_valid = str(bid_cfg.get("valid_days") or bid_cfg.get("validDays") or "7").strip()
-                        # Ensure it's a plausible integer 1-90
-                        try:
-                            vd_int = int(cfg_valid)
-                            if 1 <= vd_int <= 90:
-                                valid_days_value = str(vd_int)
-                            else:
-                                valid_days_value = "7"
-                        except Exception:
-                            valid_days_value = "7"
-                    else:
-                        # Already has a value (e.g. 30 in some fixtures), leave it
-                        valid_days_value = None
-            except Exception:
+                if (
+                    await vd_field.count() == 1
+                    and not str(await vd_field.evaluate("el => el.value || ''")).strip()
+                ):
+                    cfg_valid = str(bid_cfg.get("valid_days") or bid_cfg.get("validDays") or "7").strip()
+                    valid_days_value = cfg_valid if cfg_valid.isdigit() and 1 <= int(cfg_valid) <= 90 else "7"
+            except Exception:  # noqa: BLE001
                 valid_days_value = None
 
+            current_field = "amount"
             try:
                 await fill_field("amount", str(int(amount)))
                 if delivery_days is not None:
+                    current_field = "days"
                     await fill_field("days", str(int(delivery_days)))
+                current_field = "description"
                 await fill_field("description", proposal_text)
                 if valid_days_value is not None:
-                    # Temporarily extend mapping for this field
+                    current_field = "validDays"
                     field_mapping["_validDays"] = "validDays"
-                    await fill_field("_validDays", valid_days_value)
-                    field_mapping.pop("_validDays", None)
-                    # Wait a moment for the submit button to become enabled
                     try:
-                        await page.wait_for_timeout(400)
-                    except Exception:
-                        pass
+                        await fill_field("_validDays", valid_days_value)
+                    finally:
+                        field_mapping.pop("_validDays", None)
+                await page.wait_for_timeout(300)  # let the site's validator enable the button
             except Exception as exc:
-                field_name = str(exc).split(":")[0] if ":" in str(exc) else str(exc)[:80]
                 log.warning(
-                    "[BID][BROWSER-FORM] source=%s id=%s outcome=field_fill_failed error_type=%s field=%r detail=%r",
+                    "[BID][BROWSER-FORM] source=%s id=%s outcome=field_fill_failed error_type=%s field=%s detail=%r",
                     source_name,
                     project_id,
                     type(exc).__name__,
-                    field_name,
-                    str(exc)[:180],
+                    current_field,
+                    str(exc)[:240],
                 )
+                await _dump_debug(page, form, bid_cfg, source_name, project_id, f"fill-{current_field}")
+                safe_debug["failed_field"] = current_field
                 return _failure(
-                    "مرورگر نتوانست یکی از فیلدهای پیشنهاد را با اطمینان تکمیل کند؛ "
-                    "هیچ کلیکی برای ثبت پیشنهاد انجام نشد.",
+                    f"مرورگر نتوانست فیلد «{current_field}» را تکمیل کند؛ "
+                    "هیچ کلیکی برای ثبت پیشنهاد انجام نشد. اسکرین‌شات در data/browser_debug ذخیره شد.",
                     debug=safe_debug,
                 )
 
@@ -586,10 +593,16 @@ async def submit_js_managed_form(
                             return (inv.outerHTML || '').slice(0,300) + ' name=' + (inv.name||'') + ' validity=' + JSON.stringify(inv.validity);
                         }"""
                     )
-                    log.warning("[BID][BROWSER-FORM-INVALID] source=%s id=%s invalid=%r", source_name, project_id, invalid_detail)
+                    log.warning(
+                        "[BID][BROWSER-FORM-INVALID] source=%s id=%s invalid=%r",
+                        source_name,
+                        project_id,
+                        invalid_detail,
+                    )
                     safe_debug["invalid_field"] = invalid_detail[:300]
                 except Exception:
                     pass
+                await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-invalid")
                 return _failure(
                     "فرم مرورگر پس از تکمیل فیلدها معتبر نیست؛ برای جلوگیری از ارسال ناقص متوقف شد.",
                     debug=safe_debug,
@@ -626,9 +639,15 @@ async def submit_js_managed_form(
                 # Log why it is still disabled
                 try:
                     btn_outer = await submitter.evaluate("el => el.outerHTML.slice(0,400)")
-                    log.warning("[BID][BROWSER-SUBMIT-DISABLED] source=%s id=%s button=%r", source_name, project_id, btn_outer)
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT-DISABLED] source=%s id=%s button=%r",
+                        source_name,
+                        project_id,
+                        btn_outer,
+                    )
                 except Exception:
                     pass
+                await _dump_debug(page, form, bid_cfg, source_name, project_id, "submit-disabled")
                 return _failure(
                     "دکمه ارسال سایت غیرفعال است؛ هیچ پیشنهادی ارسال نشد.",
                     debug=safe_debug,
@@ -746,6 +765,8 @@ async def submit_js_managed_form(
         )
     except Exception as exc:
         safe_debug["request_sent"] = "unknown" if action_clicked else False
+        # A browser/page that died before any click is safe to retry once on a fresh browser.
+        safe_debug["retryable"] = (not action_clicked) and type(exc).__name__ == "TargetClosedError"
         log.warning(
             "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=browser_error error_type=%s clicked=%s",
             source_name,
@@ -763,3 +784,23 @@ async def submit_js_managed_form(
             pause_source=action_clicked,
             debug=safe_debug,
         )
+
+
+async def submit_js_managed_form(**kwargs: Any) -> SubmissionResult:
+    """Run the browser workflow serially; retry once only if Chromium died before any click."""
+    global _browser_lock
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+    async with _browser_lock:
+        result = await _submit_once(**kwargs)
+        if (result.payload_debug or {}).get("retryable"):
+            log.warning(
+                "[BID][BROWSER-RETRY] source=%s id=%s reason=browser_closed_before_click",
+                kwargs.get("source_name"),
+                kwargs.get("project_id"),
+            )
+            await asyncio.sleep(1.0)
+            result = await _submit_once(**kwargs)
+        if result.payload_debug:
+            result.payload_debug.pop("retryable", None)
+        return result

@@ -148,9 +148,7 @@ async def test_submit_bid_delegates_js_managed_form_to_browser(monkeypatch):
       </form>
     </body></html>
     """
-    respx.get("https://parscoders.com/project/12345").mock(
-        return_value=httpx.Response(200, text=page)
-    )
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
     wrong_route = respx.post("https://parscoders.com/project/12345").mock(
         return_value=httpx.Response(200, text="project page returned")
     )

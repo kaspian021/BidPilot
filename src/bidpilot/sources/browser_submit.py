@@ -671,11 +671,23 @@ async def submit_js_managed_form(
                 response = await response_info.value
             except PlaywrightTimeoutError:
                 safe_debug["request_sent"] = "unknown"
-                return _failure(
-                    "پس از کلیک، پاسخ مسیر ثبت پیشنهاد دریافت نشد؛ ممکن است سایت درخواست را گرفته باشد. "
-                    "برای جلوگیری از پیشنهاد تکراری، وضعیت پروژه را دستی بررسی کن و فعلاً دوباره تلاش نکن.",
-                    pause_source=True,
-                    debug=safe_debug,
+                # This is an ambiguous network timeout — not evidence of a
+                # JavaScript interstitial. Do NOT pause the scheduler; the bid
+                # may have actually succeeded (as proven in production: the
+                # next cycle showed already_submitted).
+                log.warning(
+                    "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_no_response clicked=true",
+                    source_name,
+                    project_id,
+                )
+                return SubmissionResult(
+                    status=SubmissionStatus.FAILED,
+                    message=(
+                        "پس از کلیک، پاسخ مسیر ثبت پیشنهاد دریافت نشد؛ ممکن است سایت درخواست را گرفته باشد. "
+                        "برای جلوگیری از پیشنهاد تکراری، وضعیت پروژه را دستی بررسی کن و فعلاً دوباره تلاش نکن."
+                    ),
+                    payload_debug=safe_debug,
+                    javascript_required=False,
                 )
 
             safe_debug["request_sent"] = True
@@ -700,6 +712,36 @@ async def submit_js_managed_form(
                     pass
 
             if not ok:
+                # Subscription / daily-limit outranks everything
+                if html_parser.requires_subscription(response_text):
+                    sub_snippet = html_parser.subscription_limit_snippet(response_text)
+                    daily = html_parser.is_daily_limit_error(response_text)
+                    if daily:
+                        msg = (
+                            f"⛔ سقف ارسال روزانه پر شده است ({sub_snippet[:120]}). "
+                            "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
+                            "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
+                        )
+                    else:
+                        msg = (
+                            f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_snippet[:120]}). "
+                            "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
+                        )
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=subscription_required daily=%s snippet=%r",
+                        source_name,
+                        project_id,
+                        response.status,
+                        daily,
+                        sub_snippet,
+                    )
+                    return SubmissionResult(
+                        status=SubmissionStatus.FAILED,
+                        message=msg,
+                        http_status=response.status,
+                        subscription_required=True,
+                        payload_debug=safe_debug,
+                    )
                 pause = html_parser.requires_javascript(response_text)
                 log.warning(
                     "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s "

@@ -142,6 +142,27 @@ class Application:
                 )
             )
             return
+        subscription_failures = [r for r in reports if getattr(r, "subscription_required", False)]
+        if subscription_failures:
+            source = subscription_failures[0].source or "marketplace"
+            detail = getattr(subscription_failures[0], "subscription_message", "") or next(
+                (str(error) for report in subscription_failures for error in report.errors if str(error).strip()),
+                "اشتراک حساب به پایان رسیده است.",
+            )
+            await self.notifiers.dispatch(
+                Event(
+                    kind=EventKind.ERROR,
+                    title="اشتراک پارس‌کدرز به پایان رسیده",
+                    body=(
+                        f"⛔ اشتراک حساب «{source}» به پایان رسیده یا سقف ارسال روزانه پر شده است.\\n"
+                        f"دلیل: {detail}\\n"
+                        "جست‌وجو و ارسال پیشنهاد متوقف شد تا اشتراک را تمدید کنی.\\n"
+                        "حساب رایگان روزی ۱ پیشنهاد اجازه می‌دهد؛ برای ارسال نامحدود باید اشتراک بخری.\\n"
+                        "پس از تمدید اشتراک، دوباره /run را بزن."
+                    ),
+                )
+            )
+            return
         javascript_failures = [r for r in reports if getattr(r, "javascript_required", False)]
         if javascript_failures:
             source = javascript_failures[0].source or "marketplace"

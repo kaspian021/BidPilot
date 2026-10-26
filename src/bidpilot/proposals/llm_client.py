@@ -217,8 +217,8 @@ class LLMClient:
                 return spend
             wait = 60 - (now - self._spent[0].at) + 0.2 if self._spent else 0.5
             wait = max(0.5, min(wait, 65.0))
-            log.info(
-                "LLM budget: %s/%s tokens used in this minute; waiting %.1fs",
+            log.debug(
+                "LLM budget: %s/%s tokens used; waiting %.1fs",
                 used,
                 self.tokens_per_minute,
                 wait,

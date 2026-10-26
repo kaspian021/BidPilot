@@ -295,11 +295,12 @@ class ProposalGenerator:
         validation then rejects as if the model had ignored the price. So a
         ``finish_reason == "length"`` answer is retried with twice the budget.
         """
-        budget = max(int(self.llm_config.max_tokens or 900), 1_400)
+        budget = max(int(self.llm_config.max_tokens or 900), 900)
+        budget = min(budget, 1100)
         response = await self._call(client, system, user, budget)
         if getattr(response, "truncated", False):
             log.info("Proposal hit the %s-token limit; retrying with more room", budget)
-            response = await self._call(client, system, user, min(budget * 2, 3_000))
+            response = await self._call(client, system, user, min(budget * 2, 2_200))
         return response
 
     @staticmethod

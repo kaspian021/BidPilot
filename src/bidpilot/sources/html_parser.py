@@ -1808,6 +1808,61 @@ def javascript_requirement_snippet(html: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- subscription / daily limit
+_SUBSCRIPTION_PATTERNS = (
+    re.compile(r"اشتراک\s*(?:شما)?\s*(?:به\s*)?(?:پایان|اتمام|منقضی|تمام)", re.IGNORECASE),
+    re.compile(r"تمدید\s*اشتراک|خرید\s*اشتراک|ارتق[اا]ی\s*حساب|خرید\s*پلن|تمدید\s*کنید", re.IGNORECASE),
+    re.compile(r"اعتبار\s*(?:حساب|کافی).*?(?:نیست|ندارید|کافی نیست|تمام شده|به پایان)", re.IGNORECASE),
+    re.compile(r"اعتبار\s*کافی\s*نیست|اعتبار\s*شما\s*کافی\s*نیست", re.IGNORECASE),
+    re.compile(r"سقف\s*ارسال|محدودیت\s*(?:روزانه|ارسال)|ظرفیت\s*ارسال", re.IGNORECASE),
+    re.compile(r"امکان\s*ارسال\s*پیشنهاد\s*ندارید|مجاز\s*به\s*ارسال\s*نیست", re.IGNORECASE),
+    re.compile(r"برای\s*ارسال\s*پیشنهاد\s*بیشتر|برای\s*ادامه\s*اشتراک", re.IGNORECASE),
+    re.compile(r"روزانه\s*فقط\s*(?:یک|1|۱)|روزی\s*(?:یک|1|۱)\s*پیشنهاد|تعداد\s*پیشنهاد\s*روزانه|حد\s*نصاب\s*روزانه", re.IGNORECASE),
+    re.compile(r"حساب\s*(?:ویژه|کاربری).*?(?:به پایان|منقضی|تمام)|نیاز\s*به\s*خرید\s*اشتراک", re.IGNORECASE),
+    re.compile(r"subscription\s*(?:expired|required)|daily\s*limit|insufficient\s*credit", re.IGNORECASE),
+)
+
+_DAILY_LIMIT_ONLY_PATTERNS = (
+    re.compile(r"روزانه\s*فقط|روزی\s*(?:یک|1|۱)|سقف\s*ارسال|محدودیت\s*روزانه|ظرفیت\s*ارسال", re.IGNORECASE),
+    re.compile(r"daily\s*limit", re.IGNORECASE),
+)
+
+
+def subscription_limit_snippet(html: str) -> str:
+    """Short matched subscription/limit notice, or ""."""
+    for notice in extract_response_notices(html) + extract_json_notices(html):
+        for pat in _SUBSCRIPTION_PATTERNS:
+            m = pat.search(notice)
+            if m:
+                start = max(0, m.start() - 20)
+                return notice[start : m.end() + 40].strip()[:220]
+    text2 = _visible_page_text(html)
+    if not text2:
+        return ""
+    for pat in _SUBSCRIPTION_PATTERNS:
+        m = pat.search(text2)
+        if m:
+            start = max(0, m.start() - 25)
+            return text2[start : m.end() + 35].strip()[:220]
+    return ""
+
+
+def requires_subscription(html: str) -> bool:
+    """True when the site says the account/subscription cannot send more bids."""
+    return bool(subscription_limit_snippet(html))
+
+
+def is_daily_limit_error(html: str) -> bool:
+    """True when the message is specifically a daily-quota (not full expiry)."""
+    snippet = subscription_limit_snippet(html)
+    if not snippet:
+        return False
+    for pat in _DAILY_LIMIT_ONLY_PATTERNS:
+        if pat.search(snippet):
+            return True
+    return False
+
+
 def requires_javascript(html: str) -> bool:
     """Detect an explicit, *visible* site message requiring browser JavaScript."""
     return bool(javascript_requirement_snippet(html))
@@ -1831,6 +1886,13 @@ def detect_success(status_code: int, html: str, settings: dict[str, Any]) -> tup
     json_notices = extract_json_notices(html)
     notices = extract_response_notices(html) + json_notices
     error_words = ("خطا", "ناموفق", "خطای", "failed", "error")
+
+    # Subscription / daily-limit is terminal: surface it before generic checks
+    sub_snippet = subscription_limit_snippet(html)
+    if sub_snippet:
+        daily = is_daily_limit_error(html)
+        kind = "سقف روزانه" if daily else "اشتراک"
+        return False, f"⛔ اشتراک/محدودیت {kind}: {sub_snippet[:180]}"
 
     # Check for structured JSON success response first
     body_raw = (html or "").strip()
@@ -1889,6 +1951,9 @@ __all__ = [
     "serialize_form",
     "javascript_requirement_snippet",
     "requires_javascript",
+    "subscription_limit_snippet",
+    "requires_subscription",
+    "is_daily_limit_error",
     "enrich_from_detail",
     "extract_external_id",
     "extract_js_cookie_assignments",

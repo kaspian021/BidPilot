@@ -201,6 +201,10 @@ class Scheduler:
                     log.info(report.summary())
                     for error in report.errors:
                         log.warning("cycle error: %s", error)
+                if any(getattr(report, "subscription_required", False) for report in reports):
+                    log.error("[SCHEDULER][STOP-SUBSCRIPTION] subscription expired / daily limit reached; stopping polling")
+                    self.request_stop()
+                    break
                 if any(getattr(report, "authentication_failed", False) for report in reports):
                     log.error("[SCHEDULER][STOP-AUTH] marketplace login is not verified; stopping polling")
                     self.request_stop()

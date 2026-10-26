@@ -415,12 +415,12 @@ class HtmlMarketSource(Source):
     def ai_discovery_enabled(self) -> bool:
         mode = self.discovery_mode()
         if mode in {"selectors", "off"}:
-            log.info("[DISCOVERY][DISABLED] source=%s reason=mode_%s", self.name, mode)
+            log.debug("[DISCOVERY][DISABLED] source=%s reason=mode_%s", self.name, mode)
             return False
 
         remaining = self._discovery_blocked_until - time.monotonic()
         if remaining > 0:
-            log.info(
+            log.debug(
                 "[DISCOVERY][DISABLED] source=%s reason=failure_cooldown remaining_seconds=%.1f",
                 self.name,
                 remaining,
@@ -590,7 +590,7 @@ class HtmlMarketSource(Source):
 
         projects: list[Project] = []
         seen: set[str] = set()
-        log.info(
+        log.debug(
             "[SELECTORS][START] source=%s base_url=%s list_path=%s max_pages=%s "
             "card_selectors=%r detail_mode=%s detail_path=%s",
             self.name,
@@ -604,7 +604,7 @@ class HtmlMarketSource(Source):
         for page in range(1, max_pages + 1):
             params = {page_param: page} if page > 1 else None
             try:
-                log.info(
+                log.debug(
                     "[SELECTORS][GET-LIST] source=%s requested=%s params=%r",
                     self.name,
                     urljoin(self.base_url + "/", str(path).lstrip("/")),
@@ -617,14 +617,14 @@ class HtmlMarketSource(Source):
                     raise SourceError(f"خطا در دریافت لیست پروژه‌ها: {detail}") from exc
                 log.warning("%s page %s failed: %s", self.name, page, exc)
                 break
-            log.info(
+            log.debug(
                 "[SELECTORS][LIST-RESPONSE] source=%s requested_path=%s html_chars=%s",
                 self.name,
                 path,
                 len(html or ""),
             )
             page_projects = parser.parse_list_page(html, list_cfg, self.name, self.base_url)
-            log.info(
+            log.debug(
                 "[SELECTORS][LIST-PARSED] source=%s page=%s projects=%s",
                 self.name,
                 page,
@@ -646,7 +646,8 @@ class HtmlMarketSource(Source):
             projects = await self._attach_details(projects, int(list_cfg.get("detail_concurrency", 3)))
 
         projects.sort(key=lambda p: (p.published_at is not None, p.published_at), reverse=True)
-        log.info("[FETCH][FINAL] source=%s projects=%s", self.name, len(projects))
+        # Single concise summary for the cycle; per-card details stay at DEBUG
+        log.info("📥 %s: %s پروژه دریافت شد", self.name, len(projects))
         for project in projects:
             log.debug(
                 "[FETCH][FINAL-PROJECT] source=%s id=%s title=%r url=%s "
@@ -709,7 +710,7 @@ class HtmlMarketSource(Source):
                 raise SourceError(f"خطای شبکه هنگام بررسی وضعیت پیشنهاد پروژه: {type(exc).__name__}") from exc
 
             final_path = urlsplit(str(page.url)).path
-            log.info(
+            log.debug(
                 "[BID][STATUS-CHECK-RESPONSE] source=%s id=%s status=%s final_path=%s html_chars=%s",
                 self.name,
                 project.external_id,
@@ -735,12 +736,11 @@ class HtmlMarketSource(Source):
             if snippet:
                 raise JavaScriptRequiredError(_javascript_required_message(snippet))
         outcome = "already_submitted" if state is True else "not_submitted" if state is False else "unknown"
-        log.info(
-            "[BID][STATUS-CHECK] source=%s id=%s outcome=%s",
-            self.name,
-            project.external_id,
-            outcome,
-        )
+        # Only log already_submitted at INFO (actionable); not_submitted is noise for 20+ cards
+        if state is True:
+            log.info("[BID] %s:%s — قبلاً پیشنهاد داده‌ایم ✓", self.name, project.external_id)
+        else:
+            log.debug("[BID][STATUS-CHECK] source=%s id=%s outcome=%s", self.name, project.external_id, outcome)
         return state
 
     # --------------------------------------------------------- detail pages
@@ -1199,6 +1199,36 @@ class HtmlMarketSource(Source):
         #   2) an explicit visible JavaScript alert outranks a login redirect
         #      (the site is telling us the *reason* for the bounce);
         #   3) only then does a bare login redirect mean "session expired".
+        # Subscription / daily-limit is terminal and outranks JS/login diagnosis
+        if parser.requires_subscription(response.text):
+            sub_msg = parser.subscription_limit_snippet(response.text)
+            daily = parser.is_daily_limit_error(response.text)
+            if daily:
+                message = (
+                    f"⛔ سقف ارسال روزانه پر شده است ({sub_msg[:120]}). "
+                    "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
+                    "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
+                )
+            else:
+                message = (
+                    f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_msg[:120]}). "
+                    "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
+                )
+            log.warning(
+                "[BID][SUBMIT-RESPONSE] source=%s id=%s outcome=subscription_required daily=%s snippet=%r",
+                self.name,
+                project.external_id,
+                daily,
+                sub_msg,
+            )
+            return SubmissionResult(
+                status=SubmissionStatus.FAILED,
+                message=message,
+                http_status=response.status_code,
+                subscription_required=True,
+                payload_debug={"action": action, "fields": sorted(payload)},
+            )
+
         _ok_preview, _ = parser.detect_success(response.status_code, response.text, bid_cfg)
         js_notice = next((item for item in notices if parser.requires_javascript(item)), "")
         if not _ok_preview and js_notice:

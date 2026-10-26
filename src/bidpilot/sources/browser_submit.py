@@ -4,6 +4,7 @@ This module deliberately clicks the site's own controls; it does not reproduce
 or guess private AJAX payloads, forge JavaScript state, or bypass challenges.
 Playwright is an optional extra so non-browser sources do not need Chromium.
 """
+
 from __future__ import annotations
 
 import json
@@ -49,9 +50,7 @@ def _browser_cookies(cookies: Any, base_url: str) -> list[dict[str, Any]]:
         if not name or not domain or not host:
             continue
         # Never carry unrelated-domain cookies into the browser context.
-        if domain.count(".") < 1 or not (
-            host == domain or host.endswith("." + domain)
-        ):
+        if domain.count(".") < 1 or not (host == domain or host.endswith("." + domain)):
             continue
         expires = getattr(cookie, "expires", None)
         if expires is not None:
@@ -75,8 +74,11 @@ def _browser_cookies(cookies: Any, base_url: str) -> list[dict[str, Any]]:
         if any(str(key).casefold() == "httponly" for key in rest):
             spec["httpOnly"] = True
         same_site = next(
-            (str(val).capitalize() for key, val in rest.items()
-             if str(key).casefold() == "samesite" and str(val).casefold() in {"strict", "lax", "none"}),
+            (
+                str(val).capitalize()
+                for key, val in rest.items()
+                if str(key).casefold() == "samesite" and str(val).casefold() in {"strict", "lax", "none"}
+            ),
             None,
         )
         if same_site:
@@ -200,9 +202,7 @@ async def submit_js_managed_form(
             logged_markers = [
                 str(item).casefold() for item in (auth_cfg.get("logged_in_markers") or []) if item
             ]
-            login_markers = [
-                str(item).casefold() for item in (auth_cfg.get("login_markers") or []) if item
-            ]
+            login_markers = [str(item).casefold() for item in (auth_cfg.get("login_markers") or []) if item]
             if (
                 logged_markers
                 and not any(marker in lowered for marker in logged_markers)
@@ -300,7 +300,9 @@ async def submit_js_managed_form(
             if submitter_id:
                 submitter = form.locator(_attr_selector("id", submitter_id)).first
             else:
-                submitter = form.locator(_attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)).first
+                submitter = form.locator(
+                    _attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)
+                ).first
             if await submitter.count() == 0 or not await submitter.is_visible():
                 return _failure(
                     "دکمه اصلی ارسال در فرم مرورگر پیدا یا قابل‌مشاهده نیست؛ هیچ پیشنهادی ارسال نشد.",

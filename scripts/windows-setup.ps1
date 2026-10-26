@@ -34,12 +34,16 @@ $venvPython = ".\.venv\Scripts\python.exe"
 
 Write-Host "== 4) نصب BidPilot (editable + dev) ==" -ForegroundColor Cyan
 & $venvPython -m pip install -e ".[dev,browser]"
-if ($LASTEXITCODE -eq 0) {
+$installExitCode = $LASTEXITCODE
+if ($installExitCode -eq 0) {
     Write-Host "== Install Chromium for JavaScript forms ==" -ForegroundColor Cyan
     & $venvPython -m playwright install chromium
-    if ($LASTEXITCODE -ne 0) { Write-Host "Chromium install failed; run later: .\.venv\Scripts\python.exe -m playwright install chromium" -ForegroundColor Yellow }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Chromium install failed. Run: .\.venv\Scripts\python.exe -m playwright install chromium" -ForegroundColor Red
+        exit 1
+    }
 }
-if ($LASTEXITCODE -ne 0) {
+if ($installExitCode -ne 0) {
     Write-Host "نصب با pip ناموفق بود؛ حالت جایگزین: بدون نصب و با PYTHONPATH اجرا کن:" -ForegroundColor Yellow
     Write-Host '  $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m bidpilot setup'
     exit 1

@@ -145,6 +145,7 @@ detail:
 # --- bidding ----------------------------------------------------------------
 bid:
   mode: "form"           # "form" = parse & POST the real HTML form
+  browser_submit: true  # Use the site's JavaScript form in Chromium when the form has no native action.
   # form on the project page that submits a proposal
   # VERIFIED on the live DOM (2026-10-25, `bidpilot inspect` on project
   # 621237): the real bid form has NO action/method (JS submits it) and

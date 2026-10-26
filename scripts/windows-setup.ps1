@@ -33,10 +33,6 @@ $venvPython = ".\.venv\Scripts\python.exe"
 & $venvPython -m pip install --upgrade pip setuptools wheel
 
 Write-Host "== 4) نصب BidPilot (editable + dev) ==" -ForegroundColor Cyan
-<<<<<<< HEAD
-& $venvPython -m pip install -e ".[dev]"
-if ($LASTEXITCODE -ne 0) {
-=======
 & $venvPython -m pip install -e ".[dev,browser]"
 $installExitCode = $LASTEXITCODE
 if ($installExitCode -eq 0) {
@@ -48,7 +44,6 @@ if ($installExitCode -eq 0) {
     }
 }
 if ($installExitCode -ne 0) {
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
     Write-Host "نصب با pip ناموفق بود؛ حالت جایگزین: بدون نصب و با PYTHONPATH اجرا کن:" -ForegroundColor Yellow
     Write-Host '  $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m bidpilot setup'
     exit 1

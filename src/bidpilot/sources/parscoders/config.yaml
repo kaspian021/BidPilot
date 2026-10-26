@@ -145,10 +145,8 @@ detail:
 # --- bidding ----------------------------------------------------------------
 bid:
   mode: "form"           # "form" = parse & POST the real HTML form
-<<<<<<< HEAD
-=======
   browser_submit: true  # Use the site's JavaScript form in Chromium when the form has no native action.
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
+  valid_days: 7           # مدت اعتبار پیشنهاد (روز) — فیلد validDays در فرم پارس‌کدرز
   # form on the project page that submits a proposal
   # VERIFIED on the live DOM (2026-10-25, `bidpilot inspect` on project
   # 621237): the real bid form has NO action/method (JS submits it) and

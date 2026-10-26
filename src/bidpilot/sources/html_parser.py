@@ -1737,16 +1737,10 @@ def extract_json_notices(text: str) -> list[str]:
     if not isinstance(data, dict):
         return []
     notices: list[str] = []
-<<<<<<< HEAD
-    message = data.get("message")
-    if isinstance(message, str) and message.strip():
-        notices.append(clean_text(message)[:300])
-=======
     for key in ("message", "response_message"):
         message = data.get(key)
         if isinstance(message, str) and message.strip():
             notices.append(clean_text(message)[:300])
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
     errors = data.get("errors")
     if isinstance(errors, dict):
         for field, messages in errors.items():

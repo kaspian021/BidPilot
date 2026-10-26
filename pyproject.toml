@@ -32,10 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.29"]
-<<<<<<< HEAD
-=======
 browser = ["playwright>=1.51,<2"]
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
 dev = [
   "pytest>=8.2",
   "pytest-asyncio>=0.23",

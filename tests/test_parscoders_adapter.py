@@ -12,11 +12,7 @@ import respx
 
 from bidpilot.config import AppConfig, Profile, RuntimeConfig, Secrets
 from bidpilot.credentials import SiteCredentials
-<<<<<<< HEAD
-from bidpilot.models import Budget, Project, Proposal
-=======
 from bidpilot.models import Budget, Project, Proposal, SubmissionResult, SubmissionStatus
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
 from bidpilot.sources.base import SourceError
 from bidpilot.sources.parscoders.adapter import ParscodersSource
 
@@ -116,21 +112,11 @@ async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
       </form>
     </body></html>
     """
-<<<<<<< HEAD
-    respx.get("https://parscoders.com/project/12345").mock(
-        return_value=httpx.Response(200, text=page)
-    )
-    wrong_route = respx.post("https://parscoders.com/project/12345").mock(
-        return_value=httpx.Response(200, text="project page returned")
-    )
-    source = make_source()
-=======
     respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
     wrong_route = respx.post("https://parscoders.com/project/12345").mock(
         return_value=httpx.Response(200, text="project page returned")
     )
     source = make_source(bid={"browser_submit": False})
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
     source._session_cookies = {"PHPSESSID": "session-value"}
     project = Project(source="parscoders", external_id="12345", title="تست")
 
@@ -144,8 +130,6 @@ async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
     await source.aclose()
 
 
-<<<<<<< HEAD
-=======
 @pytest.mark.asyncio
 @respx.mock
 async def test_submit_bid_delegates_js_managed_form_to_browser(monkeypatch):
@@ -203,7 +187,6 @@ async def test_submit_bid_delegates_js_managed_form_to_browser(monkeypatch):
     await source.aclose()
 
 
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
 @respx.mock
 async def test_submit_bid_detects_rejection():
     respx.get("https://parscoders.com/project/12345").mock(
@@ -254,12 +237,9 @@ async def test_submit_bid_detects_javascript_requirement_and_marks_it():
 @respx.mock
 async def test_submit_bid_without_credentials_fails_fast():
     source = make_source()
-<<<<<<< HEAD
-=======
     # Isolate this test from credentials saved in the developer's local settings store.
     source._session_cookies = {}
     source.credentials = SiteCredentials(site="parscoders", method="cookie")
->>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
     project = Project(source="parscoders", external_id="1", title="تست")
     result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
     assert result.status.value == "failed"

@@ -35,6 +35,10 @@ from ..llm_providers import build_client, resolve_chain
 from ..models import Project, Proposal, SubmissionResult, SubmissionStatus
 from . import html_parser as parser
 from .base import AuthenticationRequiredError, JavaScriptRequiredError, Source, SourceError
+<<<<<<< HEAD
+=======
+from .browser_submit import submit_js_managed_form
+>>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
 from .discovery import (
     MAX_DETAIL_PAGES,
     MAX_PROJECTS,
@@ -1065,6 +1069,39 @@ class HtmlMarketSource(Source):
                     form_name = str(form.get("name") or "")
                     submitter_id = str(submitter.get("id") or "")
                     field_names = sorted(str(name) for name in payload)
+<<<<<<< HEAD
+=======
+                    if bool(bid_cfg.get("browser_submit")):
+                        log.info(
+                            "[BID][BROWSER-SUBMIT-START] source=%s id=%s endpoint_path=%s "
+                            "form_id=%r submitter_id=%r fields=%r",
+                            self.name,
+                            project.external_id,
+                            endpoint_path,
+                            form_id,
+                            submitter_id,
+                            field_names,
+                        )
+                        return await submit_js_managed_form(
+                            source_name=self.name,
+                            base_url=self.base_url,
+                            page_url=form_page_url,
+                            project_id=str(project.external_id),
+                            user_agent=self.config.runtime.user_agent,
+                            cookies=client.cookies,
+                            form_id=form_id,
+                            form_name=form_name,
+                            submitter_id=submitter_id,
+                            endpoint_attribute=endpoint_attr,
+                            endpoint_url=endpoint,
+                            field_mapping=mapping,
+                            proposal_text=proposal.text,
+                            amount=amount,
+                            delivery_days=delivery_days,
+                            bid_cfg=bid_cfg,
+                            auth_cfg=self.settings.get("auth") or {},
+                        )
+>>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
                     message = (
                         "فرم ارسال پیشنهاد action معمولی ندارد و مسیر ارسال روی دکمه‌ی submit "
                         "به‌صورت data-href/data-url/data-action تعریف شده است؛ این نشانه‌ی فرم "

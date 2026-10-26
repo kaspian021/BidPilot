@@ -7,6 +7,19 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SETTINGS = load_default_settings()
 
 
+<<<<<<< HEAD
+=======
+def test_json_response_message_is_used_for_bid_confirmation():
+    ok, message = parser.detect_success(
+        200,
+        '{"response_message":"پیشنهاد با موفقیت ثبت شد","bid_id":123}',
+        SETTINGS["bid"],
+    )
+    assert ok is True
+    assert "تأیید شد" in message
+
+
+>>>>>>> a26d343 (Fall back to installed Edge or Chrome when Playwright Chromium is unavailable)
 def test_parse_list_page():
     html = (FIXTURES / "sample_list.html").read_text(encoding="utf-8")
     projects = parser.parse_list_page(html, SETTINGS["list"], "parscoders", "https://parscoders.com")

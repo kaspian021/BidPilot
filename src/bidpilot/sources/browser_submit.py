@@ -109,6 +109,7 @@ async def submit_js_managed_form(
     base_url: str,
     page_url: str,
     project_id: str,
+    user_agent: str,
     cookies: Any,
     form_id: str,
     form_name: str,
@@ -175,7 +176,10 @@ async def submit_js_managed_form(
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
-            context = await browser.new_context(locale="fa-IR")
+            context_options: dict[str, Any] = {"locale": "fa-IR"}
+            if user_agent.strip():
+                context_options["user_agent"] = user_agent.strip()
+            context = await browser.new_context(**context_options)
             cookie_specs = _browser_cookies(cookies, base_url)
             if cookie_specs:
                 await context.add_cookies(cookie_specs)

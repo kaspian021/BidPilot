@@ -94,6 +94,45 @@ async def test_submit_bid_posts_mapped_form_fields():
 
 
 @respx.mock
+async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
+    # Real ParsCoders pages use a JS-managed form: the <form> has no action,
+    # while its submit button carries the AJAX endpoint in data-href.
+    page = """
+    <html><head><title>پروژه آزمایشی</title></head><body>
+      <form id="init_message_form" name="init_message">
+        <input type="hidden" name="_token" value="csrf-placeholder">
+        <input type="text" name="bidAmount">
+        <input type="text" name="deadline">
+        <input type="text" name="initEscrowPercent">
+        <input type="text" name="expertGuaranteePercent">
+        <input type="text" name="validDays">
+        <textarea name="message"></textarea>
+        <button type="submit" id="msg_submit_btn"
+                data-href="/conversation/ajax/bid-send/12345">ارسال پیشنهاد</button>
+      </form>
+    </body></html>
+    """
+    respx.get("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text=page)
+    )
+    wrong_route = respx.post("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text="project page returned")
+    )
+    source = make_source()
+    source._session_cookies = {"PHPSESSID": "session-value"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="متن پیشنهاد آزمایشی"), 500_000, 14)
+
+    assert result.status.value == "failed"
+    assert result.javascript_required
+    assert result.payload_debug["request_sent"] is False
+    assert result.payload_debug["endpoint_path"] == "/conversation/ajax/bid-send/12345"
+    assert wrong_route.call_count == 0
+    await source.aclose()
+
+
+@respx.mock
 async def test_submit_bid_detects_rejection():
     respx.get("https://parscoders.com/project/12345").mock(
         return_value=httpx.Response(200, text=PROJECT_HTML)

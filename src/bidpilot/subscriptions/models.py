@@ -33,6 +33,10 @@ class UserAccountRow(Base):
     # stats cache
     total_bids: Mapped[int] = mapped_column(Integer, default=0)
     successful_bids: Mapped[int] = mapped_column(Integer, default=0)
+    # Referral
+    referral_code: Mapped[str | None] = mapped_column(String(16), nullable=True, unique=True, index=True)
+    referred_by: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    granted_milestones: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of counts
 
 
 class SubscriptionRecord(Base):
@@ -58,6 +62,19 @@ class PaymentRow(Base):
     authority: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     ref_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="created")  # created, sent, verified, failed, cancelled
+    gateway: Mapped[str] = mapped_column(String(32), default="zarinpal")
     zarinpal_response: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ReferralRow(Base):
+    __tablename__ = "referrals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inviter_chat_id: Mapped[str] = mapped_column(String(32), index=True)
+    invitee_chat_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    invitee_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending")  # pending, qualified, purchased
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

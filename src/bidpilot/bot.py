@@ -226,22 +226,31 @@ HELP_TEXT = """<b>BidPilot — راهنمای حرفه‌ای</b>  <i>✦ دست
 
 <b>شروع سریع (۱ دقیقه)</b>
 • /start — منوی اصلی حرفه‌ای (پروفایل، پلن، وضعیت زنده)
-• /plans — مشاهده پلن‌ها و خرید اشتراک (زرین‌پال)
+• /plans — پلن‌ها + پرداخت با ۴ درگاه سبک (زیبال/آی‌دی‌پی/نکست‌پی/زرین‌پال)
+• /invite — باشگاه دعوت: لینک اختصاصی، ارتقای رایگان بدون خرید
 • /account — حساب من + سقف‌های ساعتی/روزانه
 • /status — داشبورد با گراف مصرف
+
+<b>پرداخت — ۴ درگاه، احراز سبک</b>
+• زیبال 💚، آی‌دی‌پی 💙، نکست‌پی 🧡، زرین‌پال 💛 — فقط موبایل+شبا (زیبال فوری)
+• بدون کلید هم تست می‌شود (شبیه‌سازی). راهنما: /zarinpal
+
+<b>دعوت دوستان — رایگان ارتقا بگیر 🎁</b>
+• /invite → لینک <code>t.me/bot?start=ref_XXXX</code> + دکمه اشتراک
+• ۳ دعوت=۷ روز استارتر · ۵=۱۵ روز · ۱۰=۳۰ روز حرفه‌ای · ۲۰=۳۰ روز سازمانی
+• هر خرید دوست = +۷ روز همان پلن (نامحدود)
 
 <b>هسته</b>
 /setup — راه‌اندازی کامل
 /run — 🚀 شروع رصد خودکار
 /stop — ⏸ توقف
 /style — لحن و درصد قیمت (۵۰٪ = نصف بودجه ثابت — اصلاح‌شده)
-/profile, /llm, /market, /sites, /filters — تنظیم پروفایل، هوش، سایت، فیلتر
+/profile, /llm, /market, /sites, /filters — پروفایل، هوش، سایت، فیلتر
 /preview — پیش‌نمایش بدون ارسال
 /mode, /proxy, /check, /test, /deps — حالت، پروکسی، تست‌ها
 /settings, /cancel — تنظیمات، لغو
 
 هر کاربر حساب و سقف جدا دارد: رایگان ۵/ساعت، پولی تا ۸۰/ساعت.
-پرداخت‌ها با زرین‌پال (شاپرک) امن و با راهنمای کامل داخل ربات.
 هیچ .env لازم نیست؛ همه امن در data/settings.json ذخیره می‌شود."""
 
 
@@ -498,10 +507,20 @@ class BotService:
             await self.handle_command(chat, "/start", "")
         elif data.startswith("plan:"):
             await self._cmd_plan_detail(chat, data.split(":", 1)[1])
+        elif data.startswith("pay_pick:"):
+            await self._cmd_pick_gateway(chat, data.split(":", 1)[1])
         elif data.startswith("buy:"):
-            await self._cmd_buy(chat, data.split(":", 1)[1])
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                await self._cmd_buy(chat, parts[1], gateway=parts[2])
+            else:
+                await self._cmd_buy(chat, parts[1])
         elif data.startswith("verify:"):
             await self._cmd_verify(chat, data.split(":", 1)[1])
+        elif data.startswith("ref:copy:"):
+            await self._cmd_ref_copy(chat, data.split(":", 2)[1])
+        elif data == "cmd:invite":
+            await self._cmd_invite(chat)
         elif data == "zarinpal:guide":
             await self._cmd_zarinpal_guide(chat)
         elif data == "payments:history":
@@ -519,7 +538,7 @@ class BotService:
     # -------------------------------------------------------------- commands
     async def handle_command(self, chat_id: str, command: str, rest: str = "") -> None:
         if command in {"/start", "/menu"}:
-            await self._cmd_start(chat_id)
+            await self._cmd_start(chat_id, rest)
         elif command == "/help":
             await self.send(chat_id, HELP_TEXT)
         elif command == "/setup":
@@ -569,6 +588,8 @@ class BotService:
                 await self._consume_answer(chat_id, "/skip")
             else:
                 await self.send(chat_id, "الان پرسشی در جریان نیست.")
+        elif command in {"/invite", "/referral", "/دعوت", "/باشگاه", "/affiliate"}:
+            await self._cmd_invite(chat_id)
         elif command in {"/plans", "/plan", "/subscription", "/اشتراک"}:
             await self._cmd_plans(chat_id)
         elif command in {"/account", "/اکانت", "/myplan"}:
@@ -576,8 +597,13 @@ class BotService:
         elif command == "/zarinpal":
             await self._cmd_zarinpal_guide(chat_id)
         elif command.startswith("/buy"):
-            plan = rest or "starter"
-            await self._cmd_buy(chat_id, plan)
+            _parts = (rest or "starter").strip().split()
+            _plan = _parts[0] if _parts else "starter"
+            _gw = _parts[1] if len(_parts) > 1 else None
+            if _gw:
+                await self._cmd_buy(chat_id, _plan, gateway=_gw)
+            else:
+                await self._cmd_buy(chat_id, _plan)
         elif command == "/cancel":
             if self._flows.pop(chat_id, None):
                 await self.send(chat_id, "لغو شد. هر وقت خواستی /setup یا /help.")
@@ -1569,6 +1595,11 @@ class BotService:
         self._flows.pop(chat_id, None)
         if flow.mark_complete:
             mark_setup_complete(self.store, complete=not missing_steps(self.store, include_recommended=False))
+            # referral qualification happens async
+            try:
+                await self._maybe_qualify_referral(chat_id)
+            except Exception:
+                pass
             await self.send(
                 chat_id,
                 "✅ تنظیمات ذخیره شد. از این به بعد همه‌چیز از همین تلگرام قابل تغییر است.\n\n"
@@ -1618,6 +1649,7 @@ class BotService:
         if flow.name == "market":
             # right after the account is entered: prove the login and offer «شروع فعالیت»
             await self.send(chat_id, "✅ حساب ذخیره شد.")
+            await self._maybe_qualify_referral(chat_id)
             await self._post_setup(chat_id)
             return
         await self.send(chat_id, "✅ ذخیره شد.\n\n" + status_text(self.store))
@@ -1645,6 +1677,159 @@ class BotService:
                 ]
             },
         )
+
+
+    # ── referral & start with deep link ──────────────────────────
+    def _bot_username(self) -> str:
+        for k in ("telegram.bot_username", "telegram.username", "bot.username"):
+            v = self.store.get(k)
+            if v:
+                return str(v).lstrip("@")
+        return "BidPilotBot"
+
+    async def _handle_referral_start(self, chat_id: str, rest: str) -> bool:
+        rest = (rest or "").strip()
+        if not rest.lower().startswith("ref_"):
+            return False
+        code = rest[4:].strip().upper()
+        if not code:
+            return False
+        try:
+            from .db import Database
+            from .subscriptions.referrals import ReferralManager
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                rm = ReferralManager(s, bot_username=self._bot_username())
+                ok = await rm.record_referral(chat_id, code)
+                await s.commit()
+                if ok:
+                    await self.send(chat_id, f"🎁 خوش آمدید! شما با لینک دوست وارد شدید — کد <code>{code}</code> ثبت شد.\nبا تکمیل اتصال بازار، دوست‌تان پاداش می‌گیرد و شما هم می‌توانید دوستان خود را دعوت کنید: /invite")
+                    # also ensure invitee has code
+                    async with db.session_factory() as s2:
+                        rm2 = ReferralManager(s2, bot_username=self._bot_username())
+                        await rm2.ensure_code(chat_id)
+                        await s2.commit()
+                    return True
+            await db.dispose()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("referral start failed: %s", exc)
+        return False
+
+    async def _maybe_qualify_referral(self, chat_id: str) -> None:
+        """Call after setup/market complete — if invitee finishes, inviter gets milestone."""
+        try:
+            from .db import Database
+            from .subscriptions.referrals import ReferralManager
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                rm = ReferralManager(s, bot_username=self._bot_username())
+                grants = await rm.mark_setup_complete(chat_id)
+                await s.commit()
+                # notify inviter if milestone hit (best-effort)
+                for g in grants:
+                    # we don't know inviter chat to push — log only; they will see on /invite
+                    pass
+            await db.dispose()
+        except Exception:
+            pass
+
+    async def _cmd_start(self, chat_id: str, rest: str = "") -> None:
+        # handle referral if present, then show main menu
+        if rest:
+            await self._handle_referral_start(chat_id, rest)
+        # ensure account exists so referral code is ready
+        await self._ensure_account(chat_id)
+        try:
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.referrals import ReferralManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=ZarinpalConfig(merchant_id=str(self.store.get("zarinpal.merchant_id") or "")))
+                user, plan = await mgr.effective_plan(chat_id)
+                title = plan.title if plan else None
+                rm = ReferralManager(s, bot_username=self._bot_username())
+                await rm.ensure_code(chat_id)
+                await s.commit()
+            await db.dispose()
+        except Exception:
+            title = None
+        from .bot_ui import main_menu_keyboard, main_menu_text
+
+        first = None
+        try:
+            first = str(self.store.get("profile.display_name") or "").split()[0]
+        except Exception:
+            pass
+        await self.send(chat_id, main_menu_text(first_name=first, plan_title=title), main_menu_keyboard())
+
+    async def _cmd_pick_gateway(self, chat_id: str, plan_id: str) -> None:
+        from .bot_ui import gateway_picker_keyboard, gateway_picker_text
+        from .subscriptions.plans import get_plan
+
+        plan = get_plan(plan_id)
+        if plan.is_free():
+            await self.send(chat_id, "پلن رایگان نیازی به پرداخت ندارد — همین حالا فعال است ✅")
+            return
+        await self.send(chat_id, gateway_picker_text(plan), gateway_picker_keyboard(plan.id))
+
+    async def _cmd_invite(self, chat_id: str) -> None:
+        try:
+            from .db import Database
+            from .subscriptions.referrals import ReferralManager, MILESTONES
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            db = Database(str(db_url))
+            await db.init()
+            bot_user = self._bot_username()
+            async with db.session_factory() as s:
+                rm = ReferralManager(s, bot_username=bot_user)
+                stats = await rm.stats(chat_id)
+                await s.commit()
+            await db.dispose()
+            from .bot_ui import referral_card, referral_keyboard
+
+            txt = referral_card(
+                code=stats["code"],
+                link=stats["link"],
+                bot_username=bot_user,
+                total_qualified=stats["total_qualified"],
+                pending=stats["pending"],
+                next_milestone=stats["next_milestone"],
+                recent=stats["recent"],
+                milestones=MILESTONES,
+            )
+            await self.send(chat_id, txt, referral_keyboard(stats["link"], stats["code"]))
+        except Exception as exc:
+            await self.send(chat_id, f"⚠️ خطا در نمایش دعوت: {exc}")
+
+    async def _cmd_ref_copy(self, chat_id: str, code: str) -> None:
+        try:
+            from .db import Database
+            from .subscriptions.referrals import ReferralManager
+
+            db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+            db = Database(str(db_url))
+            await db.init()
+            async with db.session_factory() as s:
+                rm = ReferralManager(s, bot_username=self._bot_username())
+                _, link = await rm.invite_link(chat_id)
+                await s.commit()
+            await db.dispose()
+            await self.send(chat_id, f"🔗 لینک دعوت شما:\n<code>{link}</code>\n\nروی لینک بزنید و نگه دارید تا کپی شود، یا از دکمه اشتراک استفاده کنید.", {"inline_keyboard": [[{"text": "📤 اشتراک در تلگرام", "url": f"https://t.me/share/url?url={link}"}]]})
+        except Exception as exc:
+            await self.send(chat_id, f"⚠️ {exc}")
 
     # ── Subscription & ZarinPal ────────────────────────────────────────
     async def _ensure_account(self, chat_id: str) -> None:
@@ -1682,14 +1867,21 @@ class BotService:
         plan = get_plan(plan_id)
         await self.send(chat_id, plan_detail_text(plan), plan_detail_keyboard(plan))
 
-    async def _cmd_buy(self, chat_id: str, plan_id: str) -> None:
+    async def _cmd_buy(self, chat_id: str, plan_id: str, gateway: str | None = None) -> None:
         from .subscriptions.plans import get_plan
 
         plan = get_plan(plan_id.strip().lower())
         if plan.is_free():
             await self.send(chat_id, "پلن رایگان فعال است — نیاز به پرداخت ندارد. ✅\nبرای سقف بالاتر یک پلن پولی بخرید: /plans")
             return
-        await self.send(chat_id, f"⏳ در حال ساخت لینک پرداخت زرین‌پال برای <b>{escape(plan.title)}</b> ({escape(plan.formatted_price)}) ...")
+        gw = (gateway or "zibal").lower()
+        # friendly label
+        try:
+            from .subscriptions.gateways import GATEWAYS_META as _GM
+            gname = _GM.get(gw, _GM["zarinpal"]).label_fa
+        except Exception:
+            gname = gw
+        await self.send(chat_id, f"⏳ در حال ساخت لینک پرداخت <b>{escape(gname)}</b> برای <b>{escape(plan.title)}</b> ({escape(plan.formatted_price)}) ...")
         try:
             from .db import Database
             from .subscriptions.manager import SubscriptionManager
@@ -1704,12 +1896,12 @@ class BotService:
             await db.init()
             async with db.session_factory() as s:
                 mgr = SubscriptionManager(s, zarinpal_config=cfg)
-                payment, url = await mgr.create_payment(chat_id, plan.id)
+                payment, url = await mgr.create_payment(chat_id, plan.id, gateway=gw)
                 await s.commit()
             await db.dispose()
             from .bot_ui import payment_created_text, payment_keyboard
 
-            await self.send(chat_id, payment_created_text(plan, url, payment.authority or ""), payment_keyboard(payment.authority or "", url))
+            await self.send(chat_id, payment_created_text(plan, url, payment.authority or "", gateway=gw), payment_keyboard(payment.authority or "", url, gateway=gw))
         except Exception as exc:
             log.exception("buy failed")
             await self.send(chat_id, f"❌ ساخت پرداخت ناموفق: {escape(str(exc))}\n\nراهنما: /zarinpal")
@@ -1738,6 +1930,18 @@ class BotService:
                 from .bot_ui import payment_verified_text
 
                 await self.send(chat_id, payment_verified_text(plan, payment.ref_id or "—", sub.expires_at if sub else None))
+                # referral bonus: if this user was invited, give inviter +7 days
+                try:
+                    from .subscriptions.referrals import ReferralManager
+
+                    rm2 = ReferralManager(s, bot_username=self._bot_username())
+                    bonus = await rm2.mark_purchase(chat_id, plan.id)
+                    await s.commit()
+                    if bonus:
+                        days = bonus[0].get("days", 7)
+                        await self.send(chat_id, f"🎁 پاداش دعوت برای معرف شما ثبت شد: +{days} روز")
+                except Exception:
+                    pass
                 await self._cmd_account(chat_id)
             await db.dispose()
         except Exception as exc:

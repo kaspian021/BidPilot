@@ -53,12 +53,14 @@
 ```bash
 git clone https://github.com/<username>/bidpilot.git && cd bidpilot
 python3 -m venv .venv && source .venv/bin/activate     # ویندوز: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[dev,browser]"
+python -m playwright install chromium  # بار اول: نصب مرورگر Chromium
 
 bidpilot setup     # توکن تلگرام، کلید هوش مصنوعی رایگان، حساب سایت، پروفایل (PDF/لینک)، لحن، درصد قیمت
 bidpilot bot       # کنترل کامل از تلگرام؛ با «🚀 شروع فعالیت» رصد هم از همان چت بالا می‌آید
 ```
 
+برای ارسال فرم‌های وابسته به JavaScript در پارس‌کدرز، وابستگی مرورگر و Chromium لازم است؛ راه‌اندازی بالا هر دو را نصب می‌کند. این گردش کار روی دکمه واقعی سایت کلیک می‌کند و اگر کپچا/محدودیت نمایش داده شود متوقف می‌شود.
 **هیچ فایل `.env` لازم نیست.** `bidpilot setup` فقط از خودت می‌پرسد و هر پاسخ را
 بلافاصله در `data/settings.json` ذخیره می‌کند (پوشه `0700`، فایل `0600`، در `.gitignore`).
 بعداً هر چیزی را می‌توانی از داخل تلگرام عوض کنی؛ لازم نیست سرور را دست بزنی.

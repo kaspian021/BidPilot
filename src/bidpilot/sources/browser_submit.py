@@ -175,7 +175,45 @@ async def submit_js_managed_form(
     action_clicked = False
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            try:
+                browser = await playwright.chromium.launch(headless=True)
+            except Exception as chromium_error:
+                # The Playwright CDN may be unavailable in some regions. If the
+                # managed Chromium build is missing, try a browser already installed
+                # on Windows/macOS/Linux before asking the user to download anything.
+                log.warning(
+                    "[BID][BROWSER-LAUNCH] source=%s id=%s channel=chromium error_type=%s",
+                    source_name,
+                    project_id,
+                    type(chromium_error).__name__,
+                )
+                browser = None
+                for channel in ("msedge", "chrome"):
+                    try:
+                        browser = await playwright.chromium.launch(channel=channel, headless=True)
+                        log.info(
+                            "[BID][BROWSER-LAUNCH] source=%s id=%s channel=%s outcome=launched",
+                            source_name,
+                            project_id,
+                            channel,
+                        )
+                        break
+                    except Exception as channel_error:
+                        log.info(
+                            "[BID][BROWSER-LAUNCH] source=%s id=%s channel=%s error_type=%s",
+                            source_name,
+                            project_id,
+                            channel,
+                            type(channel_error).__name__,
+                        )
+                if browser is None:
+                    return _failure(
+                        "مرورگر داخلی Playwright در دسترس نیست و اجرای Microsoft Edge یا Google Chrome "
+                        "نصب‌شده هم موفق نشد. یکی از این مرورگرها را نصب کن یا از شبکه‌ای استفاده کن "
+                        "که دانلود مرورگر Playwright در آن مجاز است. هیچ پیشنهادی ارسال نشده است.",
+                        pause_source=True,
+                        debug=safe_debug,
+                    )
             context_options: dict[str, Any] = {"locale": "fa-IR"}
             if user_agent.strip():
                 context_options["user_agent"] = user_agent.strip()

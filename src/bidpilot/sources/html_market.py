@@ -1042,10 +1042,80 @@ class HtmlMarketSource(Source):
         if delivery_days and "days" in mapping:
             payload[mapping["days"]] = str(delivery_days)
 
-        # JS-driven forms (like the real ParsCoders bid form) often have no
-        # action/method at all — the endpoint then hides in data-action /
-        # data-url, and only as a last resort is it the page URL itself.
+        # Some sites render a JS/AJAX bid form whose real endpoint is attached
+        # to the submit button (e.g. data-href), not to the <form>. Do not
+        # silently POST proposal data to the project URL in that situation:
+        # HTTP 200 from the project page is not evidence that a bid was saved.
         raw_action = str(form.get("action") or form.get("data-action") or form.get("data-url") or "")
+        if not raw_action:
+            submitter = form.select_one(
+                "button[data-href], input[data-href], button[data-url], input[data-url], "
+                "button[data-action], input[data-action]"
+            )
+            if submitter is not None:
+                endpoint_attr = next(
+                    (name for name in ("data-href", "data-url", "data-action") if submitter.get(name)),
+                    "",
+                )
+                submitter_action = str(submitter.get(endpoint_attr) or "").strip() if endpoint_attr else ""
+                if submitter_action:
+                    endpoint = urljoin(form_page_url, submitter_action)
+                    endpoint_path = urlsplit(endpoint).path
+                    form_id = str(form.get("id") or "")
+                    form_name = str(form.get("name") or "")
+                    submitter_id = str(submitter.get("id") or "")
+                    field_names = sorted(str(name) for name in payload)
+                    message = (
+                        "فرم ارسال پیشنهاد action معمولی ندارد و مسیر ارسال روی دکمه‌ی submit "
+                        "به‌صورت data-href/data-url/data-action تعریف شده است؛ این نشانه‌ی فرم "
+                        "وابسته به JavaScript/AJAX است. برای جلوگیری از ارسال اشتباه، BidPilot "
+                        "درخواست POST به URL صفحه پروژه نفرستاد. ثبت پیشنهاد انجام نشده است؛ "
+                        "این فرم باید با گردش کار مرورگریِ مجاز و مطابق قوانین سایت بررسی شود."
+                    )
+                    log.warning(
+                        "[BID][JS-AJAX-FORM-DETECTED] source=%s id=%s form_id=%r form_name=%r "
+                        "form_action_present=False form_method_attr=%r submitter_id=%r "
+                        "submitter_tag=%s endpoint_attribute=%s endpoint_path=%s fields=%r "
+                        "has_csrf_field=%s has_key_field=%s decision=abort_without_request",
+                        self.name,
+                        project.external_id,
+                        form_id,
+                        form_name,
+                        str(form.get("method") or ""),
+                        submitter_id,
+                        submitter.name,
+                        endpoint_attr,
+                        endpoint_path,
+                        field_names,
+                        any(name.casefold() in {"_token", "_csrf", "csrf_token"} for name in field_names),
+                        any(name.casefold() == "key" for name in field_names),
+                    )
+                    log.error(
+                        "[BID][SUBMIT-ABORT] source=%s id=%s reason=js_managed_form_no_native_action "
+                        "page_path=%s submitter_endpoint_path=%s no_request_sent=true",
+                        self.name,
+                        project.external_id,
+                        urlsplit(form_page_url).path,
+                        endpoint_path,
+                    )
+                    return SubmissionResult(
+                        status=SubmissionStatus.FAILED,
+                        message=message,
+                        http_status=page.status_code,
+                        payload_debug={
+                            "action_source": "submitter_data_attribute",
+                            "endpoint_path": endpoint_path,
+                            "form_id": form_id,
+                            "submitter_id": submitter_id,
+                            "fields": field_names,
+                            "request_sent": False,
+                        },
+                        javascript_required=True,
+                    )
+
+        # For native HTML forms, an explicit form action is preferred. Keep the
+        # legacy current-page fallback only when the page has no JS submitter
+        # endpoint; the diagnostic above catches the known AJAX shape safely.
         action_source = "action" if form.get("action") else ("data-attr" if raw_action else "page-url")
         action = urljoin(form_page_url, raw_action or form_page_url)
         method = (form.get("method") or "post").upper()

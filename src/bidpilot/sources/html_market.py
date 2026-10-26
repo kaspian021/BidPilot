@@ -34,8 +34,8 @@ from ..credentials import SiteCredentials, site_credentials
 from ..llm_providers import build_client, resolve_chain
 from ..models import Project, Proposal, SubmissionResult, SubmissionStatus
 from . import html_parser as parser
-from .browser_submit import submit_js_managed_form
 from .base import AuthenticationRequiredError, JavaScriptRequiredError, Source, SourceError
+from .browser_submit import submit_js_managed_form
 from .discovery import (
     MAX_DETAIL_PAGES,
     MAX_PROJECTS,

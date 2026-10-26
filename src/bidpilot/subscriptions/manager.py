@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import PaymentRow, SubscriptionRecord, UserAccountRow, utcnow
 from .plans import PLANS, Plan, all_plans, get_plan
-from .zarinpal import PaymentRequest, ZarinpalClient, ZarinpalConfig
+from .gateways import PaymentRequest as GatewayPaymentRequest, get_gateway
+from .zarinpal import PaymentRequest, ZarinpalClient, ZarinpalConfig  # keep alias for compat
 
 log = logging.getLogger(__name__)
 
@@ -34,13 +35,29 @@ class SubscriptionManager:
                 row.telegram_username = username
             if first_name and row.telegram_first_name != first_name:
                 row.telegram_first_name = first_name
+            # backfill referral_code for old rows
+            if not getattr(row, "referral_code", None):
+                try:
+                    from .referrals import generate_referral_code
+
+                    row.referral_code = generate_referral_code(cid)
+                except Exception:
+                    pass
             await self.session.flush()
             return row
+        # new user — generate referral_code immediately
+        try:
+            from .referrals import generate_referral_code
+
+            code = generate_referral_code(cid)
+        except Exception:
+            code = None
         row = UserAccountRow(
             telegram_chat_id=cid,
             telegram_username=username,
             telegram_first_name=first_name,
             plan_id="free",
+            referral_code=code,  # type: ignore[call-arg]
         )
         self.session.add(row)
         await self.session.flush()
@@ -77,33 +94,55 @@ class SubscriptionManager:
 
     # ---- plans / purchase ----
 
-    async def create_payment(self, chat_id: str | int, plan_id: str, *, mobile: str | None = None, email: str | None = None) -> tuple[PaymentRow, str]:
+    async def create_payment(self, chat_id: str | int, plan_id: str, *, mobile: str | None = None, email: str | None = None, gateway: str = "zibal") -> tuple[PaymentRow, str]:
         plan = get_plan(plan_id)
         if plan.is_free():
             raise ValueError("پلن رایگان نیاز به پرداخت ندارد")
         user = await self.get_or_create_user(chat_id)
-        # create payment row first for order_id
         payment = PaymentRow(
             user_chat_id=str(chat_id),
             plan_id=plan.id,
             amount_toman=plan.price_toman,
             status="created",
+            gateway=gateway,
         )
         self.session.add(payment)
         await self.session.flush()
 
-        client = ZarinpalClient(self.zarinpal_config)
-        # callback is not a public URL — we use manual verify; still required by API
+        # Resolve merchant for chosen gateway from store-backed config
+        gateway_id = (gateway or "zibal").lower()
+        # Try gateway-specific merchant, fallback to legacy zarinpal merchant
+        merchant = ""
+        sandbox = bool(self.zarinpal_config.sandbox)
         callback = self.zarinpal_config.callback_url or "https://bidpilot.local/payment/verify"
-        req = PaymentRequest(
+        # Attempt to read from a pseudo-settings if manager was given SettingsStore-backed config?
+        # If manager has .settings dict, use it
+        if hasattr(self, "settings") and isinstance(self.settings, dict):
+            from .gateways import gateway_config_from_settings
+
+            mid, sb, cb = gateway_config_from_settings(self.settings, gateway_id)
+            if mid:
+                merchant = mid
+                sandbox = sb
+                if cb:
+                    callback = cb
+            else:
+                merchant = self.zarinpal_config.merchant_id
+        else:
+            merchant = self.zarinpal_config.merchant_id
+
+        from .gateways import get_gateway as _get_gw
+
+        gw = _get_gw(gateway_id, merchant_id=merchant, sandbox=sandbox, callback_url=callback)
+        req = GatewayPaymentRequest(
             amount_toman=plan.price_toman,
-            description=f"{client.config.description_prefix} - {plan.title} ({plan.period_days} روز)",
+            description=f"BidPilot - {plan.title} ({plan.period_days} روز)",
             callback_url=callback,
             mobile=mobile,
             email=email,
             order_id=f"bidpilot-{payment.id}-{chat_id}",
         )
-        result = await client.create_payment(req)
+        result = await gw.create(req)
         if not result.ok:
             payment.status = "failed"
             payment.zarinpal_response = json.dumps({"error": result.message, "code": result.code}, ensure_ascii=False)
@@ -126,8 +165,21 @@ class SubscriptionManager:
             sub = (await self.session.execute(sub_stmt)).scalars().first()
             return payment, sub
 
-        client = ZarinpalClient(self.zarinpal_config)
-        verify = await client.verify_payment(authority, payment.amount_toman)
+        # Verify via same gateway that created payment
+        gateway_id = getattr(payment, "gateway", None) or "zarinpal"
+        merchant = self.zarinpal_config.merchant_id
+        sandbox = bool(self.zarinpal_config.sandbox)
+        if hasattr(self, "settings") and isinstance(self.settings, dict):
+            from .gateways import gateway_config_from_settings
+
+            mid, sb, _ = gateway_config_from_settings(self.settings, gateway_id)
+            if mid:
+                merchant = mid
+                sandbox = sb
+        from .gateways import get_gateway as _get_gw2
+
+        client = _get_gw2(gateway_id, merchant_id=merchant, sandbox=sandbox)
+        verify = await client.verify(authority, payment.amount_toman)
         if not verify.ok:
             payment.status = "failed"
             payment.zarinpal_response = json.dumps({"verify_code": verify.code, "message": verify.message}, ensure_ascii=False)

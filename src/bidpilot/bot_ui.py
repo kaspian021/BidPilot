@@ -84,6 +84,7 @@ def main_menu_keyboard(is_live: bool = False) -> dict:
             [{"text": "👤  پروفایل", "callback_data": "cmd:profile"}, {"text": "🎭  لحن و سبک", "callback_data": "cmd:style"}],
             [{"text": "🌐  سایت‌های فریلنسری", "callback_data": "cmd:sites"}, {"text": "🧹  فیلترها", "callback_data": "cmd:filters"}],
             [{"text": "💳  پلن‌ها و اشتراک", "callback_data": "cmd:plans"}, {"text": "⚙️  تنظیمات", "callback_data": "cmd:settings"}],
+            [{"text": "🎁  دعوت دوستان — رایگان ارتقا بگیر", "callback_data": "cmd:invite"}],
             [{"text": "ℹ️  راهنما", "callback_data": "cmd:help"}, {"text": "⏸  توقف", "callback_data": "run:stop"}],
         ]
     }
@@ -152,14 +153,46 @@ def plan_detail_text(plan: Plan) -> str:
 
 def plan_detail_keyboard(plan: Plan) -> dict:
     if plan.is_free():
-        return {"inline_keyboard": [[{"text": "✅ فعال است (رایگان)", "callback_data": "cmd:plans"}], [{"text": "↩️ بازگشت", "callback_data": "cmd:plans"}]]}
+        return {"inline_keyboard": [[{"text": "✅ فعال است (رایگان)", "callback_data": "cmd:plans"}], [{"text": "🎁 دعوت دوستان → ارتقای رایگان", "callback_data": "cmd:invite"}], [{"text": "↩️ بازگشت", "callback_data": "cmd:plans"}]]}
     return {
         "inline_keyboard": [
-            [{"text": f"💳 پرداخت {plan.formatted_price} با زرین‌پال", "callback_data": f"buy:{plan.id}"}],
+            [{"text": f"💳 پرداخت {plan.formatted_price} — انتخاب درگاه", "callback_data": f"pay_pick:{plan.id}"}],
+            [{"text": "🎁 یا با دعوت دوستان رایگان بگیر", "callback_data": "cmd:invite"}],
             [{"text": "📊 مقایسه پلن‌ها", "callback_data": "plans:compare"}],
             [{"text": "↩️ بازگشت", "callback_data": "cmd:plans"}],
         ]
     }
+
+
+def gateway_picker_text(plan: Plan) -> str:
+    from .subscriptions.gateways import GATEWAYS_META, GATEWAY_ORDER
+
+    lines = [
+        f"<b>💳 پرداخت {esc(plan.title)} — {esc(plan.formatted_price)}</b>",
+        f"<i>{plan.period_days} روزه · {esc(plan.price_per_day)}</i>",
+        hr(),
+        "یک درگاه را انتخاب کنید — هر ۴ شاپرک، احراز <b>سبک</b> (فقط موبایل + شبا). اگر هنوز حساب ندارید نگران نباشید: بدون کلید هم پرداخت <i>شبیه‌سازی</i> می‌شود تا تست کنید.",
+        "",
+    ]
+    for gid in GATEWAY_ORDER:
+        m = GATEWAYS_META[gid]
+        lines.append(f"{m.logo_emoji} <b>{esc(m.label_fa)}</b> ({esc(m.label)}) — <i>{esc(m.kyc_level)}</i>")
+        lines.append(f"   {esc(m.description)} · {esc(m.website)}")
+    lines.append("")
+    lines.append(f"<i>توصیه ما برای شروع سریع: <b>زیبال</b> — کمترین احراز، فعال‌سازی زیر ۲ ساعت.</i>")
+    lines.append(f"{hr()}\n<i>{FOOTER}</i>")
+    return "\n".join(lines)
+
+
+def gateway_picker_keyboard(plan_id: str) -> dict:
+    from .subscriptions.gateways import GATEWAYS_META, GATEWAY_ORDER
+
+    rows = []
+    for gid in GATEWAY_ORDER:
+        m = GATEWAYS_META[gid]
+        rows.append([{"text": f"{m.logo_emoji} {m.label_fa} — {m.kyc_level.split('—')[0].strip()}", "callback_data": f"buy:{plan_id}:{gid}"}])
+    rows.append([{"text": "↩️ بازگشت", "callback_data": f"plan:{plan_id}"}])
+    return {"inline_keyboard": rows}
 
 def compare_table_text() -> str:
     lines = [f"<b>📊 مقایسه پلن‌ها</b>", hr(), ""]
@@ -181,23 +214,100 @@ def compare_table_text() -> str:
     return "\n".join(lines)
 
 # ── payment ──────────────────────────────────────────────────────
-def payment_created_text(plan: Plan, payment_url: str, authority: str) -> str:
+def payment_created_text(plan: Plan, payment_url: str, authority: str, gateway: str = "zarinpal") -> str:
+    from .subscriptions.gateways import GATEWAYS_META
+
+    g = GATEWAYS_META.get(gateway, GATEWAYS_META["zarinpal"])
     return (
         f"<b>💳 پرداخت {esc(plan.title)} — {esc(plan.formatted_price)}</b>\n"
         f"{hr()}\n"
-        f"لینک امن زرین‌پال برای شما ساخته شد. روی دکمه زیر بزنید، پرداخت را کامل کنید و سپس <b>بررسی پرداخت</b> را بزنید.\n\n"
+        f"لینک امن <b>{esc(g.label_fa)}</b> برای شما ساخته شد. پرداخت را کامل کنید سپس <b>بررسی پرداخت</b> بزنید.\n\n"
         f"🔗 <a href=\"{payment_url}\">{payment_url}</a>\n"
-        f"کد پیگیری: <code>{esc(authority)}</code>\n\n"
-        f"<i>نکته: اگر درگاه زرین‌پال هنوز فعال نکرده‌اید، راهنما را ببینید — بدون مرچنت‌کد، پرداخت شبیه‌سازی می‌شود.</i>"
+        f"کد پیگیری: <code>{esc(authority)}</code>\n"
+        f"درگاه: {g.logo_emoji} {esc(g.label_fa)} ({esc(g.kyc_level)})\n\n"
+        f"<i>بدون کلید درگاه؟ نگران نباشید — پرداخت شبیه‌سازی می‌شود تا UX را تست کنید.</i>"
     )
 
-def payment_keyboard(authority: str, payment_url: str) -> dict:
+
+def payment_keyboard(authority: str, payment_url: str, gateway: str = "zarinpal") -> dict:
+    from .subscriptions.gateways import GATEWAYS_META
+
+    g = GATEWAYS_META.get(gateway, GATEWAYS_META["zarinpal"])
     return {
         "inline_keyboard": [
-            [{"text": "🔗 رفتن به درگاه زرین‌پال", "url": payment_url}],
+            [{"text": f"🔗 رفتن به درگاه {g.label_fa}", "url": payment_url}],
             [{"text": "✅ بررسی پرداخت", "callback_data": f"verify:{authority}"}],
             [{"text": "📖 راهنمای زرین‌پال", "callback_data": "zarinpal:guide"}],
             [{"text": "↩️ بازگشت به پلن‌ها", "callback_data": "cmd:plans"}],
+        ]
+    }
+
+
+# ── referral ─────────────────────────────────────────────────────
+def referral_card(
+    code: str,
+    link: str,
+    bot_username: str,
+    total_qualified: int,
+    pending: int,
+    next_milestone: dict | None,
+    recent: list,
+    milestones: list[dict] | None = None,
+) -> str:
+    from .subscriptions.referrals import MILESTONES as _MS
+
+    ms = milestones or _MS
+    lines = [
+        f"<b>🎁 باشگاه دعوت — ارتقای رایگان</b>",
+        f"<i>لینک شخصی خود را بفرستید و بدون خرید، پلن بگیرید</i>",
+        hr(),
+        f"🔗 لینک دعوت شما:",
+        f"<code>{esc(link)}</code>",
+        f"کد: <code>{esc(code)}</code>  ·  ربات: @{esc(bot_username or 'BidPilotBot')}",
+        "",
+        f"👥 دعوت‌های موفق: <b>{total_qualified}</b>  ·  در انتظار تکمیل: {pending}",
+    ]
+    if next_milestone:
+        need = next_milestone["count"] - total_qualified
+        bar = progress_bar(total_qualified, next_milestone["count"])
+        lines.append(f"🎯 بعدی: {next_milestone['emoji']} <b>{esc(next_milestone['title'])}</b> — {need} نفر دیگر")
+        lines.append(f"   {bar}  {total_qualified}/{next_milestone['count']}")
+    else:
+        if total_qualified >= (ms[-1]["count"] if ms else 20):
+            lines.append("👑 تمام مایل‌استون‌ها کامل شد — هر خرید دوست = +۷ روز!")
+        else:
+            lines.append(progress_bar(total_qualified, ms[-1]["count"]) + f"  {total_qualified}/{ms[-1]['count']}")
+    lines.append("")
+    lines.append("<b>سطح‌ها</b>")
+    for m in ms:
+        done = "✅" if total_qualified >= m["count"] else "⬜"
+        lines.append(f"{done} {m['emoji']} {m['count']} نفر → {esc(m['title'])}")
+    lines.append(f"{hr()}")
+    lines.append("💡 <b>هر دوستی که با لینک شما بیاید و اتصال بازار را کامل کند</b> حساب می‌شود. اگر دوست‌تان پلن بخرد، شما +۷ روز از همان پلن هدیه می‌گیرید.")
+    if recent:
+        lines.append("")
+        lines.append("<b>۵ دعوت اخیر</b>")
+        for r in recent[:5]:
+            st_icon = {"pending": "⏳", "qualified": "✅", "purchased": "💎"}.get(getattr(r, "status", ""), "•")
+            uname = esc(getattr(r, "invitee_username", "") or getattr(r, "invitee_chat_id", "") or "")
+            lines.append(f"{st_icon} {uname} — {esc(getattr(r, 'status', ''))}")
+    lines.append("")
+    lines.append(f"<i>{FOOTER}</i>")
+    return "\n".join(lines)
+
+
+def referral_keyboard(link: str, code: str) -> dict:
+    import urllib.parse
+
+    share_text = urllib.parse.quote(f"با BidPilot پیشنهادهای فریلنسری رو خودکار بفرست — من دارم استفاده می‌کنم! 🚀\n{link}")
+    tg_share = f"https://t.me/share/url?url={urllib.parse.quote(link)}&text={share_text}"
+    return {
+        "inline_keyboard": [
+            [{"text": "📤 اشتراک در تلگرام", "url": tg_share}],
+            [{"text": "📋 کپی لینک (بزنید و نگه دارید)", "callback_data": f"ref:copy:{code}"}],
+            [{"text": "🔄 بروزرسانی آمار", "callback_data": "cmd:invite"}],
+            [{"text": "💳 مشاهده پلن‌ها", "callback_data": "cmd:plans"}],
+            [{"text": "↩️ منو", "callback_data": "cmd:home"}],
         ]
     }
 

@@ -580,11 +580,12 @@ class BidPipeline:
                 (time.monotonic() - started) * 1000,
             )
 
+        is_timeout = "تایم‌اوت" in (result.message or "") or "پاسخ مسیر ثبت پیشنهاد دریافت نشد" in (result.message or "") or "پس از کلیک، پاسخ" in (result.message or "") or "پاسخی نفرستاد" in (result.message or "")
         await self.notifiers.dispatch(
             Event(
                 kind=EventKind.BID_SUBMITTED
                 if result.status == SubmissionStatus.SUBMITTED
-                else EventKind.ERROR,
+                else (EventKind.BID_SKIPPED if is_timeout else EventKind.ERROR),
                 title=project.title,
                 project=project,
                 bid=plan,

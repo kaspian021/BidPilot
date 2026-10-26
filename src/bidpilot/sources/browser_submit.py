@@ -681,7 +681,7 @@ async def _submit_once(
                         and _origin(response.url) == _origin(base_url)
                         and urlsplit(response.url).path.rstrip("/") == expected_path
                     ),
-                    timeout=18_000,
+                    timeout=30_000,
                 ) as response_info:
                     # From this point a timeout may be ambiguous: even if the
                     # click call raises, avoid claiming that no submit happened.
@@ -690,20 +690,45 @@ async def _submit_once(
                 response = await response_info.value
             except PlaywrightTimeoutError:
                 safe_debug["request_sent"] = "unknown"
-                # This is an ambiguous network timeout — not evidence of a
-                # JavaScript interstitial. Do NOT pause the scheduler; the bid
-                # may have actually succeeded (as proven in production: the
-                # next cycle showed already_submitted).
+                # Ambiguous network timeout — not a JS interstitial. The site often
+                # still records the bid and only the XHR response is lost (seen for
+                # 621342/621322). Check the page's own success indicator before
+                # declaring failure; if it flipped to "پیشنهاد ثبت شد" we treat
+                # the bid as confirmed.
                 log.warning(
                     "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_no_response clicked=true",
                     source_name,
                     project_id,
                 )
+                try:
+                    await page.wait_for_function(
+                        "(initial) => { const el = document.querySelector('#bid_status_custom'); "
+                        "const txt = (el?.textContent || '').trim(); "
+                        "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(txt) && txt !== initial; }",
+                        arg=initial_bid_status,
+                        timeout=4_000,
+                    )
+                    status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
+                    log.info(
+                        "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_but_ui_confirmed status_text=%r",
+                        source_name,
+                        project_id,
+                        status_text,
+                    )
+                    return SubmissionResult(
+                        status=SubmissionStatus.SUBMITTED,
+                        message=f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد (پس از تایم‌اوت): {status_text}",
+                        http_status=200,
+                        payload_debug=safe_debug,
+                    )
+                except Exception:
+                    pass
                 return SubmissionResult(
                     status=SubmissionStatus.FAILED,
                     message=(
-                        "پس از کلیک، پاسخ مسیر ثبت پیشنهاد دریافت نشد؛ ممکن است سایت درخواست را گرفته باشد. "
-                        "برای جلوگیری از پیشنهاد تکراری، وضعیت پروژه را دستی بررسی کن و فعلاً دوباره تلاش نکن."
+                        "سایت پس از کلیک پاسخی نفرستاد (تایم‌اوت شبکه). ممکن است پیشنهاد ثبت شده باشد — "
+                        "صفحهٔ پروژه را دستی باز کن و اگر «پیشنهاد ثبت شد» دیدی، دوباره ارسال نکن. "
+                        "این چرخه به‌عنوان خطای موقتی ثبت شد و دور بعد خودکار دوباره وضعیت را می‌سنجد."
                     ),
                     payload_debug=safe_debug,
                     javascript_required=False,

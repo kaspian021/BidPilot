@@ -122,7 +122,7 @@ def _require_chromium():
 async def test_opens_offcanvas_fills_like_a_human_and_submits(site, tmp_path):
     _require_chromium()
     result = await submit_js_managed_form(**_args(site, tmp_path))
-    if "Playwright" in result.message and "نصب نیست" in result.message:
+    if "Playwright" in result.message and ("نصب نیست" in result.message or "دسترس نیست" in result.message or "در دسترس نیست" in result.message):
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.SUBMITTED, result.message
     assert len(RECEIVED) == 1
@@ -142,7 +142,7 @@ async def test_field_failure_never_clicks_and_saves_debug(site, tmp_path):
             field_mapping={"amount": "bidAmount", "days": "initEscrowPercent", "description": "message"},
         )
     )
-    if "نصب نیست" in result.message:
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message or "در دسترس نیست" in result.message:
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.FAILED
     assert RECEIVED == []

@@ -77,17 +77,37 @@ class MidpointRoundStrategy(PricingStrategy):
 
         low = budget.lower or 0
         high = budget.upper or low
-        raw = low + (high - low) * self.ratio if high > low else float(high)
+        if high > low:
+            raw = low + (high - low) * self.ratio
+            rounded = nice_round(raw, self.min_step)
+            if self.round_down_only:
+                rounded = max(int(raw // self.min_step * self.min_step), low)
+            amount = budget.clamp(rounded)
+            note = "وسط بازه" if 0.2 < self.ratio < 0.8 else f"نسبت {self.ratio:.2f} بازه"
+            return PricingResult(
+                amount=amount,
+                within_range=budget.lower is not None and budget.lower <= amount <= (budget.upper or amount),
+                rationale=f"{note} کارفرما ({budget.as_text()}) با رند کردن به {amount:,} تومان.",
+                strategy=self.name,
+            )
+        # Fixed budget (کارفرما یک عدد ثابت گفته، نه بازه) — ratio اینجا یعنی درصد تخفیف
+        # مثلاً ۵ میلیون با ۵۰٪ → ۲.۵ میلیون؛ ۵۰۰ هزار با ۵۰٪ → ۲۵۰ هزار
+        raw = float(high) * self.ratio
         rounded = nice_round(raw, self.min_step)
         if self.round_down_only:
-            rounded = max(int(raw // self.min_step * self.min_step), low)
-        amount = budget.clamp(rounded)
-
-        note = "وسط بازه" if 0.2 < self.ratio < 0.8 else f"نسبت {self.ratio:.2f} بازه"
+            rounded = int(raw // self.min_step * self.min_step)
+        # فقط سقف را رعایت می‌کنیم (زیر کف مجاز است چون کاربر عمداً تخفیف داده)
+        amount = min(rounded, high) if high else rounded
+        # کف حداقلی انسانی برای جلوگیری از پیشنهادهای خیلی ارزان (مثلاً ۵۰ هزار)
+        min_floor = 100_000 if high >= 500_000 else max(20_000, int(high * 0.1))
+        if amount < min_floor:
+            amount = min_floor
+        within = amount <= high  # پایین‌تر از بودجه کارفرما همیشه قابل قبول است
+        percent = int(round(self.ratio * 100))
         return PricingResult(
             amount=amount,
-            within_range=budget.lower is not None and budget.lower <= amount <= (budget.upper or amount),
-            rationale=f"{note} کارفرما ({budget.as_text()}) با رند کردن به {amount:,} تومان.",
+            within_range=within,
+            rationale=f"{percent}٪ بودجه کارفرما ({budget.as_text()}) با رند کردن به {amount:,} تومان.",
             strategy=self.name,
         )
 

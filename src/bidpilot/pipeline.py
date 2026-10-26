@@ -122,6 +122,7 @@ class BidPipeline:
         *,
         live: bool | None = None,
         max_projects: int | None = None,
+        user_chat_id: str | None = None,
     ) -> None:
         self.config = config
         self.repo = repo
@@ -138,6 +139,13 @@ class BidPipeline:
         self.live = config.runtime.live if live is None else live
         self.max_projects = max_projects or config.runtime.max_projects_per_poll
         self.delivery_days = int(config.pricing.get("delivery_days", 14))
+        self.user_chat_id = str(user_chat_id) if user_chat_id else None
+        # Ensure limiter is scoped to the same user
+        if self.user_chat_id and getattr(self.rate_limiter, "user_chat_id", None) != self.user_chat_id:
+            try:
+                self.rate_limiter = self.rate_limiter.for_user(self.user_chat_id)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ runs
     async def run_once(self, source_names: list[str] | None = None) -> list[RunReport]:
@@ -568,7 +576,7 @@ class BidPipeline:
             project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
             if project_row is None:
                 project_row = await self.repo.save_project(project)
-            await self.repo.save_bid(project_row.id, plan)
+            await self.repo.save_bid(project_row.id, plan, user_chat_id=self.user_chat_id)
             report.submitted += 1
         else:
             # Failed attempts stay in logs/reports only; persist accepted bids only.

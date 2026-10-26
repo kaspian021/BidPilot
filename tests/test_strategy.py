@@ -45,7 +45,21 @@ def test_fixed_strategy_is_clamped():
 def test_single_value_budget():
     budget = Budget(min=750_000, max=750_000)
     result = build_strategy("aggressive_low").price(make_project(budget), budget)
-    assert result is not None and result.amount == 750_000
+    # Fixed budget → ratio acts as discount (aggressive_low = 15% of fixed)
+    assert result is not None and result.amount == 110_000
+    assert result.amount <= budget.max  # bidding below client's fixed budget is allowed
+
+
+def test_single_value_budget_half_discount():
+    budget = Budget(min=5_000_000, max=5_000_000)
+    result = build_strategy("midpoint_round", ratio=0.5).price(make_project(budget), budget)
+    assert result is not None and result.amount == 2_500_000
+
+
+def test_single_value_budget_full_price():
+    budget = Budget(min=500_000, max=500_000)
+    result = build_strategy("midpoint_round", ratio=1.0).price(make_project(budget), budget)
+    assert result is not None and result.amount == 500_000
 
 
 def test_nice_round():

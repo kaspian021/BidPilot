@@ -96,20 +96,25 @@ class Application:
         *,
         live: bool | None = None,
         max_projects: int | None = None,
+        user_chat_id: str | None = None,
+        subscription_manager=None,
     ) -> list[RunReport]:
         """One poll cycle with a fresh DB session (safe for long-running daemons)."""
         session = self.db.session()
         repo = Repository(session)
+        # Per-user rate limits: if we know who triggered /run, enforce their plan
+        base_limiter = RateLimiter(self.config.runtime, repo, user_chat_id=user_chat_id, subscription_manager=subscription_manager)
         pipeline = BidPipeline(
             config=self.config,
             repo=repo,
             generator=self.generator,  # type: ignore[arg-type]
             notifiers=self.notifiers,  # type: ignore[arg-type]
-            rate_limiter=RateLimiter(self.config.runtime, repo),
+            rate_limiter=base_limiter,
             sources=self.sources,
             pricing=PricingConfig(**self.config.pricing).build(),
             live=live,
             max_projects=max_projects,
+            user_chat_id=user_chat_id,
         )
         try:
             reports = await pipeline.run_once(source_names)

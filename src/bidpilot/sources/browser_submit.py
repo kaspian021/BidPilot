@@ -326,6 +326,12 @@ async def submit_js_managed_form(
                     debug=safe_debug,
                 )
 
+            initial_status_locator = page.locator("#bid_status_custom").first
+            initial_bid_status = (
+                (await initial_status_locator.inner_text()).strip()
+                if await initial_status_locator.count()
+                else ""
+            )
             expected_path = endpoint_parts.path.rstrip("/")
             try:
                 # Listen first, then perform one real click. Never replay the
@@ -359,23 +365,15 @@ async def submit_js_managed_form(
                 # treating an arbitrary HTTP 200 as a submitted proposal.
                 try:
                     await page.wait_for_function(
-                        "() => ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes("
-                        "(document.querySelector('#bid_status_custom')?.textContent || '').trim())",
+                        "(initial) => { const text = (document.querySelector('#bid_status_custom')?.textContent || '').trim(); "
+                        "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(text) && text !== initial; }",
+                        arg=initial_bid_status,
                         timeout=3_000,
                     )
                     status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
                     ok = True
                     message = f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد: {status_text}"
                 except PlaywrightTimeoutError:
-                    pass
-            if not ok:
-                # Some responses confirm success only through a visible site alert.
-                try:
-                    page_html = await page.content()
-                    ui_ok, ui_message = html_parser.detect_success(200, page_html, bid_cfg)
-                    if ui_ok:
-                        ok, message = True, ui_message
-                except Exception:
                     pass
 
             if not ok:

@@ -198,7 +198,7 @@ def test_template_bid_is_always_valid_even_with_a_tiny_max_chars(max_chars):
     assert "۱,۰۰۰,۰۰۰ تومان" in proposal.text
     assert "تومان" in proposal.text
     assert "با احترام" in proposal.text
-    assert len(proposal.text) <= max(700, max_chars)
+    assert len(proposal.text) <= max(900, max_chars)
     assert validate_proposal(proposal.text, generator.settings, 1_000_000).ok
 
 

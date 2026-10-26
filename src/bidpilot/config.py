@@ -117,7 +117,7 @@ class FiltersConfig(BaseModel):
 
 
 #: greeting + price/delivery sentence + signature do not fit below this
-PROPOSAL_MIN_MAX_CHARS = 700
+PROPOSAL_MIN_MAX_CHARS = 900
 
 
 class ProposalConfig(BaseModel):

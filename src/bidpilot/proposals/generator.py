@@ -259,6 +259,24 @@ class ProposalGenerator:
                 raise ProposalError(
                     "مدل زبانی از همکاری روی این پروژه خودداری کرد (refusal)؛ پروژه رد می‌شود."
                 )
+            # Auto-trim if only problem is length (saves a repair-pass roundtrip and TPM)
+            if len(text.strip()) > self.settings.max_chars:
+                trimmed = text.strip()
+                limit = int(self.settings.max_chars)
+                if len(trimmed) > limit:
+                    cut = trimmed[:limit]
+                    for sep in ("\n\n", "\n", "۔", ".", "!", "؟", "?"):
+                        idx = cut.rfind(sep)
+                        if idx > limit * 0.6:
+                            trimmed = cut[: idx + len(sep)].strip()
+                            break
+                    else:
+                        trimmed = cut.rstrip()
+                    if len(trimmed) >= self.settings.min_chars:
+                        text = trimmed
+                        report_trimmed = validate_proposal(text, self.settings, amount)
+                        if not any("خیلی بلند" in i for i in report_trimmed.issues):
+                            pass
             report = validate_proposal(text, self.settings, amount)
             if not report.ok:
                 log.info(

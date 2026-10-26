@@ -120,6 +120,35 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # ── Lightweight migrations for existing DBs (old installs) ──
+            # SQLite has no IF NOT EXISTS for ADD COLUMN constraints in old versions,
+            # so we do manual PRAGMA checks.
+            from sqlalchemy import text as sa_text
+
+            try:
+                # Ensure referral columns exist on user_accounts (added in v0.9.1)
+                result = await conn.execute(sa_text("PRAGMA table_info(user_accounts)"))
+                cols = {row[1] for row in result.fetchall()}  # row[1] = name
+                if "referral_code" not in cols:
+                    await conn.execute(sa_text("ALTER TABLE user_accounts ADD COLUMN referral_code VARCHAR(16)"))
+                if "referred_by" not in cols:
+                    await conn.execute(sa_text("ALTER TABLE user_accounts ADD COLUMN referred_by VARCHAR(32)"))
+                if "granted_milestones" not in cols:
+                    await conn.execute(sa_text("ALTER TABLE user_accounts ADD COLUMN granted_milestones TEXT DEFAULT '[]'"))
+                # Ensure gateway column on payments
+                result2 = await conn.execute(sa_text("PRAGMA table_info(payments)"))
+                cols2 = {row[1] for row in result2.fetchall()}
+                if "gateway" not in cols2:
+                    await conn.execute(sa_text("ALTER TABLE payments ADD COLUMN gateway VARCHAR(32) DEFAULT 'zarinpal'"))
+                # Create indexes for new columns if missing (SQLite ignores duplicates with IF NOT EXISTS)
+                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_user_accounts_referral_code ON user_accounts (referral_code)"))
+                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_user_accounts_referred_by ON user_accounts (referred_by)"))
+            except Exception:
+                # Migration is best-effort; never break startup
+                import logging
+
+                logging.getLogger(__name__).exception("DB auto-migration failed (non-fatal)")
+
             # Remove legacy scan-only records, dry runs, failed attempts, and
             # per-project skip events. Only confirmed submissions remain.
             await conn.execute(delete(BidRow).where(BidRow.status != "submitted"))

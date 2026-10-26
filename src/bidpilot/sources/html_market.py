@@ -1082,6 +1082,7 @@ class HtmlMarketSource(Source):
                             base_url=self.base_url,
                             page_url=form_page_url,
                             project_id=str(project.external_id),
+                            user_agent=self.config.runtime.user_agent,
                             cookies=client.cookies,
                             form_id=form_id,
                             form_name=form_name,

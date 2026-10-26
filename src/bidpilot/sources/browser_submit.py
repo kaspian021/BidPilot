@@ -194,6 +194,11 @@ async def submit_js_managed_form(
                 )
 
             current_url = str(page.url)
+            if _origin(current_url) != _origin(base_url):
+                return _failure(
+                    "صفحه پروژه پس از بازشدن به دامنه دیگری هدایت شد؛ برای محافظت از کوکی و پیشنهاد متوقف شد.",
+                    debug=safe_debug,
+                )
             current_path = urlsplit(current_url).path.casefold()
             if re.search(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", current_path):
                 return _failure(
@@ -322,7 +327,7 @@ async def submit_js_managed_form(
             live_endpoint = urljoin(current_url, live_action)
             if (
                 not live_action
-                or _origin(live_endpoint) != _origin(current_url)
+                or _origin(live_endpoint) != _origin(base_url)
                 or urlsplit(live_endpoint).path.rstrip("/") != endpoint_parts.path.rstrip("/")
             ):
                 return _failure(
@@ -343,6 +348,7 @@ async def submit_js_managed_form(
                 async with page.expect_response(
                     lambda response: (
                         response.request.method.upper() == "POST"
+                        and _origin(response.url) == _origin(base_url)
                         and urlsplit(response.url).path.rstrip("/") == expected_path
                     ),
                     timeout=18_000,

@@ -10,6 +10,7 @@ def browser_args(**overrides):
         "base_url": "https://parscoders.com",
         "page_url": "https://parscoders.com/project/12345/sample",
         "project_id": "12345",
+        "user_agent": "Mozilla/5.0 test",
         "cookies": {},
         "form_id": "init_message_form",
         "form_name": "init_message",

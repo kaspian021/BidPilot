@@ -46,4 +46,4 @@ async def test_browser_submit_rejects_endpoint_for_a_different_project():
 
     assert result.status is SubmissionStatus.FAILED
     assert result.payload_debug["request_sent"] is False
-    assert "همین پروژه" in result.message
+    assert "این پروژه" in result.message

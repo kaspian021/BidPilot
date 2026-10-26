@@ -112,9 +112,7 @@ async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
       </form>
     </body></html>
     """
-    respx.get("https://parscoders.com/project/12345").mock(
-        return_value=httpx.Response(200, text=page)
-    )
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
     wrong_route = respx.post("https://parscoders.com/project/12345").mock(
         return_value=httpx.Response(200, text="project page returned")
     )
@@ -130,7 +128,6 @@ async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
     assert result.payload_debug["endpoint_path"] == "/conversation/ajax/bid-send/12345"
     assert wrong_route.call_count == 0
     await source.aclose()
-
 
 
 @pytest.mark.asyncio
@@ -176,9 +173,7 @@ async def test_submit_bid_delegates_js_managed_form_to_browser(monkeypatch):
     source._session_cookies = {"PHPSESSID": "session-value"}
     project = Project(source="parscoders", external_id="12345", title="تست")
 
-    result = await source.submit_bid(
-        project, Proposal(text="متن پیشنهاد آزمایشی"), 500_000, 14
-    )
+    result = await source.submit_bid(project, Proposal(text="متن پیشنهاد آزمایشی"), 500_000, 14)
 
     assert result.status is SubmissionStatus.SUBMITTED
     assert len(calls) == 1
@@ -192,6 +187,7 @@ async def test_submit_bid_delegates_js_managed_form_to_browser(monkeypatch):
     assert calls[0]["proposal_text"] == "متن پیشنهاد آزمایشی"
     assert wrong_route.call_count == 0
     await source.aclose()
+
 
 @respx.mock
 async def test_submit_bid_detects_rejection():

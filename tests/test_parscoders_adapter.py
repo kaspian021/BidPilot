@@ -12,7 +12,7 @@ import respx
 
 from bidpilot.config import AppConfig, Profile, RuntimeConfig, Secrets
 from bidpilot.credentials import SiteCredentials
-from bidpilot.models import Budget, Project, Proposal
+from bidpilot.models import Budget, Project, Proposal, SubmissionResult, SubmissionStatus
 from bidpilot.sources.base import SourceError
 from bidpilot.sources.parscoders.adapter import ParscodersSource
 
@@ -112,13 +112,11 @@ async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
       </form>
     </body></html>
     """
-    respx.get("https://parscoders.com/project/12345").mock(
-        return_value=httpx.Response(200, text=page)
-    )
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
     wrong_route = respx.post("https://parscoders.com/project/12345").mock(
         return_value=httpx.Response(200, text="project page returned")
     )
-    source = make_source()
+    source = make_source(bid={"browser_submit": False})
     source._session_cookies = {"PHPSESSID": "session-value"}
     project = Project(source="parscoders", external_id="12345", title="تست")
 
@@ -128,6 +126,63 @@ async def test_submit_bid_aborts_js_ajax_form_without_posting_to_project_url():
     assert result.javascript_required
     assert result.payload_debug["request_sent"] is False
     assert result.payload_debug["endpoint_path"] == "/conversation/ajax/bid-send/12345"
+    assert wrong_route.call_count == 0
+    await source.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_submit_bid_delegates_js_managed_form_to_browser(monkeypatch):
+    page = """
+    <html><head><title>Project</title></head><body>
+      <form id="init_message_form" name="init_message">
+        <input type="hidden" name="_token" value="csrf-placeholder">
+        <input type="text" name="bidAmount">
+        <input type="text" name="deadline" value="2">
+        <input type="text" name="initEscrowPercent" value="100">
+        <input type="text" name="expertGuaranteePercent" value="0">
+        <input type="text" name="validDays">
+        <textarea name="message"></textarea>
+        <button type="submit" id="msg_submit_btn"
+                data-href="/conversation/ajax/bid-send/12345">ارسال پیشنهاد</button>
+      </form>
+    </body></html>
+    """
+    respx.get("https://parscoders.com/project/12345").mock(return_value=httpx.Response(200, text=page))
+    wrong_route = respx.post("https://parscoders.com/project/12345").mock(
+        return_value=httpx.Response(200, text="project page returned")
+    )
+    calls = []
+
+    async def fake_browser_submit(**kwargs):
+        calls.append(kwargs)
+        return SubmissionResult(
+            status=SubmissionStatus.SUBMITTED,
+            message="ثبت آزمایشی مرورگر تأیید شد",
+            http_status=200,
+            payload_debug={"browser": "playwright", "request_sent": True},
+        )
+
+    monkeypatch.setattr(
+        "bidpilot.sources.html_market.submit_js_managed_form",
+        fake_browser_submit,
+    )
+    source = make_source(bid={"browser_submit": True})
+    source._session_cookies = {"PHPSESSID": "session-value"}
+    project = Project(source="parscoders", external_id="12345", title="تست")
+
+    result = await source.submit_bid(project, Proposal(text="متن پیشنهاد آزمایشی"), 500_000, 14)
+
+    assert result.status is SubmissionStatus.SUBMITTED
+    assert len(calls) == 1
+    assert calls[0]["project_id"] == "12345"
+    assert calls[0]["endpoint_attribute"] == "data-href"
+    assert calls[0]["field_mapping"] == {
+        "amount": "bidAmount",
+        "days": "deadline",
+        "description": "message",
+    }
+    assert calls[0]["proposal_text"] == "متن پیشنهاد آزمایشی"
     assert wrong_route.call_count == 0
     await source.aclose()
 
@@ -182,6 +237,9 @@ async def test_submit_bid_detects_javascript_requirement_and_marks_it():
 @respx.mock
 async def test_submit_bid_without_credentials_fails_fast():
     source = make_source()
+    # Isolate this test from credentials saved in the developer's local settings store.
+    source._session_cookies = {}
+    source.credentials = SiteCredentials(site="parscoders", method="cookie")
     project = Project(source="parscoders", external_id="1", title="تست")
     result = await source.submit_bid(project, Proposal(text="سلام"), 1_000_000, 14)
     assert result.status.value == "failed"

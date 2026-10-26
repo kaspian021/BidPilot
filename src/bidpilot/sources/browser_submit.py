@@ -13,8 +13,8 @@ import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-from . import html_parser
 from ..models import SubmissionResult, SubmissionStatus
+from . import html_parser
 
 log = logging.getLogger(__name__)
 
@@ -425,15 +425,3 @@ async def submit_js_managed_form(
             pause_source=action_clicked,
             debug=safe_debug,
         )
-    finally:
-        # The Playwright context is isolated and never writes browser state to disk.
-        if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass

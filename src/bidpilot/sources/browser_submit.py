@@ -343,8 +343,10 @@ async def submit_js_managed_form(
                     ),
                     timeout=18_000,
                 ) as response_info:
-                    await submitter.click()
+                    # From this point a timeout may be ambiguous: even if the
+                    # click call raises, avoid claiming that no submit happened.
                     action_clicked = True
+                    await submitter.click()
                 response = await response_info.value
             except PlaywrightTimeoutError:
                 safe_debug["request_sent"] = "unknown"

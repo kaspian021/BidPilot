@@ -106,6 +106,7 @@ def validate_proposal(
     amount: int | None = None,
     *,
     strict_length: bool = True,
+    hide_price: bool = False,
 ) -> ValidationReport:
     issues: list[str] = []
     stripped = (text or "").strip()
@@ -130,10 +131,15 @@ def validate_proposal(
     for phrase in config.banned_phrases:
         if phrase and phrase in stripped:
             issues.append(f"عبارت ممنوعه استفاده شده: {phrase}")
-    if amount is not None and not mentions_amount(stripped, amount):
-        issues.append(f"قیمت پیشنهادی ({amount:,}) در متن ذکر نشده است.")
-    if not mentions_currency(stripped):
-        issues.append("واحد قیمت (تومان) در متن نیامده است.")
+    if not hide_price:
+        if amount is not None and not mentions_amount(stripped, amount):
+            issues.append(f"قیمت پیشنهادی ({amount:,}) در متن ذکر نشده است.")
+        if not mentions_currency(stripped):
+            issues.append("واحد قیمت (تومان) در متن نیامده است.")
+    else:
+        # hide_price_in_text: price must NOT be in text? spec says "نیازی نیست قیمت را در متن بنویسی"
+        # We don't enforce absence, just don't require presence.  But we can warn if price leaked?
+        pass
     return ValidationReport(issues)
 
 
@@ -209,25 +215,30 @@ class ProposalGenerator:
         delivery_days: int | None = None,
         *,
         force_template: bool = False,
+        hide_price: bool | None = None,
     ) -> Proposal:
         self.last_llm_error = ""
+        # hide_price_in_text per-user flag — if not passed, read from app pricing
+        if hide_price is None:
+            try:
+                hide_price = bool(self.app.pricing.get("hide_price_in_text"))
+            except Exception:
+                hide_price = False
         if not force_template:
             if not self.llm_ready:
-                # ``enabled: false`` is a deliberate choice, not a failure
                 if self.llm_config.enabled:
                     self.last_llm_error = "برای هوش مصنوعی کلید یا مدلی تنظیم نشده است."
             else:
                 try:
-                    return await self._generate_with_llm(project, amount, delivery_days)
+                    return await self._generate_with_llm(project, amount, delivery_days, hide_price=hide_price)
                 except LLMError as exc:
                     log.warning("LLM generation failed (%s); falling back", exc)
-                    # never swallow it: the bot shows this text verbatim
                     self.last_llm_error = str(exc)
                     if self.settings.on_generation_failure == "skip":
                         raise ProposalError(f"تولید پیشنهاد با LLM ناموفق بود: {exc}") from exc
-        return self.generate_from_template(project, amount, delivery_days)
+        return self.generate_from_template(project, amount, delivery_days, hide_price=hide_price)
 
-    async def _generate_with_llm(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
+    async def _generate_with_llm(self, project: Project, amount: int, delivery_days: int | None, hide_price: bool = False) -> Proposal:
         """Try the free providers in order; the first valid text wins."""
         system, user = build_prompts(
             project,
@@ -235,6 +246,7 @@ class ProposalGenerator:
             self.settings,
             amount,
             delivery_days,
+            hide_price=hide_price,
         )
         failures: list[str] = []
         for provider, client in self._clients_ready():
@@ -277,7 +289,7 @@ class ProposalGenerator:
                         report_trimmed = validate_proposal(text, self.settings, amount)
                         if not any("خیلی بلند" in i for i in report_trimmed.issues):
                             pass
-            report = validate_proposal(text, self.settings, amount)
+            report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
             if not report.ok:
                 log.info(
                     "Proposal validation issues from %s: %s — asking for a repair pass",
@@ -287,13 +299,13 @@ class ProposalGenerator:
                 try:
                     repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
                     fixed = await self._complete_proposal(client, system, repair)
-                    if validate_proposal(fixed.text.strip(), self.settings, amount).ok:
+                    if validate_proposal(fixed.text.strip(), self.settings, amount, hide_price=hide_price).ok:
                         text = fixed.text.strip()
                         response = fixed
                 except LLMError as exc:
                     log.warning("Repair pass failed (%s): %s", provider.id, exc)
 
-            final_report = validate_proposal(text, self.settings, amount)
+            final_report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
             if final_report.ok:
                 return Proposal(
                     text=text,
@@ -328,7 +340,7 @@ class ProposalGenerator:
         except TypeError:  # a minimal client (tests, older wrappers) has no such kwarg
             return await client.complete(system, user)
 
-    def generate_from_template(self, project: Project, amount: int, delivery_days: int | None) -> Proposal:
+    def generate_from_template(self, project: Project, amount: int, delivery_days: int | None, hide_price: bool = False) -> Proposal:
         """Render the longest template that fits ``proposal.max_chars``.
 
         The price sentence and the signature are *never* cut: they are what makes
@@ -364,6 +376,7 @@ class ProposalGenerator:
             "greeting": self.settings.greeting or "سلام و وقت بخیر",
             "profile": self.profile,
             "project": project,
+            "hide_price": hide_price,
             "years_fa": to_persian_digits(str(self.profile.years_experience)),
             "relevance": relevance,
             "challenges": challenges,
@@ -386,10 +399,10 @@ class ProposalGenerator:
         for candidate in (full_text, *self._bullet_trimmed(full_text, limit), compact_text):
             if not candidate or len(candidate) > limit:
                 continue
-            if validate_proposal(candidate, self.settings, amount, strict_length=False).ok:
+            if validate_proposal(candidate, self.settings, amount, strict_length=False, hide_price=hide_price).ok:
                 return Proposal(text=candidate, generated_by="template", latency_ms=0)
 
-        report = validate_proposal(compact_text, self.settings, amount, strict_length=False)
+        report = validate_proposal(compact_text, self.settings, amount, strict_length=False, hide_price=hide_price)
         if not report.ok:
             raise ProposalError("قالب پیشنهاد معتبر نیست: " + "؛ ".join(report.issues))
         raise ProposalError(

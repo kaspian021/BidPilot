@@ -30,6 +30,14 @@ def message(chat_id: int, text: str) -> dict:
     return {"update_id": 1, "message": {"chat": {"id": chat_id}, "text": text}}
 
 
+def _seed_per_user_llm(store, chat_id="777"):
+    # Seed per-user LLM as verified to bypass onboarding gate in legacy tests
+    store.set(f"users.{chat_id}.llm.provider", "groq")
+    store.set(f"users.{chat_id}.llm.api_key", "test-key-123")
+    store.set(f"users.{chat_id}.llm.model", "openai/gpt-oss-120b")
+    store.set(f"users.{chat_id}.llm.verified", True)
+    store.set(f"users.{chat_id}.onboarding.profile_skipped", True)
+
 def make_service(tmp_path, monkeypatch) -> tuple[BotService, FakeAPI, SettingsStore]:
     monkeypatch.setenv("BIDPILOT_SETTINGS_FILE", str(tmp_path / "data" / "settings.json"))
     reset_store_cache()
@@ -246,6 +254,8 @@ async def test_full_setup_from_telegram_end_to_end(tmp_path, monkeypatch):
         "روی تحویل مرحله‌ای تأکید کن",  # style instructions
         "1200",  # max chars
         "60",  # pricing: 60% of the employer's budget
+        "1",  # pricing strategy: midpoint
+        "نه",  # hide price? no
         "1",  # submit mode: dry run
     ]
     for answer in answers:
@@ -281,6 +291,7 @@ def ready_store(store: SettingsStore) -> None:
             "proposal.tone": "فنی و مستقیم",
         }
     )
+    _seed_per_user_llm(store, "777")
 
 
 async def test_live_run_is_blocked_until_a_preview_or_dry_run(tmp_path, monkeypatch):
@@ -373,6 +384,7 @@ def test_pdf_failure_keeps_the_queue_and_offers_a_retry(tmp_path, monkeypatch):
     from bidpilot.profile_import import pending_import
 
     service, api, store = make_service(tmp_path, monkeypatch)
+    _seed_per_user_llm(store, "777")
     store.update(
         {
             "profile.import_pending": {"type": "file", "value": str(tmp_path / "cv.pdf")},
@@ -429,6 +441,7 @@ def test_a_failed_resume_import_does_not_finish_as_success(tmp_path, monkeypatch
     import asyncio
 
     service, api, store = make_service(tmp_path, monkeypatch)
+    _seed_per_user_llm(store, "777")
     broken = tmp_path / "resume.pdf"
     broken.write_bytes(b"this is definitely not a pdf")
     monkeypatch.setattr("bidpilot.deps.has", lambda module: True)

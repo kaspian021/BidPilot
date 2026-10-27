@@ -405,7 +405,7 @@ async def analyse_text(
             msg = str(exc)
             # Groq retired qwen/qwen3-32b on 2026-07-17 — guide to current models
             if "model_not_found" in msg.lower() or "does not exist" in msg.lower() or "مدل یافت نشد" in msg:
-                result.warnings.append(f"تحلیل با هوش مصنوعی انجام نشد ({msg}) — این مدل منسوخ شده. با /llm مدل به‌روز مثل openai/gpt-oss-120b یا qwen/qwen3.6-27b را انتخاب کن؛ از روش جایگزین استفاده شد.")
+                result.warnings.append(f"تحلیل با هوش مصنوعی انجام نشد ({msg}) — این مدل منسوخ شده. با /llm مدل به‌روز مثل openai/gpt-oss-120b یا openai/gpt-oss-20b را انتخاب کن؛ از روش جایگزین استفاده شد.")
             else:
                 result.warnings.append(f"تحلیل با هوش مصنوعی انجام نشد ({msg})؛ از روش جایگزین استفاده شد.")
             payload = None

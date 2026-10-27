@@ -68,6 +68,7 @@ from .per_user import (
     get_user_llm_model,
     get_user_llm_provider_id,
     is_llm_onboarding_done,
+    is_marketplace_onboarding_done,
     is_onboarding_blocked,
     is_profile_onboarding_done,
     is_user_llm_verified,
@@ -2611,7 +2612,6 @@ class BotService:
                     except Exception as exc:
                         await self.send(chat_id, f"❌ ذخیره نشد: {escape(str(exc))}")
                         return
-                    from .per_user import set_user_llm_verified
                     set_user_llm_verified(self.store, chat_id, True)
                     await self.send(chat_id, f"✅ {escape(msg)}\nاین مدل دقیقاً برای تو ذخیره شد و همه درخواست‌ها با آن انجام می‌شود.")
                     self._log(f"chat {chat_id}: verified LLM model {chosen_model} for {provider_id}")
@@ -2681,7 +2681,6 @@ class BotService:
             if err:
                 await self.send(chat_id, f"⚠️ پروفایل با فایل کامل نشد: {escape(err)}\nدوباره /profile را بزن یا دستی وارد کن.")
                 return
-            from .per_user import is_marketplace_onboarding_done, is_profile_onboarding_done
             if not is_profile_onboarding_done(self.store, chat_id):
                 await self.send(chat_id, "✅ پروفایل ذخیره شد.")
                 await self._show_dashboard(chat_id)

@@ -1008,7 +1008,8 @@ class BotService:
             )
             return
         await self.send(chat_id, check.message())
-        ok, message = await self.automation.start()
+        # Per-user isolation: use this chat's own LLM key for search/proposals
+        ok, message = await self.automation.start(chat_id=chat_id)
         await self.send(
             chat_id,
             ("🚀 " if ok else "❌ ") + escape(message) + ("\n\nاولین نتیجه را همین‌جا می‌فرستم." if ok else ""),

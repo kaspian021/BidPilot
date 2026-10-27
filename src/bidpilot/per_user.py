@@ -225,8 +225,68 @@ __all__ = [
     "is_user_llm_verified",
     "set_user_llm_verified",
     "build_user_llm_provider",
+    "apply_per_user_config",
     "is_llm_onboarding_done",
     "is_profile_onboarding_done",
     "is_onboarding_blocked",
     "onboarding_progress",
 ]
+
+def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets=None):
+    """Inject per-user LLM, pricing, profile into cfg/secrets (mutates cfg, returns secrets)."""
+    from .llm_providers import DEFAULT_PROVIDER
+    from .config import Secrets, secrets_from_store
+
+    # LLM
+    provider = build_user_llm_provider(store, chat_id)
+    if provider is not None:
+        cfg.llm.provider = provider.id
+        cfg.llm.base_url = provider.base_url
+        cfg.llm.model = provider.model
+        # pricing per-user
+        strat = get_user(store, chat_id, "pricing.strategy")
+        if strat:
+            cfg.pricing["strategy"] = str(strat)
+        hide = get_user(store, chat_id, "pricing.hide_price_in_text")
+        if hide is not None:
+            cfg.pricing["hide_price_in_text"] = bool(hide)
+        bp = get_user(store, chat_id, "pricing.bid_percent")
+        if bp is not None:
+            try:
+                cfg.pricing["ratio"] = float(int(bp) / 100)
+            except Exception:
+                pass
+        # delivery days override?
+        # profile
+        for field in ("stack", "full_name", "first_name", "role", "years_experience", "highlights", "portfolio_url", "signature"):
+            v = get_user(store, chat_id, f"profile.{field}")
+            if v is not None:
+                try:
+                    setattr(cfg.profile, field, v if field not in ("stack","highlights") else list(v))
+                except Exception:
+                    pass
+        # proposal tone/style per-user? If stored per-user, override
+        tone = get_user(store, chat_id, "proposal.tone")
+        if tone:
+            cfg.proposal.tone = str(tone)
+        style = get_user(store, chat_id, "proposal.style_instructions")
+        if style is not None:
+            cfg.proposal.style_instructions = str(style)
+        max_chars = get_user(store, chat_id, "proposal.max_chars")
+        if max_chars:
+            try:
+                cfg.proposal.max_chars = int(max_chars)
+            except Exception:
+                pass
+        # secrets
+        if secrets is None:
+            secrets = Secrets()
+            secrets = secrets_from_store(secrets, store)
+        else:
+            secrets = secrets_from_store(secrets, store) if hasattr(secrets, "model_copy") else secrets
+        # Override with per-user key
+        secrets.llm_keys[provider.id] = provider.api_key or ""
+        secrets.llm_api_key = provider.api_key
+        return cfg, secrets
+    return cfg, secrets
+

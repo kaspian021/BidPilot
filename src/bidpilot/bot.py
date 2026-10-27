@@ -1681,11 +1681,36 @@ class BotService:
 
     # ── referral & start with deep link ──────────────────────────
     def _bot_username(self) -> str:
-        for k in ("telegram.bot_username", "telegram.username", "bot.username"):
+        # Correct bot is @BidPilotIranbot — not @BidPilotBot
+        for k in ("telegram.bot_username", "telegram.username", "bot.username", "telegram.bot_id"):
             v = self.store.get(k)
             if v:
-                return str(v).lstrip("@")
-        return "BidPilotBot"
+                # handle cases where value is "BidPilotIranbot" or "https://t.me/..."
+                s = str(v).strip().lstrip("@")
+                if "t.me/" in s:
+                    s = s.split("t.me/")[-1].split("?")[0].split("/")[0]
+                if s:
+                    return s
+        # Fallback: canonical production bot
+        return "BidPilotIranbot"
+
+    async def _ensure_bot_username_cached(self) -> None:
+        """If store has no username, try to learn it live from Telegram (getMe)."""
+        # Already have it?
+        for k in ("telegram.bot_username", "telegram.username", "bot.username"):
+            if self.store.get(k):
+                return
+        try:
+            me = await self.api.get_me()  # type: ignore[attr-defined]
+            uname = (me or {}).get("username")
+            if uname:
+                # persist so future referrals use correct link even before next restart
+                try:
+                    self.store.set("telegram.bot_username", str(uname).lstrip("@"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def _handle_referral_start(self, chat_id: str, rest: str) -> bool:
         rest = (rest or "").strip()
@@ -1741,6 +1766,8 @@ class BotService:
             pass
 
     async def _cmd_start(self, chat_id: str, rest: str = "") -> None:
+        # Learn real @username live if not cached (fixes wrong fallback link)
+        await self._ensure_bot_username_cached()
         # handle referral if present, then show main menu
         if rest:
             await self._handle_referral_start(chat_id, rest)
@@ -1785,6 +1812,7 @@ class BotService:
         await self.send(chat_id, gateway_picker_text(plan), gateway_picker_keyboard(plan.id))
 
     async def _cmd_invite(self, chat_id: str) -> None:
+        await self._ensure_bot_username_cached()
         try:
             from .db import Database
             from .subscriptions.referrals import ReferralManager, MILESTONES

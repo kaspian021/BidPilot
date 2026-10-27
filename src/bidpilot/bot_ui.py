@@ -352,7 +352,7 @@ def referral_card(
         f"{hr()}",
         f"<b>لینک اختصاصی شما</b>",
         f"<code>{esc(link)}</code>",
-        f"<i>کد: {esc(code)} · @{esc(bot_username or 'BidPilotBot')}</i>",
+        f"<i>کد: {esc(code)} · @{esc(bot_username or 'BidPilotIranbot')}</i>",
         "",
         f"<b>پیشرفت شما</b>",
         f"تاییدشده: <b>{total_qualified}</b> · در انتظار تکمیل: {pending}",

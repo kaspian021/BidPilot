@@ -84,7 +84,8 @@ class ReferralManager:
 
     async def invite_link(self, chat_id: str | int) -> tuple[str, str]:
         code = await self.ensure_code(chat_id)
-        base = f"https://t.me/{self.bot_username}" if self.bot_username else "https://t.me/BidPilotBot"
+        bot = (self.bot_username or "BidPilotIranbot").lstrip("@")
+        base = f"https://t.me/{bot}"
         link = f"{base}?start=ref_{code}"
         return code, link
 

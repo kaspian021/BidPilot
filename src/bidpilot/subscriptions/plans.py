@@ -172,18 +172,61 @@ PLANS: dict[str, Plan] = {
 }
 
 
+def _apply_overrides(plan: Plan) -> Plan:
+    """If admin changed price/limits via /admin_set, reflect it instantly."""
+    try:
+        from ..settings_store import get_store
+        store = get_store()
+        # price override
+        price = store.get(f"admin.plans.{plan.id}.price_toman")
+        period = store.get(f"admin.plans.{plan.id}.period_days")
+        rec = store.get(f"admin.plans.{plan.id}.recommended")
+        # limits overrides
+        limits_kwargs: dict = {}
+        for f in ["max_bids_per_hour","max_bids_per_day","max_bids_per_month","min_seconds_between_bids","max_active_sites","max_projects_per_poll"]:
+            v = store.get(f"admin.plans.{plan.id}.limits.{f}")
+            if v is not None:
+                try:
+                    limits_kwargs[f] = int(v)
+                except Exception:
+                    pass
+        if price is None and period is None and rec is None and not limits_kwargs:
+            return plan
+        # build new Plan with overrides
+        new_limits = plan.limits
+        if limits_kwargs:
+            new_limits = PlanLimits(
+                max_bids_per_hour=limits_kwargs.get("max_bids_per_hour", plan.limits.max_bids_per_hour),
+                max_bids_per_day=limits_kwargs.get("max_bids_per_day", plan.limits.max_bids_per_day),
+                max_bids_per_month=limits_kwargs.get("max_bids_per_month", plan.limits.max_bids_per_month),
+                min_seconds_between_bids=limits_kwargs.get("min_seconds_between_bids", plan.limits.min_seconds_between_bids),
+                max_projects_per_poll=limits_kwargs.get("max_projects_per_poll", plan.limits.max_projects_per_poll),
+                max_active_sites=limits_kwargs.get("max_active_sites", plan.limits.max_active_sites),
+                priority_queue=plan.limits.priority_queue,
+            )
+        return Plan(
+            id=plan.id, title=plan.title, title_en=plan.title_en, tagline=plan.tagline,
+            price_toman=int(price) if price is not None else plan.price_toman,
+            period_days=int(period) if period is not None else plan.period_days,
+            limits=new_limits, features=plan.features, badge=plan.badge, color=plan.color,
+            recommended=bool(rec) if rec is not None else plan.recommended,
+            zarinpal_plan_id=plan.zarinpal_plan_id,
+        )
+    except Exception:
+        return plan
+
 def get_plan(plan_id: str) -> Plan:
     key = (plan_id or "free").strip().lower()
     if key not in PLANS:
-        # aliases
         aliases = {"basic": "starter", "standard": "starter", "premium": "pro", "gold": "elite", "enterprise": "elite"}
         key = aliases.get(key, "free")
-    return PLANS[key]
+    base = PLANS[key]
+    return _apply_overrides(base)
 
 
 def all_plans() -> list[Plan]:
     order = ["free", "starter", "pro", "elite"]
-    return [PLANS[k] for k in order]
+    return [_apply_overrides(PLANS[k]) for k in order]
 
 
 def paid_plans() -> list[Plan]:

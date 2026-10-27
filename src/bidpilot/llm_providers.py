@@ -61,11 +61,6 @@ PROVIDER_MODELS: dict[str, list[str]] = {
     "groq": [
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
-        "qwen/qwen3.6-27b",
-        "qwen/qwen3.8-27b",
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "gemma2-9b-it",
     ],
     "gemini": [
         "gemini-3.8-flash",
@@ -375,7 +370,7 @@ async def verify_provider(
         return False, "کلید معتبر است اما سهمیه‌ی رایگان همین لحظه پر شده؛ کمی بعد امتحان کنید."
     if response.status_code == 404 or (response.status_code >= 400 and "model_not_found" in response.text.lower()) or (response.status_code >= 400 and "does not exist" in response.text.lower()):
         # Groq deprecated qwen/qwen3-32b on 2026-07-17 / 2026-08-16 — guide user to current catalog
-        return False, f"❌ مدل یافت نشد (model_not_found) — این مدل در {provider.id} منسوخ/در دسترس نیست (HTTP {response.status_code}): {response.text[:180]}. لطفاً مدل دیگری انتخاب کن (مثلاً openai/gpt-oss-120b یا qwen/qwen3.6-27b) با /llm"
+        return False, f"❌ مدل یافت نشد (model_not_found) — این مدل در {provider.id} منسوخ/در دسترس نیست (HTTP {response.status_code}): {response.text[:180]}. لطفاً مدل دیگری انتخاب کن (مثلاً openai/gpt-oss-120b یا openai/gpt-oss-20b) با /llm"
     if response.status_code >= 400:
         return False, f"❌ API key معتبر نیست — سرویس خطا داد (HTTP {response.status_code}): {response.text[:180]}"
     try:

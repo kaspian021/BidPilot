@@ -22,6 +22,7 @@ The bot is intentionally thin: all state lives in
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -385,22 +386,46 @@ class BotService:
         chat_id = chat.get("id")
         if chat_id is None:
             return
+        # ── maintenance mode (admin only) ──
+        try:
+            if self.store.get_bool("admin.maintenance"):
+                from .admin import is_admin as _is_admin
+                if not _is_admin(chat_id, self.store):
+                    await self.send(chat_id, "🚧 ربات در حال نگهداری است — بزودی برمی‌گردیم.\n<i>ادمین: /admin → خاموش کردن نگهداری</i>")
+                    return
+        except Exception:
+            pass
         if message.get("document"):
             if not self.is_allowed(chat_id):
-                return
+                try:
+                    save_chat_id(self.store, str(chat_id))
+                except Exception:
+                    return
             await self._handle_document(message, str(chat_id))
             return
         text = (message.get("text") or "").strip()
         if not text:
             return
         if not self.is_allowed(chat_id):
-            await self.send(
-                chat_id,
-                "⛔ این چت مجاز نیست.\n"
-                f"chat_id تو: <code>{escape(str(chat_id))}</code>\n"
-                "برای اجازه‌دادن، مالک باید این شناسه را در تنظیمات اضافه کند.",
-            )
-            return
+            # Referral / public onboarding: let anyone join via /start (esp. /start ref_...)
+            # Otherwise the invite link is useless. Auto-add them to allowed list.
+            lower = text.lower()
+            is_public_entry = lower.startswith("/start") or lower.startswith("/help") or lower.startswith("/plans")
+            if is_public_entry:
+                try:
+                    save_chat_id(self.store, str(chat_id))
+                    self._log(f"new user auto-added (public entry): {chat_id} via {text[:30]}")
+                except Exception:
+                    pass
+            else:
+                await self.send(
+                    chat_id,
+                    "⛔ این چت مجاز نیست.\n"
+                    f"chat_id تو: <code>{escape(str(chat_id))}</code>\n"
+                    "برای اجازه‌دادن، مالک باید این شناسه را در تنظیمات اضافه کند.\n"
+                    "<i>نکته: برای دعوت دوستان، از <code>/start</code> با لینک دعوت استفاده کن.</i>",
+                )
+                return
         if text.startswith("/"):
             command, _, rest = text.partition(" ")
             await self.handle_command(str(chat_id), command.lower(), rest.strip())
@@ -416,8 +441,17 @@ class BotService:
             return
         await self.api.answer_callback(callback_id)
         if not self.is_allowed(chat_id):
-            return
+            # Allow callbacks from newly auto-added users (e.g. after /start ref_...)
+            try:
+                save_chat_id(self.store, str(chat_id))
+            except Exception:
+                return
         chat = str(chat_id)
+
+        # Admin panel — exclusive to owner, intercepted before other handlers
+        if data.startswith("admin:"):
+            await self._handle_admin_callback(chat, data)
+            return
 
         if data.startswith("ch:"):
             _, index, choice_index = (data.split(":") + ["", "", ""])[:3]
@@ -604,6 +638,37 @@ class BotService:
                 await self._cmd_buy(chat_id, _plan, gateway=_gw)
             else:
                 await self._cmd_buy(chat_id, _plan)
+        elif command in {"/admin", "/panel", "/پنل"}:
+            if not self._require_admin(chat_id):
+                await self.send(chat_id, "⛔ فقط ادمین (7806301378) دسترسی دارد.")
+                return
+            stats = await self._admin_stats()
+            from .admin import admin_main_text, admin_main_keyboard
+            await self.send(chat_id, admin_main_text(stats), admin_main_keyboard())
+        elif command.startswith("/admin_set"):
+            if not self._require_admin(chat_id):
+                await self.send(chat_id, "⛔ فقط ادمین.")
+                return
+            await self._handle_admin_set(chat_id, rest)
+        elif command.startswith("/admin_search"):
+            if not self._require_admin(chat_id):
+                await self.send(chat_id, "⛔ فقط ادمین.")
+                return
+            await self._handle_admin_search(chat_id, rest)
+        elif command.startswith("/admin_user"):
+            if not self._require_admin(chat_id):
+                await self.send(chat_id, "⛔ فقط ادمین.")
+                return
+            target = (rest or "").strip().split()[0] if rest else ""
+            if not target:
+                await self.send(chat_id, "مثال: <code>/admin_user 8697160216</code>")
+                return
+            await self._handle_admin_callback(chat_id, f"admin:user:{target}")
+        elif command.startswith("/broadcast"):
+            if not self._require_admin(chat_id):
+                await self.send(chat_id, "⛔ فقط ادمین.")
+                return
+            await self._handle_broadcast(chat_id, rest)
         elif command == "/cancel":
             if self._flows.pop(chat_id, None):
                 await self.send(chat_id, "لغو شد. هر وقت خواستی /setup یا /help.")
@@ -1160,7 +1225,531 @@ class BotService:
         text += "\n" + info.status_line()
         if info.warning():
             text += "\n⚠️ " + escape(info.warning()) + f"\n<code>{escape(info.fix_command())}</code>"
-        await self.send(chat_id, text, self._menu_keyboard())
+        # Admin entry — only for owner
+        from .admin import is_admin
+        kb = self._menu_keyboard()
+        if is_admin(chat_id, self.store):
+            # inject admin button into keyboard
+            try:
+                kb["inline_keyboard"].insert(0, [{"text": "🔐 پنل ادمین — مدیریت کامل", "callback_data": "admin:main"}])
+            except Exception:
+                pass
+            text += "\n\n<i>🔐 شما ادمین هستید — <code>/admin</code> برای پنل کامل.</i>"
+        await self.send(chat_id, text, kb)
+
+    # ── Admin Panel (owner only) ─────────────────────────────────────
+    def _require_admin(self, chat_id: str) -> bool:
+        from .admin import is_admin
+        return is_admin(chat_id, self.store)
+
+    async def _admin_stats(self) -> dict[str, Any]:
+        stats: dict[str, Any] = {}
+        try:
+            from .db import Database
+            db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+            await db.init()
+            async with db.session_factory() as s:
+                from sqlalchemy import func, select
+                from .subscriptions.models import PaymentRow, ReferralRow, UserAccountRow
+                from .db import BidRow
+                # users
+                stats["users_total"] = (await s.execute(select(func.count()).select_from(UserAccountRow))).scalar() or 0
+                stats["users_active_7d"] = (await s.execute(select(func.count()).select_from(UserAccountRow).where(UserAccountRow.updated_at >= datetime.now(timezone.utc) - timedelta(days=7)))).scalar() or 0
+                # subs active (plan != free and not expired)
+                stats["subs_active"] = (await s.execute(select(func.count()).select_from(UserAccountRow).where(UserAccountRow.plan_id != "free"))).scalar() or 0
+                # revenue
+                rev = (await s.execute(select(func.coalesce(func.sum(PaymentRow.amount_toman), 0)).where(PaymentRow.status == "verified"))).scalar() or 0
+                stats["revenue_total"] = f"{int(rev):,} تومان".replace(",", "٬")
+                stats["payments_ok"] = (await s.execute(select(func.count()).select_from(PaymentRow).where(PaymentRow.status == "verified"))).scalar() or 0
+                stats["referrals_ok"] = (await s.execute(select(func.count()).select_from(ReferralRow).where(ReferralRow.status.in_(["qualified","purchased"])))).scalar() or 0
+                stats["bids_submitted"] = (await s.execute(select(func.count()).select_from(BidRow).where(BidRow.status == "submitted"))).scalar() or 0
+                # 7/30d revenue
+                for days, key in [(1,"revenue_today"),(7,"revenue_7d"),(30,"revenue_30d")]:
+                    since = datetime.now(timezone.utc) - timedelta(days=days)
+                    r = (await s.execute(select(func.coalesce(func.sum(PaymentRow.amount_toman),0)).where(PaymentRow.status=="verified", PaymentRow.verified_at >= since))).scalar() or 0
+                    stats[key] = f"{int(r):,} تومان".replace(",", "٬")
+            await db.dispose()
+        except Exception as e:
+            stats["error"] = str(e)
+        return stats
+
+    async def _handle_admin_callback(self, chat_id: str, data: str) -> None:
+        if not self._require_admin(chat_id):
+            await self.send(chat_id, "⛔ این بخش فقط برای ادمین (7806301378) است.")
+            return
+        # Routing
+        try:
+            from . import admin as admin_ui
+            from sqlalchemy import select, func
+            from .db import Database
+            from .subscriptions.models import PaymentRow, UserAccountRow, ReferralRow
+        except Exception as e:
+            await self.send(chat_id, f"خطای بارگذاری پنل: {escape(str(e))}")
+            return
+
+        cmd = data[len("admin:"):]
+        # Main
+        if cmd == "main":
+            stats = await self._admin_stats()
+            await self.send(chat_id, admin_ui.admin_main_text(stats), admin_ui.admin_main_keyboard())
+            return
+        if cmd == "users" or cmd.startswith("users:"):
+            parts = cmd.split(":")
+            page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+            if cmd == "users:search":
+                await self.send(chat_id, "🔍 برای جستجو: <code>/admin_search 78063</code> یا <code>/admin_set user:7806301378 plan elite</code>\nبرای دیدن جزئیات، شناسه را بفرست: <code>/admin_user 8697160216</code>")
+                return
+            # fetch page
+            try:
+                db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                await db.init()
+                async with db.session_factory() as s:
+                    total = (await s.execute(select(func.count()).select_from(UserAccountRow))).scalar() or 0
+                    limit = 6
+                    offset = (page-1)*limit
+                    rows_q = await s.execute(select(UserAccountRow).order_by(UserAccountRow.id.desc()).limit(limit).offset(offset))
+                    rows = rows_q.scalars().all()
+                    ui_rows = []
+                    for r in rows:
+                        exp = r.plan_expires_at.strftime("%Y-%m-%d") if r.plan_expires_at else "—"
+                        ui_rows.append({"chat_id": r.telegram_chat_id, "username": r.telegram_username, "plan_id": r.plan_id, "expires": exp, "is_active": r.is_active, "referral_code": r.referral_code, "referred_by": r.referred_by})
+                    has_more = offset + limit < total
+                    await self.send(chat_id, admin_ui.users_text(ui_rows, total, page), admin_ui.users_keyboard(ui_rows, page, has_more))
+                await db.dispose()
+            except Exception as e:
+                await self.send(chat_id, f"خطا: {escape(str(e))}")
+            return
+        if cmd.startswith("user:"):
+            # admin:user:chat_id  or admin:user:plan:chat_id etc
+            parts = cmd.split(":")
+            # actions with 3 parts: user:action:chat_id
+            if len(parts) == 3 and parts[1] in {"plan","extend","toggle","delete","bonus"}:
+                action, target = parts[1], parts[2]
+                if action == "plan":
+                    await self.send(chat_id, f"برای تغییر پلن کاربر <code>{escape(target)}</code>:\n<code>/admin_set user:{target} plan elite</code> یا free/starter/pro\nمثال: <code>/admin_set user:{target} plan pro</code>")
+                    return
+                if action == "extend":
+                    await self.send(chat_id, f"تمدید برای <code>{escape(target)}</code>:\n<code>/admin_set user:{target} extend 30</code> → ۳۰ روز\n<code>/admin_set user:{target} extend_bonus 7 starter</code>")
+                    return
+                if action == "toggle":
+                    try:
+                        db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                        await db.init()
+                        async with db.session_factory() as s:
+                            row = (await s.execute(select(UserAccountRow).where(UserAccountRow.telegram_chat_id==str(target)))).scalar_one_or_none()
+                            if row:
+                                row.is_active = not row.is_active
+                                await s.commit()
+                                await self.send(chat_id, f"{'✅ فعال شد' if row.is_active else '🚫 مسدود شد'}: {escape(target)}")
+                            else:
+                                await self.send(chat_id, "کاربر یافت نشد.")
+                        await db.dispose()
+                    except Exception as e:
+                        await self.send(chat_id, f"خطا: {escape(str(e))}")
+                    return
+                if action == "delete":
+                    await self.send(chat_id, f"⚠️ حذف کاربر <code>{escape(target)}</code> قطعی است:\n<code>/admin_set user:{target} delete yes</code>")
+                    return
+                if action == "bonus":
+                    await self.send(chat_id, f"هدیه روز: <code>/admin_set user:{target} bonus 7 pro</code> → ۷ روز حرفه‌ای")
+                    return
+            # view user detail: admin:user:CHATID
+            if len(parts)==2:
+                target = parts[1]
+                try:
+                    db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                    await db.init()
+                    async with db.session_factory() as s:
+                        row = (await s.execute(select(UserAccountRow).where(UserAccountRow.telegram_chat_id==str(target)))).scalar_one_or_none()
+                        if not row:
+                            await self.send(chat_id, "کاربر یافت نشد.")
+                        else:
+                            u = {
+                                "chat_id": row.telegram_chat_id,
+                                "username": row.telegram_username,
+                                "first_name": row.telegram_first_name,
+                                "plan_id": row.plan_id,
+                                "is_active": row.is_active,
+                                "started": row.plan_started_at.strftime("%Y-%m-%d %H:%M") if row.plan_started_at else None,
+                                "expires": row.plan_expires_at.strftime("%Y-%m-%d %H:%M") if row.plan_expires_at else None,
+                                "referral_code": row.referral_code,
+                                "referred_by": row.referred_by,
+                                "total_bids": row.total_bids,
+                                "successful_bids": row.successful_bids,
+                                "created": row.created_at.strftime("%Y-%m-%d") if row.created_at else None,
+                            }
+                            await self.send(chat_id, admin_ui.user_detail_text(u), admin_ui.user_detail_keyboard(target))
+                    await db.dispose()
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+        if cmd == "plans" or cmd.startswith("plan:"):
+            # plan list or single plan actions
+            if cmd == "plans":
+                from .subscriptions.plans import all_plans as _all
+                plans = [{"id":p.id,"title":p.title,"tagline":p.tagline,"price_toman":p.price_toman,"period_days":p.period_days,"badge":p.badge,"limits":p.limits.__dict__, "features": p.features} for p in _all()]
+                overrides = {k.replace("admin.plans.",""): self.store.get(k) for k in [f"admin.plans.{p['id']}.price_toman" for p in plans] if self.store.get(k) is not None}
+                # also collect limit overrides
+                for p in plans:
+                    for f in ["max_bids_per_hour","max_bids_per_day","max_bids_per_month","min_seconds_between_bids","max_active_sites"]:
+                        v = self.store.get(f"admin.plans.{p['id']}.limits.{f}")
+                        if v is not None:
+                            overrides.setdefault(f"{p['id']}_limits", {})[f] = v
+                await self.send(chat_id, admin_ui.plans_admin_text(plans, overrides), admin_ui.plans_admin_keyboard(plans))
+                return
+            # single plan view / actions
+            parts = cmd.split(":")
+            if len(parts)==2:
+                pid = parts[1]
+                if pid == "new":
+                    await self.send(chat_id, "پلن سفارشی: <code>/admin_set plan:custom price 450000</code> سپس <code>/admin_set plan:custom title \"پلن ویژه\"</code>")
+                    return
+                from .subscriptions.plans import get_plan
+                try:
+                    p = get_plan(pid)
+                    plan_dict = {"id":p.id,"title":p.title,"tagline":p.tagline,"price_toman":p.price_toman,"period_days":p.period_days,"badge":p.badge,"limits":p.limits.__dict__,"features":p.features}
+                    ov = {}
+                    # gather overrides for this plan
+                    for k in [f"admin.plans.{pid}.price_toman", f"admin.plans.{pid}.period_days"]:
+                        v = self.store.get(k)
+                        if v is not None:
+                            ov[pid] = ov.get(pid,{})
+                            ov[pid][k.split(".")[-1]] = v
+                    for f in ["max_bids_per_hour","max_bids_per_day","max_bids_per_month","min_seconds_between_bids","max_active_sites"]:
+                        v = self.store.get(f"admin.plans.{pid}.limits.{f}")
+                        if v is not None:
+                            ov.setdefault(f"{pid}_limits", {})[f]=v
+                    await self.send(chat_id, admin_ui.single_plan_text(plan_dict, ov), admin_ui.single_plan_keyboard(pid))
+                except Exception as e:
+                    await self.send(chat_id, f"پلن نامعتبر: {escape(str(e))}")
+                return
+            if len(parts)==3:
+                _, field, pid = parts
+                if field == "price":
+                    await self.send(chat_id, f"قیمت جدید برای <b>{esc(pid)}</b> را بفرست:\n<code>/admin_set plan:{pid} price 350000</code>")
+                    return
+                if field == "period":
+                    await self.send(chat_id, f"دوره جدید (روز): <code>/admin_set plan:{pid} period 30</code>")
+                    return
+                if field == "limits":
+                    await self.send(chat_id, f"سقف‌ها: <code>/admin_set plan:{pid} limits max_bids_per_hour 20</code>\nیا <code>/admin_set plan:{pid} limits max_bids_per_day 100</code>")
+                    return
+                if field == "recommend":
+                    cur = self.store.get(f"admin.plans.{pid}.recommended")
+                    new = not bool(cur) if cur is not None else True
+                    # simplified: store flag
+                    self.store.set(f"admin.plans.{pid}.recommended", new)
+                    await self.send(chat_id, f"{'⭐ پیشنهاد ویژه شد' if new else 'حذف از پیشنهاد ویژه'}: {esc(pid)}")
+                    return
+        if cmd == "revenue":
+            await self.send(chat_id, admin_ui.revenue_text(self.store), admin_ui.revenue_keyboard())
+            return
+        if cmd.startswith("rev:"):
+            sub = cmd.split(":")[1]
+            if sub == "ratio":
+                await self.send(chat_id, "نسبت داخل بازه (۰٫۱ تا ۱٫۰) یا درصد تخفیف بودجه ثابت:\n<code>/admin_set pricing.ratio 0.5</code> یا <code>/admin_set pricing.bid_percent 60</code>")
+                return
+            if sub == "strategy":
+                await self.send(chat_id, "استراتژی: <code>/admin_set pricing.strategy midpoint_round</code>\nگزینه‌ها: midpoint_round / aggressive_low / premium_high / fixed")
+                return
+            if sub == "commission":
+                await self.send(chat_id, "کمیسیون پلتفرم ٪: <code>/admin_set admin.revenue.commission_percent 10</code>")
+                return
+            if sub == "promo":
+                await self.send(chat_id, "کد تخفیف: <code>/admin_set admin.promo.active_code WELCOME10</code> و درصد: <code>/admin_set admin.promo.discount_percent 10</code>")
+                return
+        if cmd == "gateways":
+            await self.send(chat_id, admin_ui.gateways_text(self.store), admin_ui.gateways_keyboard())
+            return
+        if cmd.startswith("gw:"):
+            gid = cmd.split(":")[1]
+            await self.send(chat_id, f"مرچنت {esc(gid)}:\n<code>/admin_set payments.{gid}.merchant_id YOUR_MERCHANT</code>\nسندباکس: <code>/admin_set payments.{gid}.sandbox 1</code>")
+            return
+        if cmd == "referrals":
+            # stats
+            try:
+                db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                await db.init()
+                async with db.session_factory() as s:
+                    total = (await s.execute(select(func.count()).select_from(ReferralRow))).scalar() or 0
+                    qual = (await s.execute(select(func.count()).select_from(ReferralRow).where(ReferralRow.status.in_(["qualified","purchased"])))).scalar() or 0
+                    purch = (await s.execute(select(func.count()).select_from(ReferralRow).where(ReferralRow.status=="purchased"))).scalar() or 0
+                    stats = {"total": total, "qualified": qual, "purchased": purch}
+                await db.dispose()
+            except Exception:
+                stats = {}
+            await self.send(chat_id, admin_ui.referrals_text(self.store, stats), admin_ui.referrals_keyboard())
+            return
+        if cmd.startswith("ref:"):
+            sub = cmd.split(":")[1]
+            if sub == "milestones":
+                await self.send(chat_id, "میل‌استون‌ها JSON:\n<code>/admin_set admin.referrals.milestones [{\"count\":3,\"days\":7,\"plan\":\"starter\"}]</code>")
+                return
+            if sub == "bonus":
+                await self.send(chat_id, "پاداش خرید معرف: <code>/admin_set admin.referrals.purchase_bonus_days 7</code>")
+                return
+            if sub == "list":
+                try:
+                    db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                    await db.init()
+                    async with db.session_factory() as s:
+                        rows = (await s.execute(select(ReferralRow).order_by(ReferralRow.id.desc()).limit(8))).scalars().all()
+                        txt = "<b>آخرین دعوت‌ها</b>\n"+hr()+"\n" if rows else "هنوز دعوتی نیست."
+                        for r in rows:
+                            txt += f"<code>{esc(r.inviter_chat_id)}</code> → <code>{esc(r.invitee_chat_id)}</code> · {esc(r.status)}\n"
+                        await self.send(chat_id, txt)
+                    await db.dispose()
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+        if cmd == "reports":
+            stats = await self._admin_stats()
+            # enrich
+            total_users = stats.get("users_total",0)
+            subs = stats.get("subs_active",0)
+            conv = f"{(int(subs)/max(int(total_users),1)*100):.1f}٪" if str(total_users).isdigit() else "—"
+            stats["conversion_rate"] = conv
+            await self.send(chat_id, admin_ui.reports_text(stats), admin_ui.reports_keyboard())
+            return
+        if cmd.startswith("reports:"):
+            sub = cmd.split(":")[1]
+            if sub == "csv":
+                which = cmd.split(":")[2] if ":" in cmd[8:] else "users"
+                await self.send(chat_id, f"در حال تولید CSV <b>{esc(which)}</b>...\nبرای دانلود دستی: روی سرور <code>sqlite3 data/bidpilot.sqlite3 \"SELECT * FROM user_accounts;\" > export.csv</code>")
+                return
+            if sub == "chart":
+                await self.send(chat_id, "نمودار ۷روزه (درآمد/ثبت‌نام) بزودی — فعلاً از <b>Reports</b> بخش درآمد روزانه را ببینید.")
+                return
+        if cmd == "system":
+            await self.send(chat_id, admin_ui.system_text(self.store), admin_ui.system_keyboard())
+            return
+        if cmd.startswith("sys:"):
+            sub = cmd.split(":")[1]
+            if sub == "poll":
+                await self.send(chat_id, "پولینگ: <code>/admin_set runtime.poll_interval_seconds 120</code> و جیتر <code>/admin_set runtime.jitter_seconds 30</code>")
+                return
+            if sub == "mode":
+                cur = self.store.get("runtime.submit_mode") or "dry_run"
+                nxt = "live" if cur == "dry_run" else "dry_run"
+                self.store.set("runtime.submit_mode", nxt)
+                await self.send(chat_id, f"حالت ارسال → <b>{esc(nxt)}</b>")
+                return
+            if sub == "llm":
+                await self.send(chat_id, "LLM: <code>/admin_set llm.provider groq</code> و مدل <code>/admin_set llm.model openai/gpt-oss-120b</code>")
+                return
+            if sub == "proxy":
+                await self.send(chat_id, "پروکسی: <code>/admin_set network.proxy http://127.0.0.1:10809</code> یا <code>off</code>")
+                return
+            if sub == "filters":
+                await self.send(chat_id, "فیلترها: <code>/admin_set filters.require_budget true</code> / <code>filters.require_skill_match</code>")
+                return
+            if sub == "site":
+                await self.send(chat_id, "سایت فعال: <code>/admin_set marketplace.name parscoders</code> (یا ponisha/karlancer)")
+                return
+            if sub == "maintenance":
+                cur = self.store.get_bool("admin.maintenance")
+                self.store.set("admin.maintenance", not cur)
+                await self.send(chat_id, f"حالت نگهداری: {'🔴 روشن — کاربران عادی بلاک می‌شوند' if not cur else '🟢 خاموش'}")
+                return
+        if cmd == "advanced":
+            await self.send(chat_id, admin_ui.advanced_text(self.store), admin_ui.advanced_keyboard())
+            return
+        if cmd.startswith("adv:"):
+            sub = cmd.split(":")[1]
+            if sub == "logs":
+                await self.send(chat_id, "لاگ: روی سرور <code>tail -f data/bidpilot.log</code> یا <code>bidpilot doctor</code>")
+                return
+            if sub == "cleanup":
+                await self.send(chat_id, "پاکسازی: <code>/admin_set admin.adv.cleanup yes</code> (فعلاً دستی روی سرور انجام می‌شود)")
+                return
+            if sub == "addadmin":
+                await self.send(chat_id, "افزودن ادمین دوم: <code>/admin_set admin.extra_ids 123456,789012</code>")
+                return
+        if cmd == "broadcast":
+            await self.send(chat_id, "📢 پیام همگانی: <code>/broadcast سلام — آپدیت جدید ...</code>\nهمه کاربران فعال پیام را دریافت می‌کنند.")
+            return
+        if cmd.startswith("broadcast:"):
+            # admin:broadcast:confirm:123
+            if "confirm" in cmd:
+                pending = self.store.get("admin.pending_broadcast")
+                if not pending:
+                    await self.send(chat_id, "پیام همگانی یافت نشد — دوباره <code>/broadcast</code> بفرست.")
+                    return
+                # send to all users
+                from .db import Database
+                from .subscriptions.models import UserAccountRow
+                from sqlalchemy import select
+                await self.send(chat_id, f"⏳ در حال ارسال به همه کاربران... \n<code>{esc(str(pending)[:200])}...</code>")
+                db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                await db.init()
+                count = 0
+                async with db.session_factory() as s:
+                    rows = (await s.execute(select(UserAccountRow.telegram_chat_id))).scalars().all()
+                    for uid in rows:
+                        try:
+                            await self.send(str(uid), f"📢 <b>پیام از تیم BidPilot</b>\n{hr()}\n{esc(str(pending))}")
+                            count += 1
+                            await asyncio.sleep(0.05)
+                        except Exception:
+                            pass
+                await db.dispose()
+                self.store.delete("admin.pending_broadcast")
+                await self.send(chat_id, f"✅ پیام همگانی به {count} کاربر ارسال شد.")
+                return
+        await self.send(chat_id, "دستور ادمین نامعتبر.", admin_ui.admin_main_keyboard())
+
+    async def _handle_admin_set(self, chat_id: str, rest: str) -> None:
+        if not rest or " " not in rest.strip():
+            await self.send(chat_id, "<b>فرمت:</b> <code>/admin_set &lt;key&gt; &lt;value&gt;</code>\nنمونه‌ها:\n"
+                                      "<code>/admin_set pricing.ratio 0.4</code>\n"
+                                      "<code>/admin_set admin.revenue.commission_percent 12</code>\n"
+                                      "<code>/admin_set plan:starter price 350000</code> (میانبر)\n"
+                                      "<code>/admin_set user:8697160216 plan elite</code>\n"
+                                      "<code>/admin_set user:8697160216 extend 30</code>")
+            return
+        # user:xxx sugar
+        rest = rest.strip()
+        # handle sugar: plan:xxx, user:xxx
+        if rest.startswith("plan:") or rest.startswith("user:"):
+            # translate to store keys
+            try:
+                # plan:starter price 350000 -> admin.plans.starter.price_toman 350000
+                if rest.startswith("plan:"):
+                    # e.g. plan:starter price 350000
+                    left, val = rest.rsplit(" ", 1)
+                    _, plan_and_field = left.split(" ", 1)  # "plan:starter" "price"
+                    # Actually rest = "plan:starter price 350000" -> left="plan:starter price", val="350000"
+                    # Better split 3 parts
+                    parts = rest.split()
+                    # parts[0]=plan:starter, parts[1]=price, parts[2]=350000 (value may contain spaces? take rest)
+                    if len(parts) >= 3:
+                        plan_part = parts[0]  # plan:starter
+                        field = parts[1]
+                        value = " ".join(parts[2:])
+                        pid = plan_part.split(":")[1]
+                        key_map = {"price":"admin.plans.{}.price_toman","period":"admin.plans.{}.period_days","title":"admin.plans.{}.title"}
+                        key_tmpl = key_map.get(field, f"admin.plans.{{}}.{field}")
+                        key = key_tmpl.format(pid)
+                        # try convert numeric
+                        try:
+                            if field in {"price","period"} or "price" in key:
+                                value = str(int(value.replace(",","").replace("٬","")))
+                            self.store.set(key, int(value))
+                        except ValueError:
+                            self.store.set(key, value)
+                        await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(key)} = {esc(value)}</code>")
+                        return
+                if rest.startswith("user:"):
+                    parts = rest.split()
+                    if len(parts) >= 3:
+                        user_part = parts[0]  # user:ID
+                        field = parts[1]
+                        value = " ".join(parts[2:])
+                        uid = user_part.split(":")[1]
+                        # handle user actions via DB
+                        from .db import Database
+                        from sqlalchemy import select
+                        from .subscriptions.models import UserAccountRow
+                        from datetime import timedelta, timezone
+                        db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+                        await db.init()
+                        async with db.session_factory() as s:
+                            row = (await s.execute(select(UserAccountRow).where(UserAccountRow.telegram_chat_id==str(uid)))).scalar_one_or_none()
+                            if not row:
+                                await self.send(chat_id, "کاربر یافت نشد.")
+                                await db.dispose()
+                                return
+                            if field == "plan":
+                                row.plan_id = value.strip().lower()
+                                row.plan_started_at = datetime.now(timezone.utc)
+                                row.plan_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+                                await s.commit()
+                                await self.send(chat_id, f"✅ پلن {esc(uid)} → <b>{esc(row.plan_id)}</b> تا {esc(row.plan_expires_at.strftime('%Y-%m-%d'))}")
+                            elif field in {"extend","extend_bonus","bonus"}:
+                                days = int(value.split()[0])
+                                plan_id = value.split()[1] if len(value.split())>1 else row.plan_id
+                                # extend
+                                now = datetime.now(timezone.utc)
+                                base = row.plan_expires_at if row.plan_expires_at and row.plan_expires_at>now else now
+                                row.plan_expires_at = base + timedelta(days=days)
+                                if field != "extend" and len(value.split())>1:
+                                    row.plan_id = plan_id
+                                await s.commit()
+                                await self.send(chat_id, f"✅ تمدید {days} روز برای {esc(uid)} → انقضا {esc(row.plan_expires_at.strftime('%Y-%m-%d'))}")
+                            elif field == "delete" and value.lower() in {"yes","true","1"}:
+                                await s.delete(row)
+                                await s.commit()
+                                await self.send(chat_id, f"🗑️ حذف شد: {esc(uid)}")
+                            else:
+                                await self.send(chat_id, f"فیلد نامعتبر: {esc(field)}")
+                        await db.dispose()
+                        return
+            except Exception as e:
+                await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+        # generic store set: key value
+        try:
+            key, val = rest.split(" ", 1)
+            key = key.strip()
+            val = val.strip()
+            # try json / int / bool
+            lowered = val.lower()
+            if lowered in {"true","false","yes","no","on","off"}:
+                b = lowered in {"true","yes","on"}
+                self.store.set(key, b)
+            else:
+                try:
+                    # int?
+                    if val.replace(",","").replace("٬","").replace("-","").isdigit():
+                        self.store.set(key, int(val.replace(",","").replace("٬","")))
+                    elif val.replace(".","",1).replace(",","").isdigit():
+                        self.store.set(key, float(val))
+                    else:
+                        # try json
+                        if (val.startswith("{") or val.startswith("[")):
+                            self.store.set(key, json.loads(val))
+                        else:
+                            self.store.set(key, val)
+                except Exception:
+                    self.store.set(key, val)
+            await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(key)} = {esc(val)}</code>")
+        except Exception as e:
+            await self.send(chat_id, f"❌ ذخیره ناموفق: {escape(str(e))}")
+
+    async def _handle_admin_search(self, chat_id: str, rest: str) -> None:
+        q = (rest or "").strip()
+        if not q:
+            await self.send(chat_id, "مثال: <code>/admin_search ali</code> یا <code>/admin_search 8697</code>")
+            return
+        try:
+            from .db import Database
+            from sqlalchemy import select, or_
+            from .subscriptions.models import UserAccountRow
+            db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+            await db.init()
+            async with db.session_factory() as s:
+                stmt = select(UserAccountRow).where(or_(UserAccountRow.telegram_chat_id.contains(q), UserAccountRow.telegram_username.contains(q), UserAccountRow.telegram_first_name.contains(q))).limit(10)
+                rows = (await s.execute(stmt)).scalars().all()
+                if not rows:
+                    await self.send(chat_id, "نتیجه‌ای نبود.")
+                else:
+                    txt = f"<b>نتایج جستجو «{esc(q)}» — {len(rows)} مورد</b>\n{hr()}\n"
+                    for r in rows:
+                        txt += f"<code>{esc(r.telegram_chat_id)}</code> · @{esc(r.telegram_username or '—')} · {esc(r.plan_id)} · انقضا {esc(r.plan_expires_at.strftime('%Y-%m-%d') if r.plan_expires_at else '—')}\n"
+                    await self.send(chat_id, txt)
+            await db.dispose()
+        except Exception as e:
+            await self.send(chat_id, f"خطا: {escape(str(e))}")
+
+    async def _handle_broadcast(self, chat_id: str, rest: str) -> None:
+        if not rest or len(rest.strip()) < 5:
+            await self.send(chat_id, "متن پیام همگانی را بفرست:\n<code>/broadcast سلام — فردا تخفیف ۲۰٪ برای پلن حرفه‌ای!</code>")
+            return
+        text = rest.strip()
+        # confirmation keyboard
+        await self.send(chat_id, f"<b>پیش‌نمایش پیام همگانی:</b>\n\n{esc(text)}\n\n{hr()}\nآیا ارسال شود به همه کاربران؟", {"inline_keyboard": [[{"text": "✅ بله، ارسال کن", "callback_data": f"admin:broadcast:confirm:{len(text)}"} , {"text": "❌ لغو", "callback_data": "admin:main"}]]})
+        # store pending broadcast in memory/flow? simple: store in store temp
+        self.store.set("admin.pending_broadcast", text)
 
     async def _cmd_profile(self, chat_id: str) -> None:
         """A failed import keeps its queue: offer the retry before asking again."""
@@ -1681,11 +2270,36 @@ class BotService:
 
     # ── referral & start with deep link ──────────────────────────
     def _bot_username(self) -> str:
-        for k in ("telegram.bot_username", "telegram.username", "bot.username"):
+        # Correct bot is @BidPilotIranbot — not @BidPilotBot
+        for k in ("telegram.bot_username", "telegram.username", "bot.username", "telegram.bot_id"):
             v = self.store.get(k)
             if v:
-                return str(v).lstrip("@")
-        return "BidPilotBot"
+                # handle cases where value is "BidPilotIranbot" or "https://t.me/..."
+                s = str(v).strip().lstrip("@")
+                if "t.me/" in s:
+                    s = s.split("t.me/")[-1].split("?")[0].split("/")[0]
+                if s:
+                    return s
+        # Fallback: canonical production bot
+        return "BidPilotIranbot"
+
+    async def _ensure_bot_username_cached(self) -> None:
+        """If store has no username, try to learn it live from Telegram (getMe)."""
+        # Already have it?
+        for k in ("telegram.bot_username", "telegram.username", "bot.username"):
+            if self.store.get(k):
+                return
+        try:
+            me = await self.api.get_me()  # type: ignore[attr-defined]
+            uname = (me or {}).get("username")
+            if uname:
+                # persist so future referrals use correct link even before next restart
+                try:
+                    self.store.set("telegram.bot_username", str(uname).lstrip("@"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def _handle_referral_start(self, chat_id: str, rest: str) -> bool:
         rest = (rest or "").strip()
@@ -1741,6 +2355,8 @@ class BotService:
             pass
 
     async def _cmd_start(self, chat_id: str, rest: str = "") -> None:
+        # Learn real @username live if not cached (fixes wrong fallback link)
+        await self._ensure_bot_username_cached()
         # handle referral if present, then show main menu
         if rest:
             await self._handle_referral_start(chat_id, rest)
@@ -1785,6 +2401,7 @@ class BotService:
         await self.send(chat_id, gateway_picker_text(plan), gateway_picker_keyboard(plan.id))
 
     async def _cmd_invite(self, chat_id: str) -> None:
+        await self._ensure_bot_username_cached()
         try:
             from .db import Database
             from .subscriptions.referrals import ReferralManager, MILESTONES

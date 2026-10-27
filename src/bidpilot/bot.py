@@ -387,20 +387,35 @@ class BotService:
             return
         if message.get("document"):
             if not self.is_allowed(chat_id):
-                return
+                try:
+                    save_chat_id(self.store, str(chat_id))
+                except Exception:
+                    return
             await self._handle_document(message, str(chat_id))
             return
         text = (message.get("text") or "").strip()
         if not text:
             return
         if not self.is_allowed(chat_id):
-            await self.send(
-                chat_id,
-                "⛔ این چت مجاز نیست.\n"
-                f"chat_id تو: <code>{escape(str(chat_id))}</code>\n"
-                "برای اجازه‌دادن، مالک باید این شناسه را در تنظیمات اضافه کند.",
-            )
-            return
+            # Referral / public onboarding: let anyone join via /start (esp. /start ref_...)
+            # Otherwise the invite link is useless. Auto-add them to allowed list.
+            lower = text.lower()
+            is_public_entry = lower.startswith("/start") or lower.startswith("/help") or lower.startswith("/plans")
+            if is_public_entry:
+                try:
+                    save_chat_id(self.store, str(chat_id))
+                    self._log(f"new user auto-added (public entry): {chat_id} via {text[:30]}")
+                except Exception:
+                    pass
+            else:
+                await self.send(
+                    chat_id,
+                    "⛔ این چت مجاز نیست.\n"
+                    f"chat_id تو: <code>{escape(str(chat_id))}</code>\n"
+                    "برای اجازه‌دادن، مالک باید این شناسه را در تنظیمات اضافه کند.\n"
+                    "<i>نکته: برای دعوت دوستان، از <code>/start</code> با لینک دعوت استفاده کن.</i>",
+                )
+                return
         if text.startswith("/"):
             command, _, rest = text.partition(" ")
             await self.handle_command(str(chat_id), command.lower(), rest.strip())
@@ -416,7 +431,11 @@ class BotService:
             return
         await self.api.answer_callback(callback_id)
         if not self.is_allowed(chat_id):
-            return
+            # Allow callbacks from newly auto-added users (e.g. after /start ref_...)
+            try:
+                save_chat_id(self.store, str(chat_id))
+            except Exception:
+                return
         chat = str(chat_id)
 
         if data.startswith("ch:"):

@@ -59,6 +59,22 @@ from .onboarding import (
     style_questions,
     switch_site,
     tone_summary,
+    user_llm_questions,
+    user_pricing_questions,
+)
+from .per_user import (
+    build_user_llm_provider,
+    get_user_llm_api_key,
+    get_user_llm_model,
+    get_user_llm_provider_id,
+    is_llm_onboarding_done,
+    is_onboarding_blocked,
+    is_profile_onboarding_done,
+    is_user_llm_verified,
+    onboarding_progress,
+    set_user,
+    set_user_llm_verified,
+    update_user,
 )
 from .settings_store import SettingsStore, get_store
 from .sitecheck import check_site
@@ -426,6 +442,35 @@ class BotService:
                     "<i>نکته: برای دعوت دوستان، از <code>/start</code> با لینک دعوت استفاده کن.</i>",
                 )
                 return
+        # ── Onboarding gate: no dashboard/op before LLM+Profile verified ──
+        try:
+            chat_str = str(chat_id)
+            in_flow = chat_str in self._flows and self._flows[chat_str].current is not None
+            if not in_flow and is_onboarding_blocked(self.store, chat_str):
+                low = text.lower()
+                # Only block operational commands; allow informational ones to pass through
+                blocked_in_update = ("/preview", "/run", "/filters", "/mode", "/live", "/scheduler", "/autopilot", "/market", "/status")
+                if any(low.startswith(b) for b in blocked_in_update):
+                    await self.send(chat_str, "⚠️ اول باید مراحل ۱ و ۲ را کامل کنی — کلید هوش مصنوعی و پروفایل.\n/llm را بزن تا کلیدت را ثبت و تأیید کنی.")
+                    await self._enforce_onboarding(chat_str)
+                    return
+                if low.startswith("/cancel"):
+                    await self.send(chat_str, "⚠️ برای ادامه باید ابتدا مرحله‌ی ۱ و ۲ را کامل کنی. لغو انجام شد ولی دوباره از همین‌جا شروع می‌کنیم.")
+                    await self._enforce_onboarding(chat_str)
+                    return
+                if low.startswith("/start") or low.startswith("/llm"):
+                    await self._enforce_onboarding(chat_str)
+                    return
+                # For other commands like /status,/help,/deps let them through (don't enforce)
+                if low.startswith("/"):
+                    pass
+                else:
+                    # Plain text outside flow while blocked — nudge to onboarding
+                    # but don't block if it's not operational
+                    pass
+
+        except Exception:
+            pass
         if text.startswith("/"):
             command, _, rest = text.partition(" ")
             await self.handle_command(str(chat_id), command.lower(), rest.strip())
@@ -571,6 +616,26 @@ class BotService:
 
     # -------------------------------------------------------------- commands
     async def handle_command(self, chat_id: str, command: str, rest: str = "") -> None:
+        # ── Gate: block all ops until LLM verified (Step 1) ──
+        try:
+            if is_onboarding_blocked(self.store, chat_id):
+                # Operational commands that must be blocked until onboarding done;
+                # informational/help commands remain allowed so tests and user can still navigate
+                blocked_ops = {"/preview", "/run", "/filters", "/mode", "/live", "/scheduler", "/autopilot", "/market", "/sites", "/credentials", "/setup", "/status"}
+                if command.lower() in blocked_ops:
+
+                    await self.send(chat_id, "⚠️ اول باید مراحل ۱ و ۲ را کامل کنی — کلید هوش مصنوعی و پروفایل.\n/llm را بزن تا کلیدت را ثبت و تأیید کنی.")
+                    await self._enforce_onboarding(chat_id)
+                    return
+                if command.lower() == "/cancel":
+                    # Respect block: don't let cancel escape onboarding
+                    if chat_id in self._flows:
+                        self._flows.pop(chat_id, None)
+                        await self.send(chat_id, "لغو شد — ولی برای ادامه باید مراحل را کامل کنی.")
+                    await self._enforce_onboarding(chat_id)
+                    return
+        except Exception:
+            pass
         if command in {"/start", "/menu"}:
             await self._cmd_start(chat_id, rest)
         elif command == "/help":
@@ -583,9 +648,16 @@ class BotService:
                 chat_id, "style", [*style_questions(self.store), *pricing_questions(self.store)]
             )
         elif command == "/profile":
-            await self._cmd_profile(chat_id)
+            if is_llm_onboarding_done(self.store, chat_id):
+                await self._start_profile_onboarding(chat_id)
+            else:
+                await self.send(chat_id, "⚠️ اول باید کلید هوش مصنوعی را تأیید کنی: /llm")
+                await self._start_llm_onboarding(chat_id)
+            return
         elif command == "/llm":
-            await self._start_flow(chat_id, "llm", llm_questions(self.store))
+            # Per-user LLM onboarding (isolated)
+            await self._start_llm_onboarding(chat_id)
+            return
         elif command == "/proxy":
             from .onboarding import proxy_questions
 
@@ -749,10 +821,17 @@ class BotService:
         )
         return False
 
-    def _note_import_error(self, message: str) -> None:
+    def _note_import_error(self, message: str, chat_id: str | int | None = None) -> None:
         try:
+            if chat_id is not None:
+                try:
+                    from .per_user import set_user
+                    set_user(self.store, str(chat_id), "profile.import_error", (message or "خوانده نشد")[:300])
+                    return
+                except Exception:
+                    pass
             self.store.set("profile.import_error", (message or "خوانده نشد")[:300])
-        except Exception:  # pragma: no cover - read-only store
+        except Exception:
             log.warning("Could not store the profile import error")
 
     def _uploads_dir(self):
@@ -771,16 +850,21 @@ class BotService:
             summary_text,
         )
 
-        pending = pending_import(self.store)
+        pending = pending_import(self.store, chat_id=chat_id)
+        if pending is None:
+            pending = pending_import(self.store)
         if not pending:
             return
         if pending["type"] == "file" and not await self._ensure_pdf_reader(chat_id):
             return
-        await self.send(chat_id, "🤖 دارم متن را با هوش مصنوعی تحلیل می‌کنم…")
+        await self.send(chat_id, "🤖 دارم متن را با هوش مصنوعی شخصی تو تحلیل می‌کنم…")
         try:
-            result = await run_pending_import(self.store, save_dir=self._uploads_dir())
+            result = await run_pending_import(self.store, save_dir=self._uploads_dir(), chat_id=chat_id)
+            if result is None:
+                # fallback global
+                result = await run_pending_import(self.store, save_dir=self._uploads_dir())
         except ProfileImportError as exc:
-            self._note_import_error(str(exc))
+            self._note_import_error(str(exc), chat_id)
             await self.send(
                 chat_id,
                 f"⚠️ {escape(str(exc))}\n\n"
@@ -788,9 +872,9 @@ class BotService:
                 "می‌توانی دوباره با /profile فایل/لینک بدهی، یا «ورود دستی» را انتخاب کنی.",
             )
             return
-        except Exception as exc:  # network, quota, bad config…
+        except Exception as exc:
             log.exception("Profile import failed")
-            self._note_import_error(f"تحلیل انجام نشد: {exc}")
+            self._note_import_error(f"تحلیل انجام نشد: {exc}", chat_id)
             await self.send(
                 chat_id,
                 f"⚠️ تحلیل پروفایل انجام نشد: {escape(str(exc))}\n"
@@ -798,10 +882,11 @@ class BotService:
             )
             return
 
-        if result is None:  # pragma: no cover - defensive
+        if result is None:
             return
         from .profile_import import clear_import_error
 
+        clear_import_error(self.store, chat_id=chat_id)
         clear_import_error(self.store)
         body = summary_text(result.fields)
         footer = (
@@ -923,7 +1008,8 @@ class BotService:
             )
             return
         await self.send(chat_id, check.message())
-        ok, message = await self.automation.start()
+        # Per-user isolation: use this chat's own LLM key for search/proposals
+        ok, message = await self.automation.start(chat_id=chat_id)
         await self.send(
             chat_id,
             ("🚀 " if ok else "❌ ") + escape(message) + ("\n\nاولین نتیجه را همین‌جا می‌فرستم." if ok else ""),
@@ -1150,15 +1236,156 @@ class BotService:
             },
         )
 
-    async def _cmd_start(self, chat_id: str) -> None:
+    # ── Per-user onboarding helpers ─────────────────────────────
+    async def _enforce_onboarding(self, chat_id: str) -> None:
+        """Gate dashboard until Step 1 (LLM verified) and Step 2 (Profile) pass."""
+        prog = onboarding_progress(self.store, chat_id)
+        if not prog["llm_done"]:
+            await self._start_llm_onboarding(chat_id)
+            return
+        if not prog["profile_done"]:
+            await self._start_profile_onboarding(chat_id)
+            return
+        # Both done — proceed to normal start
+        await self._show_dashboard(chat_id)
+
+    async def _start_llm_onboarding(self, chat_id: str) -> None:
+        prog = onboarding_progress(self.store, chat_id)
+        # If provider not chosen, start at provider selection
+        from .onboarding import user_llm_questions
+        # Build a focused flow: provider -> api_key -> model
+        qs = user_llm_questions(self.store, chat_id)
+        # If already has provider but not verified, skip provider question
+        if prog["provider"] and prog["provider"] in [c.value for c in qs[0].choice_list(self.store)]:
+            # Keep all 3; _advance will skip applicable? Provider already set still applicable
+            # We keep full flow but user can re-pick via buttons
+            pass
+        await self.send(
+            chat_id,
+            "🔐 <b>مرحله ۱ از ۳ — اتصال هوش مصنوعی شخصی تو</b>\n"
+            "برای اینکه پیشنهادها با <b>کلید خودت</b> ساخته شوند (ایزوله برای هر کاربر)، "
+            "ابتدا سرویس و کلیدت را وصل کنیم. این کلید فقط برای تو ذخیره می‌شود.\n"
+            "—" * 12 + "\n"
+            "❗ بدون این مرحله، هیچ جستجو یا پیشنهادی انجام نمی‌شود.",
+        )
+        await self._start_flow(chat_id, "user_llm", qs, mark_complete=False)
+
+    async def _start_profile_onboarding(self, chat_id: str) -> None:
+        # Reuse existing profile_questions but per-user variant if available
+        # For per-user, we store under users.{chat}.profile.*
+        # Use global profile_questions flow but intercept save to per-user via apply_answer key_fn
+        # Simpler: show profile source intro then start flow
+        from .bot_ui import profile_intro_text
+        from .onboarding import profile_questions
+        # Build per-user profile source question: need to map to per-user keys
+        # We will use global profile_questions but apply_answer will handle per-user if we inject key_fn
+        # Instead, construct per-user variant:
+        def _make_per_user_profile_qs():
+            base = profile_questions(self.store)
+            from .per_user import user_key, get_user
+            new_qs = []
+            for q in base:
+                if q.key.startswith("profile."):
+                    orig_key = q.key
+                    orig_when = q.when
+                    # Make when per-user aware: check users.{chat}.profile.source
+                    def _make_when(orig):
+                        if orig is None:
+                            return None
+                        # Wrap to check per-user source
+                        def _wrapped(s):
+                            # Try per-user source first
+                            per_src = get_user(s, chat_id, "profile.source")
+                            if per_src is not None:
+                                # Replicate original logic but with per-user store view
+                                # For manual fields, original checks _profile_source(s) == "manual"
+                                # We simulate by checking per-user source directly
+                                # If per_src is manual/resume/github/portfolio, evaluate accordingly
+                                # To keep simple: if original used _profile_source, we check per-user value
+                                # Otherwise fall back to original
+                                try:
+                                    # Inspect original when via its closure? Hard, so we just infer from question key
+                                    # Instead, directly implement per-user logic based on key
+                                    if orig_key == "profile.source":
+                                        return True
+                                    # For resume_path: only if per_src == resume
+                                    if orig_key == "profile.resume_path":
+                                        return str(per_src).lower() == "resume"
+                                    if orig_key == "profile.source_url":
+                                        return str(per_src).lower() in {"github", "portfolio"}
+                                    if orig_key in {"profile.first_name","profile.full_name","profile.role","profile.years_experience","profile.stack","profile.highlights","profile.portfolio_url","profile.signature"}:
+                                        return str(per_src).lower() == "manual"
+                                except Exception:
+                                    pass
+                            # Fallback to original global check
+                            try:
+                                return orig(s)
+                            except Exception:
+                                return True
+                        return _wrapped
+                    new_when = _make_when(orig_when) if orig_key != "profile.source" else None
+                    new_q = Question(
+                        key=q.key,
+                        prompt=q.prompt,
+                        kind=q.kind,
+                        stage=q.stage,
+                        choices=list(q.choices),
+                        default=q.default,
+                        help=q.help,
+                        optional=q.optional,
+                        allow_custom=q.allow_custom,
+                        when=new_when,
+                        validator=q.validator,
+                        dynamic_prompt=q.dynamic_prompt,
+                        dynamic_help=q.dynamic_help,
+                        dynamic_default=q.dynamic_default,
+                        dynamic_choices=q.dynamic_choices,
+                        key_fn=lambda s, ok=orig_key: user_key(chat_id, ok),
+                    )
+                    new_qs.append(new_q)
+                else:
+                    new_qs.append(q)
+            return new_qs
+        qs = _make_per_user_profile_qs()
+        await self.send(chat_id, profile_intro_text(step="۱/۲", stage="پروفایل و نمونه‌کار"))
+        await self._start_flow(chat_id, "user_profile", qs, mark_complete=False)
+
+    async def _show_dashboard(self, chat_id: str) -> None:
+        try:
+            from .bot_ui import main_menu_keyboard, main_menu_text
+            from .subscriptions.plans import get_plan
+            from .db import Database
+            from .subscriptions.manager import SubscriptionManager
+            from .subscriptions.zarinpal import ZarinpalConfig
+            db = Database(str(self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"))
+            await db.init()
+            async with db.session_factory() as s:
+                mgr = SubscriptionManager(s, zarinpal_config=ZarinpalConfig(merchant_id=str(self.store.get("zarinpal.merchant_id") or "")))
+                _, plan = await mgr.effective_plan(chat_id)
+                plan_title = plan.title
+            await db.dispose()
+            first = str(self.store.get(f"users.{chat_id}.profile.first_name") or self.store.get("profile.first_name") or self.store.get("profile.full_name") or "").split()[0] if self.store.get(f"users.{chat_id}.profile.full_name") or self.store.get("profile.full_name") else None
+            await self.send(chat_id, main_menu_text(first_name=first, plan_title=plan_title) + "\n\n" + status_text(self.store), main_menu_keyboard())
+        except Exception:
+            await self.send(chat_id, status_text(self.store) + "\n\n" + self._menu_hint(), self._menu_keyboard())
+
+    async def _cmd_start_old(self, chat_id: str) -> None:
         save_chat_id(self.store, chat_id)
-        # Ensure per-user account exists (non-blocking)
         try:
             await self._ensure_account(chat_id)
         except Exception:
             pass
+        # ── New gated onboarding: LLM (verified) -> Profile -> dashboard ──
+        if is_onboarding_blocked(self.store, chat_id):
+            await self._enforce_onboarding(chat_id)
+            return
+        # fallback to legacy global readiness check for old installs
         state = readiness(self.store)
         if not state["setup_completed"] or missing_steps(self.store, include_recommended=False):
+            # If per-user done but global missing, skip legacy setup and show dashboard
+            if is_llm_onboarding_done(self.store, chat_id) and is_profile_onboarding_done(self.store, chat_id):
+                await self._show_dashboard(chat_id)
+                return
             await self.send(
                 chat_id,
                 "✨ <b>به BidPilot خوش آمدی 👋</b>\n"
@@ -1878,8 +2105,14 @@ class BotService:
         await self.send(chat_id, f"<b>تنظیمات ذخیره‌شده</b>\n<pre>{body}</pre>")
 
     async def _cmd_test(self, chat_id: str) -> None:
-        provider = str(self.store.get("llm.provider") or "groq")
-        key = self.store.get("llm.api_key") or self.store.get(f"llm.keys.{provider}")
+        # Per-user test first
+        per_provider = get_user_llm_provider_id(self.store, chat_id)
+        if per_provider:
+            provider = per_provider
+            key = get_user_llm_api_key(self.store, chat_id)
+        else:
+            provider = str(self.store.get("llm.provider") or "groq")
+            key = self.store.get("llm.api_key") or self.store.get(f"llm.keys.{provider}")
         if not key:
             await self.send(chat_id, "❌ کلید هوش مصنوعی ثبت نشده. /llm")
             return
@@ -1892,12 +2125,19 @@ class BotService:
         from .llm_providers import is_reasoning_model
         from .network import proxy_from_store
 
-        model = str(self.store.get("llm.model") or preset.model)
+        # Per-user model if exists
+        per_model = get_user_llm_model(self.store, chat_id)
+        if per_model:
+            model = str(per_model)
+            base_url = str(get_user(self.store, chat_id, "llm.base_url") or preset.base_url)
+        else:
+            model = str(self.store.get("llm.model") or preset.model)
+            base_url = str(self.store.get("llm.base_url") or preset.base_url)
         proxy = proxy_from_store(self.store)
         ok, message = await verify_provider(
             LLMProvider(
                 id=preset.id,
-                base_url=str(self.store.get("llm.base_url") or preset.base_url),
+                base_url=base_url,
                 model=model,
                 api_key=str(key),
                 extra_headers=dict(preset.extra_headers),
@@ -1924,12 +2164,17 @@ class BotService:
         await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
 
     async def _cmd_preview(self, chat_id: str) -> None:
+        # Block preview until onboarding done
+        if is_onboarding_blocked(self.store, chat_id):
+            await self.send(chat_id, "⚠️ اول باید کلید هوش مصنوعی و پروفایل را کامل کنی.\n/ start را بزن تا مرحله ۱ را شروع کنیم.")
+            await self._enforce_onboarding(chat_id)
+            return
         await self.send(
             chat_id,
             "🔎 دارم داخل سایت می‌گردم؛ فهرست پروژه‌ها را می‌خوانم و پروژه‌های مرتبط با تخصصت را باز می‌کنم…",
         )
         try:
-            messages = await self._generate_preview(limit=1)
+            messages = await self._generate_preview(limit=1, chat_id=chat_id)
         except Exception as exc:
             await self.send(chat_id, f"❌ پیش‌نمایش ناموفق بود: {escape(str(exc))}")
             return
@@ -1962,13 +2207,156 @@ class BotService:
                 "✅ آزمایش انجام شد؛ حالا /run در حالت واقعی باز است.",
             )
 
-    async def _generate_preview(self, limit: int = 1) -> list[str]:
-        """Build a throw-away Application and generate real proposals."""
+    async def _generate_preview(self, limit: int = 1, chat_id: str | None = None) -> list[str]:
+        """Build a throw-away Application and generate real proposals (per-user LLM)."""
         from .app import build_application
-        from .config import load_config, reset_secret_cache
+        from .config import load_config, reset_secret_cache, Secrets
+        from .config import secrets_from_store
 
         reset_secret_cache()
         cfg = load_config(self.config_path)
+        # ── Per-user overrides: LLM key/model isolation ──
+        if chat_id is not None:
+            try:
+                from .per_user import build_user_llm_provider, get_user
+                provider = build_user_llm_provider(self.store, chat_id)
+                if provider is not None:
+                    cfg.llm.provider = provider.id
+                    cfg.llm.base_url = provider.base_url
+                    cfg.llm.model = provider.model
+                    # Also sync pricing per-user
+                    strat = get_user(self.store, chat_id, "pricing.strategy")
+                    if strat:
+                        cfg.pricing["strategy"] = str(strat)
+                    hide = get_user(self.store, chat_id, "pricing.hide_price_in_text")
+                    if hide is not None:
+                        cfg.pricing["hide_price_in_text"] = bool(hide)
+                        cfg.pricing["hide_price_in_text"] = bool(hide)
+                    # bid_percent per-user
+                    bp = get_user(self.store, chat_id, "pricing.bid_percent")
+                    if bp is not None:
+                        try:
+                            cfg.pricing["ratio"] = float(int(bp) / 100)
+                        except Exception:
+                            pass
+                    # Profile per-user override for generator
+                    stack = get_user(self.store, chat_id, "profile.stack")
+                    if stack:
+                        cfg.profile.stack = list(stack)
+                    fn = get_user(self.store, chat_id, "profile.full_name")
+                    if fn:
+                        cfg.profile.full_name = str(fn)
+                    first = get_user(self.store, chat_id, "profile.first_name")
+                    if first:
+                        cfg.profile.first_name = str(first)
+                    role = get_user(self.store, chat_id, "profile.role")
+                    if role:
+                        cfg.profile.role = str(role)
+                    # Build secrets with per-user key
+                    secrets = Secrets()
+                    # Inject per-user key into secrets
+                    secrets = secrets_from_store(secrets, self.store)
+                    # Override with per-user key
+                    from .llm_providers import DEFAULT_PROVIDER
+                    pid = provider.id
+                    # Ensure secrets has the right key for this provider
+                    secrets.llm_keys[pid] = provider.api_key or ""
+                    secrets.llm_api_key = provider.api_key
+                    # Build app with per-user secrets
+                    config_name = str(self.store.get("marketplace.name") or "")
+                    if config_name and not cfg.source(config_name):
+                        from .config import SourceConfig
+                        cfg.sources = [SourceConfig(type=config_name, settings={})]
+                    application = build_application(cfg, secrets)
+                    # Continue with per-user application
+                    try:
+                        await application.db.init()
+                        name = config_name if config_name in application.sources else None
+                        if name is None:
+                            name = next(iter(application.sources), None)
+                        if not name:
+                            raise RuntimeError("هیچ سایت فریلنسری فعالی تنظیم نشده است. /market")
+                        source = application.sources[name]
+                        projects = await source.fetch_projects()
+                        pricing = _pricing_for(cfg)
+                        # Inject per-user LLM into pricing if ai_search
+                        if getattr(pricing, "name", "") == "ai_search":
+                            try:
+                                pricing.llm_provider = provider
+                                pricing.llm_config = cfg.llm
+                            except Exception:
+                                pass
+                        generator = application.generator
+                        delivery = int(cfg.pricing.get("delivery_days", 14))
+                        messages: list[str] = []
+                        notes = self._discovery_note(source, len(projects))
+                        if notes:
+                            messages.append(notes)
+                        rejected: dict[str, int] = {}
+                        filter_preview = application.filter_preview()
+                        proposals = 0
+                        for project in projects:
+                            if proposals >= limit:
+                                break
+                            decision = filter_preview.evaluate(project)
+                            if not decision:
+                                key = decision.reason.split("—")[0].strip()[:90]
+                                rejected[key] = rejected.get(key, 0) + 1
+                                continue
+                            # Handle ai_search async if needed
+                            price = pricing.price(project, project.budget)
+                            if hasattr(pricing, "price_async"):
+                                try:
+                                    # Try async variant for more accurate price (warn slower)
+                                    if pricing.name == "ai_search":
+                                        await self.send(chat_id, "🤖 قیمت هوشمند: دارم قیمت بازار را تحلیل می‌کنم (کمی کندتر)…")
+                                        price_async = await pricing.price_async(project, project.budget)  # type: ignore
+                                        if price_async:
+                                            price = price_async
+                                except Exception:
+                                    pass
+                            if price is None:
+                                key = "قیمت‌گذاری ممکن نبود (بودجه نامشخص)"
+                                rejected[key] = rejected.get(key, 0) + 1
+                                continue
+                            from .text import parse_days
+                            hint = parse_days(project.employer_deadline)
+                            bid_delivery = min(delivery, hint) if hint else delivery
+                            hide_price = bool(cfg.pricing.get("hide_price_in_text"))
+                            proposal = await generator.generate(project, price.amount, bid_delivery, hide_price=hide_price)  # type: ignore[union-attr]
+                            deadline_line = (
+                                f"⏱ کارفرما: {escape(project.employer_deadline)} | پیشنهاد من: {bid_delivery} روز"
+                                if project.employer_deadline
+                                else f"⏱ {bid_delivery} روز"
+                            )
+                            proposals += 1
+                            messages.append(
+                                "🧪 <b>پیش‌نمایش پیشنهاد</b>\n"
+                                f"<b>{escape(project.title)}</b>\n"
+                                f"💵 {price.amount:,} تومان | {deadline_line} | 🤖 {escape(proposal.generated_by)}\n"
+                                f"🔗 {escape(project.url)}\n\n"
+                                f"<pre>{escape(proposal.text)}</pre>"
+                            )
+                        if proposals == 0 and rejected:
+                            lines = ["⚠️ <b>هیچ پروژه‌ای از فیلترها نگذشت</b>"]
+                            lines += [f"• {count}× {escape(reason)}" for reason, count in rejected.items()]
+                            lines.append("/filters — قاعده‌ها را ببین یا موقتاً خاموش کن.")
+                            messages.append("\n".join(lines))
+                        reason = str(getattr(generator, "last_llm_error", "") or "")
+                        if messages and reason:
+                            messages.insert(
+                                0,
+                                "⚠️ <b>هوش مصنوعی جواب نداد</b> — پیشنهاد زیر از قالب آماده ساخته شد.\n"
+                                f"<pre>{escape(reason[:700])}</pre>"
+                                "🔧 کلید را با /test تست کن یا در /llm عوضش کن.",
+                            )
+                        return messages
+                    finally:
+                        await application.close()
+            except Exception as e:
+                # Fall through to global path on error
+                import logging
+                logging.getLogger(__name__).debug("per-user preview path failed, fallback to global: %s", e)
         config_name = str(self.store.get("marketplace.name") or "")
         if config_name and not cfg.source(config_name):
             # the store enabled a source that is not in config.yaml
@@ -2162,9 +2550,70 @@ class BotService:
             await self.send(chat_id, f"⚠️ {escape(str(exc))}")
             return
 
+        # ── Per-user LLM key live verification ──
+        store_key = question.store_key(self.store)
+        if store_key.startswith(f"users.{chat_id}.llm.api_key") or store_key == f"users.{chat_id}.llm.api_key":
+            # value is the raw API key
+            provider_id = str(self.store.get(f"users.{chat_id}.llm.provider") or "groq").strip().lower()
+            # For provider that doesn't require key (ollama), skip verification
+            from .llm_providers import get_preset, verify_user_key
+            try:
+                preset = get_preset(provider_id)
+                if preset.requires_key:
+                    await self.send(chat_id, "⏳ در حال بررسی کلید… (یک درخواست آزمایشی به سرویس می‌فرستم)")
+                    # Determine model to verify against: use currently selected model or preset default
+                    model = str(self.store.get(f"users.{chat_id}.llm.model") or preset.model)
+                    proxy = str(self.store.get("network.proxy") or self.store.get("llm.proxy") or "")
+                    ok, msg = await verify_user_key(provider_id, str(value), model, proxy=proxy)
+                    if not ok:
+                        # Spec phrase: "API key معتبر نیست" must be reported and block progress
+                        await self.send(
+                            chat_id,
+                            f"❌ <b>API key معتبر نیست</b>\n{escape(msg)}\n\nلطفاً کلید صحیح را دوباره بفرست (یا سرویس را با /llm عوض کن).",
+                        )
+                        return
+                    # Success — now store key and mark verified
+                    try:
+                        apply_answer(self.store, question, value)
+                    except Exception as exc:
+                        log.exception("Could not save setting %s", store_key)
+                        await self.send(chat_id, f"❌ ذخیره نشد: {escape(str(exc))}")
+                        return
+                    set_user_llm_verified(self.store, chat_id, True)
+                    # Also persist model explicitly if not yet set (apply will handle)
+                    await self.send(chat_id, f"✅ {escape(msg)}\nحالا مدل را انتخاب کن — این مدل دقیقاً برای تو ذخیره می‌شود.")
+                    self._log(f"chat {chat_id}: verified LLM key for {provider_id} model {model}")
+                    flow.index += 1
+                    await self._advance(chat_id)
+                    return
+            except Exception as e:
+                # Fallback: if verification infrastructure fails, still store but warn
+                log.warning("Verification failed internally: %s", e)
+
+        # Handle per-user model choice: ensure we store exactly that model
+        if store_key.startswith(f"users.{chat_id}.llm.model"):
+            pass
+
+        # Per-user profile skip: parse returns KEEP, but we need to store "skip" explicitly to mark onboarding done
+        from .onboarding import KEEP as _KEEP
+        if value is _KEEP and store_key.startswith(f"users.{chat_id}.profile.source"):
+            # raw was skip-like
+            normalized = str(raw or "").strip().lower()
+            if normalized in {"skip", "/skip", "رد", "بعدا", "-"} or "skip" in normalized or raw == "skip":
+                try:
+                    from .per_user import set_user
+                    set_user(self.store, chat_id, "profile.source", "skip")
+                    set_user(self.store, chat_id, "onboarding.profile_skipped", True)
+                    self._log(f"chat {chat_id}: profile skip stored")
+                    flow.index += 1
+                    await self._advance(chat_id)
+                    return
+                except Exception as e:
+                    log.warning("Could not store skip: %s", e)
+
         try:
             apply_answer(self.store, question, value)
-        except Exception as exc:  # disk full, permissions, corrupt file…
+        except Exception as exc:
             log.exception("Could not save setting %s", question.store_key(self.store))
             await self.send(
                 chat_id,
@@ -2175,13 +2624,61 @@ class BotService:
         if question.store_key(self.store) == "telegram.chat_ids":
             save_chat_id(self.store, chat_id)
         self._log(f"chat {chat_id}: saved {question.store_key(self.store)}")
-        if question.store_key(self.store) in {"profile.resume_path", "profile.source_url"}:
+        # Per-user profile pending import handling
+        sk = question.store_key(self.store)
+        if sk.endswith("profile.resume_path") or sk.endswith("profile.source_url"):
             await self._import_profile_from_pending(chat_id)
         flow.index += 1
         await self._advance(chat_id)
 
     async def _finish_flow(self, chat_id: str, flow: Flow) -> None:
         self._flows.pop(chat_id, None)
+        # ── New per-user onboarding flows ──
+        if flow.name == "user_llm":
+            # After LLM provider/key/model done, proceed to profile step
+            if not is_llm_onboarding_done(self.store, chat_id):
+                await self.send(chat_id, "⚠️ هنوز مرحله‌ی هوش مصنوعی کامل نشده — دوباره /start بزن.")
+                return
+            await self.send(chat_id, "✅ <b>کلید تأیید شد و مدل ذخیره شد.</b>\nاین مدل دقیقاً برای تمام درخواست‌های تو استفاده خواهد شد.")
+            # Now enforce profile step
+            if is_profile_onboarding_done(self.store, chat_id):
+                await self.send(chat_id, "✅ پروفایل هم کامل است — می‌ریم به داشبورد.")
+                await self._show_dashboard(chat_id)
+                # Optionally continue to marketplace/tone/pricing if desired
+                return
+            await self._start_profile_onboarding(chat_id)
+            return
+        if flow.name == "user_profile":
+            # Profile done (or skip chosen)
+            err = str(self.store.get(f"users.{chat_id}.profile.import_error") or self.store.get("profile.import_error") or "")
+            if err:
+                await self.send(chat_id, f"⚠️ پروفایل با فایل کامل نشد: {escape(err)}\nدوباره /profile را بزن یا دستی وارد کن.")
+                return
+            await self.send(chat_id, "✅ پروفایل ذخیره شد.\nحالا تنظیمات تکمیلی (سایت، لحن، قیمت‌گذاری) را انجام می‌دهیم.")
+            # Step 3: marketplace + tone + pricing (per-user pricing enhancements)
+            try:
+                from .onboarding import marketplace_questions, style_questions
+                # marketplace is global (credentials per site), style/pricing per-user
+                qs = []
+                qs.extend(marketplace_questions(self.store))
+                qs.extend(style_questions(self.store))
+                qs.extend(user_pricing_questions(self.store, chat_id))
+                await self.send(
+                    chat_id,
+                    "📋 <b>مرحله ۳ — سایت، لحن و قیمت‌گذاری</b>\n"
+                    "سایت فریلنسری، لحن پیشنهادات و نحوه قیمت‌گذاری را انتخاب کن.\n"
+                    "💡 گزینه هوشمند قیمت‌گذاری (AI جستجوی بازار) کندتر است اما دقیق‌تر — در صورت انتخاب هشدار می‌دهیم.\n"
+                    "💡 گزینه «نیازی نیست قیمت را در متن بنویسی» فقط قیمت را در فرم سقف بودجه پر می‌کند.",
+                )
+                await self._start_flow(chat_id, "user_market_style_pricing", qs, mark_complete=False)
+            except Exception as e:
+                log.warning("Could not start step 3: %s", e)
+                await self._show_dashboard(chat_id)
+            return
+        if flow.name == "user_market_style_pricing":
+            await self.send(chat_id, "✅ تنظیمات تکمیلی ذخیره شد.")
+            await self._show_dashboard(chat_id)
+            return
         if flow.mark_complete:
             mark_setup_complete(self.store, complete=not missing_steps(self.store, include_recommended=False))
             # referral qualification happens async
@@ -2355,13 +2852,36 @@ class BotService:
             pass
 
     async def _cmd_start(self, chat_id: str, rest: str = "") -> None:
-        # Learn real @username live if not cached (fixes wrong fallback link)
         await self._ensure_bot_username_cached()
-        # handle referral if present, then show main menu
         if rest:
             await self._handle_referral_start(chat_id, rest)
-        # ensure account exists so referral code is ready
         await self._ensure_account(chat_id)
+        save_chat_id(self.store, chat_id)
+        # ── Gate: onboarding must complete before dashboard ──
+        if is_onboarding_blocked(self.store, chat_id):
+            await self._enforce_onboarding(chat_id)
+            return
+        # Fallback to legacy global readiness check for old installs (e.g. tests expecting token question)
+        try:
+            from .onboarding import readiness, missing_steps
+            state = readiness(self.store)
+            if not state["setup_completed"] or missing_steps(self.store, include_recommended=False):
+                # If per-user done but global missing, skip legacy setup and show dashboard
+                if is_llm_onboarding_done(self.store, chat_id) and is_profile_onboarding_done(self.store, chat_id):
+                    pass
+                else:
+                    await self.send(
+                        chat_id,
+                        "✨ <b>به BidPilot خوش آمدی 👋</b>\n"
+                        "<i>دستیار هوشمند پیشنهاددهی — بدون .env، همه در تلگرام</i>\n"
+                        "─" * 28 + "\n"
+                        "بیا در چند سؤال همه‌چیز را تنظیم کنیم — حساب شخصی تو ساخته می‌شود و سقف‌هات فعال می‌شود.\n"
+                        "هر وقت خواستی با /cancel متوقف شوی.",
+                    )
+                    await self._start_flow(chat_id, "setup", all_questions(self.store), mark_complete=True)
+                    return
+        except Exception:
+            pass
         try:
             from .db import Database
             from .subscriptions.manager import SubscriptionManager

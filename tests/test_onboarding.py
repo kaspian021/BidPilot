@@ -153,6 +153,8 @@ def test_terminal_wizard_saves_answers(tmp_path, monkeypatch):
             "روی تحویل مرحله‌ای تأکید کن.",  # style
             "1200",  # max chars
             "70",  # pricing: 70% of the employer budget
+            "1",  # pricing strategy: midpoint
+            "نه",  # hide price in text? نه
             "1",  # dry-run
         ]
     )

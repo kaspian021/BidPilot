@@ -53,6 +53,64 @@ class ProviderPreset:
         return f"{self.title} — {self.model}"
 
 
+# ── Provider model catalog (user picks exactly one, persisted per-user) ──
+# Each provider exposes 4-6 representative models; the preset's default is
+# always first.  These are *known-good* free-tier models as of 2026-10; if a
+# model retires, /test will report it and the user can pick another.
+PROVIDER_MODELS: dict[str, list[str]] = {
+    "groq": [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
+        "gemma2-9b-it",
+    ],
+    "gemini": [
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+    ],
+    "openrouter": [
+        "openrouter/free",
+        "google/gemini-flash-1.5",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "qwen/qwen-2.5-7b-instruct:free",
+        "deepseek/deepseek-r1:free",
+    ],
+    "mistral": [
+        "mistral-small-latest",
+        "mistral-large-latest",
+        "mistral-nemo",
+        "open-mistral-7b",
+    ],
+    "ollama": [
+        "qwen2.5:14b",
+        "llama3.2:3b",
+        "gemma2:9b",
+        "mistral:7b",
+    ],
+    # Generic OpenAI-compatible (user supplies base_url)
+    "openai": [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-3.5-turbo",
+    ],
+}
+
+
+def models_for_provider(provider_id: str) -> list[str]:
+    pid = (provider_id or DEFAULT_PROVIDER).strip().lower()
+    if pid in PROVIDER_MODELS:
+        return list(PROVIDER_MODELS[pid])
+    # Unknown provider -> at least its preset default
+    preset = PRESETS.get(pid)
+    if preset:
+        return [preset.model]
+    return [preset.model for preset in PRESETS.values()][:1]
+
+
 PRESETS: dict[str, ProviderPreset] = {
     "groq": ProviderPreset(
         id="groq",
@@ -99,6 +157,23 @@ PRESETS: dict[str, ProviderPreset] = {
         key_url="https://ollama.com/download",
         note="اگر روی همان سیستم Ollama دارید: بدون اینترنت، بدون محدودیت، بدون هزینه.",
         requires_key=False,
+    ),
+    # Aliases so user can type \"openai\" / \"grok\"
+    "openai": ProviderPreset(
+        id="openai",
+        title="OpenAI",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        key_url="https://platform.openai.com/api-keys",
+        note="کلید OpenAI (پولی).",
+    ),
+    "grok": ProviderPreset(
+        id="groq",
+        title="Groq (رایگان و همیشگی)",
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-120b",
+        key_url="https://console.groq.com/keys",
+        note="توکن رایگان و همیشگی؛ سهمیه ۸٬۰۰۰ توکن در دقیقه.",
     ),
 }
 
@@ -287,7 +362,7 @@ async def verify_provider(
         await client.aclose()
 
     if response.status_code == 401:
-        return False, "کلید رد شد (HTTP 401). مطمئن شوید کلید کامل و مربوط به همین سرویس است."
+        return False, "❌ API key معتبر نیست — کلید رد شد (HTTP 401). مطمئن شوید کلید کامل و مربوط به همین سرویس است."
     if response.status_code == 403:
         return (
             False,
@@ -298,7 +373,7 @@ async def verify_provider(
     if response.status_code == 429:
         return False, "کلید معتبر است اما سهمیه‌ی رایگان همین لحظه پر شده؛ کمی بعد امتحان کنید."
     if response.status_code >= 400:
-        return False, f"سرویس خطا داد (HTTP {response.status_code}): {response.text[:180]}"
+        return False, f"❌ API key معتبر نیست — سرویس خطا داد (HTTP {response.status_code}): {response.text[:180]}"
     try:
         data = response.json()
         text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -315,17 +390,56 @@ async def verify_provider(
     return True, f"کلید سالم است ✅ ({provider.model})"
 
 
+# ── Per-user verification helper (spec: "API key معتبر نیست" report) ──
+async def verify_user_key(
+    provider_id: str,
+    api_key: str,
+    model: str | None = None,
+    *,
+    proxy: str = "",
+    timeout: float = 25.0,
+) -> tuple[bool, str]:
+    """Verify a user's API key for a provider/model; returns (ok, message).
+
+    The message is Persian and safe to show. On failure it always contains
+    "API key معتبر نیست" so the bot can block progress and ask to retry.
+    """
+    preset = get_preset(provider_id)
+    chosen_model = (model or preset.model).strip()
+    provider = LLMProvider(
+        id=preset.id,
+        base_url=preset.base_url,
+        model=chosen_model,
+        api_key=api_key.strip(),
+        extra_headers=dict(preset.extra_headers),
+        tokens_per_minute=preset.tokens_per_minute,
+    )
+    ok, msg = await verify_provider(
+        provider,
+        proxy=proxy,
+        timeout=timeout,
+        reasoning_effort="low" if is_reasoning_model(chosen_model) else "",
+    )
+    if not ok and "API key معتبر نیست" not in msg:
+        # Ensure spec phrase is present for blocking logic
+        msg = f"❌ API key معتبر نیست — {msg}"
+    return ok, msg
+
+
 __all__ = [
     "DEFAULT_FALLBACKS",
     "DEFAULT_PROVIDER",
     "LLMProvider",
     "PRESETS",
     "PROVIDER_ORDER",
+    "PROVIDER_MODELS",
     "ProviderPreset",
     "build_client",
     "get_preset",
+    "models_for_provider",
     "provider_choices",
     "provider_label",
     "resolve_chain",
     "verify_provider",
+    "verify_user_key",
 ]

@@ -71,6 +71,7 @@ class Question:
     dynamic_prompt: Callable[[SettingsStore], str] | None = None
     dynamic_help: Callable[[SettingsStore], str] | None = None
     dynamic_default: Callable[[SettingsStore], Any] | None = None
+    dynamic_choices: Callable[[SettingsStore], list[Choice]] | None = None
     key_fn: Callable[[SettingsStore], str] | None = None
 
     # ------------------------------------------------------------- helpers
@@ -94,6 +95,11 @@ class Question:
         return store.get(self.store_key(store))
 
     def choice_list(self, store: SettingsStore) -> list[Choice]:
+        if self.dynamic_choices is not None:
+            try:
+                return list(self.dynamic_choices(store))
+            except Exception:
+                return list(self.choices)
         return list(self.choices)
 
 
@@ -226,6 +232,138 @@ def llm_questions(store: SettingsStore) -> list[Question]:
             when=_provider_requires_key,
         ),
     ]
+
+
+# ── Per-user LLM onboarding (Step 1) — isolated per chat_id ───────────────
+def _user_provider_default(chat_id: str | int) -> Callable[[SettingsStore], Any]:
+    def _fn(store: SettingsStore):
+        from .per_user import get_user_llm_provider_id
+        pid = get_user_llm_provider_id(store, chat_id)
+        return pid or DEFAULT_PROVIDER
+    return _fn
+
+
+def _user_provider_choices() -> list[Choice]:
+    return [Choice(preset.id, preset.title, preset.note) for preset in provider_choices()]
+
+
+def _user_model_choices(chat_id: str | int) -> Callable[[SettingsStore], list[Choice]]:
+    def _fn(store: SettingsStore) -> list[Choice]:
+        from .per_user import get_user_llm_provider_id
+        from .llm_providers import models_for_provider, get_preset
+        pid = get_user_llm_provider_id(store, chat_id) or DEFAULT_PROVIDER
+        models = models_for_provider(pid)
+        preset = None
+        try:
+            preset = get_preset(pid)
+        except KeyError:
+            pass
+        choices = []
+        for m in models:
+            desc = "پیش‌فرض" if preset and m == preset.model else ""
+            choices.append(Choice(m, m, desc))
+        return choices
+    return _fn
+
+
+def _user_model_default(chat_id: str | int) -> Callable[[SettingsStore], Any]:
+    def _fn(store: SettingsStore):
+        from .per_user import get_user_llm_model
+        m = get_user_llm_model(store, chat_id)
+        if m:
+            return m
+        from .per_user import get_user_llm_provider_id
+        from .llm_providers import get_preset
+        pid = get_user_llm_provider_id(store, chat_id) or DEFAULT_PROVIDER
+        try:
+            return get_preset(pid).model
+        except KeyError:
+            return m
+    return _fn
+
+
+def user_llm_questions(store: SettingsStore, chat_id: str | int) -> list[Question]:
+    """Step 1 — per-user provider + verified key + model choice."""
+    # Note: keys are namespaced via per_user helpers, but for the Question
+    # engine we use a key_fn that writes to the namespaced location.
+    def _ukey(dotted: str) -> Callable[[SettingsStore], str]:
+        from .per_user import user_key
+        return lambda s: user_key(chat_id, dotted)
+
+    def _provider_help(s: SettingsStore) -> str:
+        from .per_user import get_user_llm_provider_id
+        from .llm_providers import get_preset
+        pid = get_user_llm_provider_id(s, chat_id) or DEFAULT_PROVIDER
+        try:
+            preset = get_preset(pid)
+        except KeyError:
+            return "یکی از ارائه‌دهنده‌های لیست را انتخاب کن."
+        lines = [f"مدل پیش‌فرض: {preset.model}"]
+        if preset.note:
+            lines.append(preset.note)
+        if preset.key_url:
+            lines.append(f"گرفتن کلید رایگان: {preset.key_url}")
+        lines.append("کلید فقط برای حساب تو ذخیره می‌شود و هرگز با دیگران به اشتراک گذاشته نمی‌شود.")
+        return "\n".join(lines)
+
+    def _key_prompt(s: SettingsStore) -> str:
+        from .per_user import get_user_llm_provider_id
+        from .llm_providers import get_preset
+        pid = get_user_llm_provider_id(s, chat_id) or DEFAULT_PROVIDER
+        try:
+            preset = get_preset(pid)
+            return f"کلید API {preset.title} را بفرست"
+        except KeyError:
+            return "کلید API را بفرست"
+
+    def _needs_key(s: SettingsStore) -> bool:
+        from .per_user import get_user_llm_provider_id
+        from .llm_providers import get_preset
+        pid = get_user_llm_provider_id(s, chat_id) or DEFAULT_PROVIDER
+        try:
+            return get_preset(pid).requires_key
+        except KeyError:
+            return True
+
+    return [
+        Question(
+            key="llm.provider",
+            prompt="سرویس هوش مصنوعی را انتخاب کن (Grok/Groq/Gemini/OpenRouter...)",
+            kind="choice",
+            stage="llm",
+            key_fn=_ukey("llm.provider"),
+            choices=_user_provider_choices(),
+            dynamic_default=_user_provider_default(chat_id),
+            help="هر سرویس کلید و مدل‌های خودش را دارد. پیشنهاد ما Groq (رایگان و سریع) است.",
+        ),
+        Question(
+            key="llm.api_key",
+            prompt="کلید API",
+            kind="secret",
+            stage="llm",
+            key_fn=_ukey("llm.api_key"),
+            dynamic_prompt=_key_prompt,
+            dynamic_help=_provider_help,
+            when=_needs_key,
+        ),
+        Question(
+            key="llm.model",
+            prompt="مدل را انتخاب کن — این مدل برای تمام تولید متن‌های تو استفاده می‌شود",
+            kind="choice",
+            stage="llm",
+            key_fn=_ukey("llm.model"),
+            choices=_user_provider_choices(),  # placeholder, overridden below
+            dynamic_choices=_user_model_choices(chat_id),
+            dynamic_default=_user_model_default(chat_id),
+            help="مدل دقیقاً همان که انتخاب می‌کنی ذخیره می‌شود و در تمام پیشنهادها استفاده خواهد شد. بعداً با /llm می‌توانی عوض کنی.",
+        ),
+    ]
+
+
+def user_llm_model_choices(store: SettingsStore, chat_id: str | int) -> list[Choice]:
+    """Helper for bot to render model choices dynamically."""
+    fn = _user_model_choices(chat_id)
+    return fn(store)
 
 
 def validate_proxy(value: Any) -> str | None:
@@ -609,7 +747,106 @@ def pricing_questions(store: SettingsStore) -> list[Question]:
                 "عدد ۱۰۰ یعنی سقف بودجه."
             ),
             dynamic_default=lambda s: bid_percent(s),
-        )
+        ),
+        Question(
+            key="pricing.strategy",
+            prompt="قیمت را چطور تعیین کنیم؟",
+            kind="choice",
+            stage="pricing",
+            choices=[
+                Choice(
+                    "midpoint_round",
+                    "درصدی از بودجه کارفرما (سریع)",
+                    "مثلاً ۶۰٪ بودجه — سریع و قابل پیش‌بینی.",
+                ),
+                Choice(
+                    "ai_search",
+                    "هوش مصنوعی قیمت بازار را جستجو و پیشنهاد بهینه بدهد (کندتر)",
+                    "عنوان و توضیحات پروژه تحلیل می‌شود، قیمت بازار جستجو می‌شود و بهترین پیشنهاد محاسبه می‌گردد. توجه: کمی کندتر است.",
+                ),
+            ],
+            default="midpoint_round",
+            dynamic_default=lambda s: s.get("pricing.strategy") or "midpoint_round",
+            help="گزینه دوم هوشمند است اما به خاطر جستجو کمی کندتر عمل می‌کند.",
+        ),
+        Question(
+            key="pricing.hide_price_in_text",
+            prompt="قیمت در متن پیشنهاد نوشته شود؟",
+            kind="confirm",
+            stage="pricing",
+            default=True,
+            dynamic_default=lambda s: s.get("pricing.hide_price_in_text") if s.get("pricing.hide_price_in_text") is not None else False,
+            help="اگر «نه» بزنی، قیمت فقط در فرم سقف بودجه پر می‌شود و در متن پیشنهاد ذکر نمی‌گردد (نیازی نیست قیمت را در متن بنویسی). گزینه «بله» قیمت را در متن هم می‌آورد.",
+        ),
+    ]
+
+
+def user_pricing_questions(store: SettingsStore, chat_id: str | int) -> list[Question]:
+    """Per-user pricing — same catalogue but stored under users.{chat_id}.*"""
+    def _ukey(dotted: str) -> Callable[[SettingsStore], str]:
+        from .per_user import user_key
+        return lambda s: user_key(chat_id, dotted)
+
+    def _bid_default(s: SettingsStore):
+        from .per_user import get_user
+        v = get_user(s, chat_id, "pricing.bid_percent")
+        if v is not None:
+            try:
+                return int(v)
+            except Exception:
+                pass
+        return bid_percent(s)
+
+    def _strategy_default(s: SettingsStore):
+        from .per_user import get_user
+        v = get_user(s, chat_id, "pricing.strategy")
+        return str(v) if v else "midpoint_round"
+
+    def _hide_default(s: SettingsStore):
+        from .per_user import get_user
+        v = get_user(s, chat_id, "pricing.hide_price_in_text")
+        if v is not None:
+            return bool(v)
+        return False
+
+    return [
+        Question(
+            key="pricing.bid_percent",
+            prompt="چند درصد از بودجه‌ی اعلامی کارفرما را پیشنهاد بدهیم؟",
+            kind="int",
+            stage="pricing",
+            key_fn=_ukey("pricing.bid_percent"),
+            default=DEFAULT_BID_PERCENT,
+            validator=lambda value: (
+                None if 10 <= int(value) <= 100 else "عددی بین ۱۰ تا ۱۰۰ بنویس (مثلاً ۶۰ برای ۶۰٪ بودجه)."
+            ),
+            help="اگر کارفرما بازه بدهد (مثلاً ۵۰۰٬۰۰۰ تا ۱٬۵۰۰٬۰۰۰)، همین درصد از بازه انتخاب می‌شود و همیشه داخل بازه می‌ماند.",
+            dynamic_default=_bid_default,
+        ),
+        Question(
+            key="pricing.strategy",
+            prompt="قیمت را چطور تعیین کنیم؟",
+            kind="choice",
+            stage="pricing",
+            key_fn=_ukey("pricing.strategy"),
+            choices=[
+                Choice("midpoint_round", "درصدی از بودجه کارفرما (سریع)", "سریع و قابل پیش‌بینی."),
+                Choice("ai_search", "هوش مصنوعی قیمت بازار را جستجو کند (کندتر — دقیق‌تر)", "⚠️ کندتر است اما قیمت بهینه پیشنهاد می‌دهد."),
+            ],
+            default="midpoint_round",
+            dynamic_default=_strategy_default,
+            help="گزینه دوم عنوان/توضیحات را تحلیل و قیمت بازار را جستجو می‌کند — کندتر اما دقیق‌تر.",
+        ),
+        Question(
+            key="pricing.hide_price_in_text",
+            prompt="نیازی نیست قیمت را در متن بنویسی؟ (فقط در فرم سقف بودجه)",
+            kind="confirm",
+            stage="pricing",
+            key_fn=_ukey("pricing.hide_price_in_text"),
+            default=False,
+            dynamic_default=_hide_default,
+            help="اگر «بله» بزنی، قیمت فقط در فرم «سقف بودجه» پر می‌شود و در متن پیشنهاد ذکر نمی‌گردد.",
+        ),
     ]
 
 
@@ -813,43 +1050,69 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
         return
     key = question.store_key(store)
 
-    if key == "profile.source" and str(value).strip().lower() == "skip":
-        # "فعلاً رد کن" must not pin the choice: next time we ask again
+    # Per-user skip handling (namespaced) — for per-user onboarding, skip IS a valid terminal state
+    if key.endswith("profile.source") and str(value).strip().lower() == "skip":
+        if key.startswith("users."):
+            # Per-user: store skip explicitly and mark done
+            store.set(key, "skip")
+            # Also store a flag so is_profile_onboarding_done can see it even without fields
+            prefix = key[: -len("profile.source")].rstrip(".")
+            store.set(f"{prefix}.onboarding.profile_skipped", True)
+            reset_secret_cache()
+            return
         return
-    if key in {"profile.resume_path", "profile.source_url"}:
-        # the actual analysis happens in the async layer (bot / terminal wizard)
-        import_kind = "file" if key == "profile.resume_path" else "url"
-        store.update({key: value, "profile.import_pending": {"type": import_kind, "value": value}})
+    if key.endswith("profile.resume_path") or key.endswith("profile.source_url"):
+        import_kind = "file" if key.endswith("profile.resume_path") else "url"
+        if key.startswith("users."):
+            parts = key.split(".")
+            chat = parts[1] if len(parts) > 1 else ""
+            pending_key = f"users.{chat}.profile.import_pending"
+            store.update({key: value, pending_key: {"type": import_kind, "value": value}})
+        else:
+            store.update({key: value, "profile.import_pending": {"type": import_kind, "value": value}})
         reset_secret_cache()
         return
-    if key in {"llm.proxy", "network.proxy"}:
-        # one setting for every *foreign* service (Telegram + LLM); the Iranian
-        # marketplace keeps going direct
+    if key in {"llm.proxy", "network.proxy"} or key.endswith(".proxy"):
         from .network import set_proxy
-
         set_proxy(store, str(value or ""))
         return
-    if key == "pricing.bid_percent":
+    if key.endswith("pricing.bid_percent"):
         percent = min(100, max(10, int(value)))
-        store.update({"pricing.bid_percent": percent, "pricing.ratio": round(percent / 100, 2)})
+        if key.startswith("users."):
+            prefix = key[: -len("pricing.bid_percent")].rstrip(".")
+            store.update({key: percent, f"{prefix}.pricing.ratio": round(percent / 100, 2)})
+        else:
+            store.update({"pricing.bid_percent": percent, "pricing.ratio": round(percent / 100, 2)})
         reset_secret_cache()
         return
-    if key == "llm.api_key":
-        provider = str(store.get("llm.provider") or DEFAULT_PROVIDER).strip().lower()
-        store.update({"llm.api_key": value, f"llm.keys.{provider}": value})
-    elif key == "llm.provider":
+    if key.endswith("llm.api_key"):
+        if key.startswith("users."):
+            prefix = key[: -len("llm.api_key")].rstrip(".")
+            provider = str(store.get(f"{prefix}.llm.provider") or store.get("llm.provider") or DEFAULT_PROVIDER).strip().lower()
+            store.update({key: value, f"{prefix}.llm.keys.{provider}": value, f"{prefix}.llm.verified": False})
+        else:
+            provider = str(store.get("llm.provider") or DEFAULT_PROVIDER).strip().lower()
+            store.update({"llm.api_key": value, f"llm.keys.{provider}": value})
+    elif key.endswith("llm.provider"):
         provider = str(value).strip().lower()
-        existing = store.get(f"llm.keys.{provider}")
-        store.set("llm.provider", provider)
-        store.set("llm.api_key", existing or None)
-        preset = PRESETS.get(provider)
-        if preset is not None:
-            # keep model/base_url in sync with the chosen provider
-            store.update({"llm.model": preset.model, "llm.base_url": preset.base_url})
+        if key.startswith("users."):
+            prefix = key[: -len("llm.provider")].rstrip(".")
+            store.set(key, provider)
+            preset = PRESETS.get(provider)
+            if preset is not None:
+                store.update({f"{prefix}.llm.model": preset.model, f"{prefix}.llm.base_url": preset.base_url})
+            store.set(f"{prefix}.llm.verified", False)
+        else:
+            existing = store.get(f"llm.keys.{provider}")
+            store.set("llm.provider", provider)
+            store.set("llm.api_key", existing or None)
+            preset = PRESETS.get(provider)
+            if preset is not None:
+                store.update({"llm.model": preset.model, "llm.base_url": preset.base_url})
+    elif key.endswith("llm.model"):
+        store.set(key, value)
     else:
         store.set(key, value)
-
-    # the effective config must see the new values immediately
     reset_secret_cache()
 
 
@@ -986,6 +1249,52 @@ def readiness(store: SettingsStore) -> dict[str, Any]:
         "bid_percent": bid_percent(store),
         "preview": preview_is_fresh(store),
         "setup_completed": bool(store.get("setup.completed")),
+    }
+
+
+def user_readiness(store: SettingsStore, chat_id: str | int) -> dict[str, Any]:
+    """Per-user readiness — for gating /status and /preview."""
+    from .per_user import get_user, get_user_llm_model, get_user_llm_provider_id, is_user_llm_verified
+
+    provider = get_user_llm_provider_id(store, chat_id) or _current_provider(store)
+    try:
+        preset = get_preset(provider)
+    except KeyError:
+        preset = get_preset(DEFAULT_PROVIDER)
+        provider = DEFAULT_PROVIDER
+    has_key = bool(is_user_llm_verified(store, chat_id) and get_user_llm_model(store, chat_id))
+    # Fallback to global if per-user not set (old installs)
+    if not has_key:
+        has_key = bool(store.get("llm.api_key") or store.get(f"llm.keys.{provider}"))
+    marketplace = _current_marketplace(store)
+    if marketplace == "mock":
+        creds_ok = True
+    else:
+        from .credentials import site_credentials
+        creds_ok = site_credentials(marketplace, store).ready
+    # Per-user profile name
+    full_name = get_user(store, chat_id, "profile.full_name") or store.get("profile.full_name") or ""
+    return {
+        "site": marketplace,
+        "telegram": bool(store.get("telegram.bot_token") and store.get("telegram.chat_ids")),
+        "llm": bool(has_key or not preset.requires_key),
+        "llm_provider": provider,
+        "llm_title": preset.title,
+        "llm_model": get_user_llm_model(store, chat_id) or (store.get("llm.model") or preset.model),
+        "llm_verified": bool(is_user_llm_verified(store, chat_id)),
+        "marketplace": marketplace,
+        "credentials": creds_ok,
+        "tone": get_user(store, chat_id, "proposal.tone") or store.get("proposal.tone") or "",
+        "style": bool(get_user(store, chat_id, "proposal.style_instructions") or store.get("proposal.style_instructions")),
+        "mode": store.get("runtime.submit_mode") or "dry_run",
+        "profile_source": str(get_user(store, chat_id, "profile.source") or store.get("profile.source") or ""),
+        "profile_imported_at": get_user(store, chat_id, "profile.imported_at") or store.get("profile.imported_at"),
+        "profile_imported": bool(get_user(store, chat_id, "profile.imported_at") or store.get("profile.imported_at")),
+        "profile_error": str(get_user(store, chat_id, "profile.import_error") or store.get("profile.import_error") or ""),
+        "bid_percent": bid_percent(store),  # TODO per-user
+        "preview": preview_is_fresh(store),
+        "setup_completed": bool(store.get("setup.completed")),
+        "full_name": full_name,
     }
 
 

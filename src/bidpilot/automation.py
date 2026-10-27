@@ -90,12 +90,22 @@ class Automation:
             log.warning("Could not notify owner: %s", exc)
 
     # ------------------------------------------------------------------ start
-    async def start(self) -> tuple[bool, str]:
+    async def start(self, chat_id: str | int | None = None) -> tuple[bool, str]:
         if self.running:
             return False, "رصد از قبل در حال اجراست."
         try:
             cfg = load_config(self.config_path, store=self.store)
-            app = build_application(cfg)
+            secrets = None
+            # Per-user LLM/pricing/profile isolation: if chat_id is known, inject its overrides
+            if chat_id is not None:
+                try:
+                    from .per_user import apply_per_user_config
+                    from .config import Secrets, secrets_from_store
+                    cfg, secrets = apply_per_user_config(self.store, str(chat_id), cfg, None)
+                except Exception as e:
+                    log.debug("per-user config apply failed: %s", e)
+                    secrets = None
+            app = build_application(cfg, secrets) if secrets is not None else build_application(cfg)
             await app.setup()
         except Exception as exc:
             log.exception("Could not start automation")
@@ -131,8 +141,18 @@ class Automation:
                     await app.close()
                     return False, "ورود به حساب تأیید نشد؛ عملیات شروع نشد."
 
+        # Capture chat_id for per-user factory
+        _chat_for_factory = chat_id
         def make_app() -> Application:
-            return build_application(load_config(self.config_path, store=self.store))
+            cfg2 = load_config(self.config_path, store=self.store)
+            secrets2 = None
+            if _chat_for_factory is not None:
+                try:
+                    from .per_user import apply_per_user_config
+                    cfg2, secrets2 = apply_per_user_config(self.store, str(_chat_for_factory), cfg2, None)
+                except Exception:
+                    pass
+            return build_application(cfg2, secrets2) if secrets2 is not None else build_application(cfg2)
 
         self._app = app
         self._scheduler = Scheduler(

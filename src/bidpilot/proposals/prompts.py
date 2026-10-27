@@ -71,6 +71,8 @@ def build_prompts(
     config: ProposalConfig,
     amount: int,
     delivery_days: int | None,
+    *,
+    hide_price: bool = False,
 ) -> tuple[str, str]:
     """Return (system_prompt, user_prompt)."""
     delivery = f"{delivery_days} روز" if delivery_days else "توافقی"
@@ -89,10 +91,16 @@ def build_prompts(
         min_chars=config.min_chars,
         max_chars=config.max_chars,
     )
+    if hide_price:
+        system += "\n- قیمت را در متن ذکر نکن — فقط روی توانایی و راه‌حل تمرکز کن. قیمت جداگانه در فرم وارد می‌شود."
     # The user's own voice always beats the generic profile tone.
     effective_tone = (config.tone or profile.tone or "حرفه‌ای، صمیمی، بدون اغراق").strip()
     style = (config.style_instructions or "").strip()
     style = truncate(style, 1_000) if style else "خاصی تعیین نشده؛ طبیعی و انسانی بنویس."
+    if hide_price:
+        price_line = "توجه: قیمت را در متن ننویس؛ فقط مهارت و برنامه را توضیح بده. (قیمت در فرم پر می‌شود)"
+    else:
+        price_line = f"{to_persian_digits(f'{amount:,}')} تومان"
     user = USER_PROMPT_TEMPLATE.format(
         full_name=profile.full_name,
         role=profile.role,
@@ -104,7 +112,7 @@ def build_prompts(
         style=style,
         forbidden="؛ ".join(profile.forbidden_claims) or "—",
         project_text=project_text,
-        amount=to_persian_digits(f"{amount:,}"),
+        amount=price_line,
         delivery=to_persian_digits(delivery),
         budget=project.budget.as_text() if project.budget else "اعلام نشده",
     )

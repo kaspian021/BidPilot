@@ -589,14 +589,38 @@ async def _provider_from_settings(store: SettingsStore) -> tuple[LLMProvider | N
     return (chain[0] if chain else None), cfg.llm
 
 
+async def _provider_for_user(store: SettingsStore, chat_id: str | int | None = None) -> tuple[LLMProvider | None, Any]:
+    """Per-user provider — uses that user's own API key/model, never global.
+
+    If chat_id is given and that user has a verified LLM config, it is used
+    exclusively. Otherwise falls back to the legacy global provider so old
+    single-user installs keep working.
+    """
+    if chat_id is not None:
+        try:
+            from .per_user import build_user_llm_provider
+
+            provider = build_user_llm_provider(store, chat_id)
+            if provider is not None:
+                from .config import load_config
+
+                cfg = load_config(store=store)
+                return provider, cfg.llm
+        except Exception as exc:
+            log.debug("Per-user provider lookup failed: %s", exc)
+    # fallback to global
+    return await _provider_from_settings(store)
+
+
 async def import_from_text(
     text: str,
     *,
     kind: str,
     store: SettingsStore,
     hints: dict[str, Any] | None = None,
+    chat_id: str | int | None = None,
 ) -> ImportedProfile:
-    provider, llm_config = await _provider_from_settings(store)
+    provider, llm_config = await _provider_for_user(store, chat_id)
     return await analyse_text(text, kind=kind, provider=provider, llm_config=llm_config, hints=hints)
 
 
@@ -606,9 +630,10 @@ async def import_from_pdf(
     store: SettingsStore,
     filename: str = "resume.pdf",
     save_dir: str | Path | None = None,
+    chat_id: str | int | None = None,
 ) -> ImportedProfile:
     text = pdf_text(data)
-    result = await import_from_text(text, kind="resume", store=store)
+    result = await import_from_text(text, kind="resume", store=store, chat_id=chat_id)
 
     data_dir = Path(save_dir) if save_dir else Path("data") / "uploads"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -616,28 +641,42 @@ async def import_from_pdf(
     digest = hashlib.sha1(data).hexdigest()[:8]
     target = data_dir / f"resume-{stamp}-{digest}.pdf"
     target.write_bytes(data)
-    store.update(
-        {
-            "profile.resume_path": str(target),
-            "profile.resume_filename": filename,
-        }
-    )
+    if chat_id is not None:
+        from .per_user import update_user
+
+        update_user(store, chat_id, {"profile.resume_path": str(target), "profile.resume_filename": filename})
+    else:
+        store.update(
+            {
+                "profile.resume_path": str(target),
+                "profile.resume_filename": filename,
+            }
+        )
     return result
 
 
-async def import_from_url(url: str, *, store: SettingsStore, kind: str | None = None) -> ImportedProfile:
+async def import_from_url(url: str, *, store: SettingsStore, kind: str | None = None, chat_id: str | int | None = None) -> ImportedProfile:
     target = normalise_url(url)
     resolved_kind = kind or ("github" if _GITHUB_RE.match(target) else "portfolio")
     text = await fetch_url_text(target)
     hints = {"portfolio_url": target}
-    return await import_from_text(text, kind=resolved_kind, store=store, hints=hints)
+    return await import_from_text(text, kind=resolved_kind, store=store, hints=hints, chat_id=chat_id)
 
 
 PENDING_KEY = "profile.import_pending"
 
 
-def pending_import(store: SettingsStore) -> dict[str, Any] | None:
+def pending_import(store: SettingsStore, chat_id: str | int | None = None) -> dict[str, Any] | None:
     """A resume/URL answer waiting to be analysed (set by the wizard)."""
+    # Per-user first
+    if chat_id is not None:
+        from .per_user import get_user
+        pending = get_user(store, chat_id, PENDING_KEY)
+        if isinstance(pending, dict):
+            value = str(pending.get("value") or "").strip()
+            kind = str(pending.get("type") or "").strip()
+            if value and kind in {"file", "url"}:
+                return {"type": kind, "value": value}
     pending = store.get(PENDING_KEY)
     if not isinstance(pending, dict):
         return None
@@ -648,12 +687,18 @@ def pending_import(store: SettingsStore) -> dict[str, Any] | None:
     return {"type": kind, "value": value}
 
 
-def clear_pending_import(store: SettingsStore) -> None:
+def clear_pending_import(store: SettingsStore, chat_id: str | int | None = None) -> None:
+    if chat_id is not None:
+        from .per_user import delete_user
+        delete_user(store, chat_id, PENDING_KEY)
     store.delete(PENDING_KEY)
 
 
-def clear_import_error(store: SettingsStore) -> None:
+def clear_import_error(store: SettingsStore, chat_id: str | int | None = None) -> None:
     """A successful import (or a fresh manual entry) forgets the last failure."""
+    if chat_id is not None:
+        from .per_user import delete_user
+        delete_user(store, chat_id, "profile.import_error")
     store.delete("profile.import_error")
 
 
@@ -661,9 +706,10 @@ async def run_pending_import(
     store: SettingsStore,
     *,
     save_dir: str | Path | None = None,
+    chat_id: str | int | None = None,
 ) -> ImportedProfile | None:
     """Analyse the queued resume/URL, store the fields, clear the queue."""
-    pending = pending_import(store)
+    pending = pending_import(store, chat_id=chat_id)
     if pending is None:
         return None
 
@@ -671,33 +717,52 @@ async def run_pending_import(
         path = Path(pending["value"]).expanduser()
         if not path.is_file():
             raise ProfileImportError(f"فایل پیدا نشد: {path}")
-        result = await import_from_pdf(path.read_bytes(), store=store, filename=path.name, save_dir=save_dir)
+        result = await import_from_pdf(path.read_bytes(), store=store, filename=path.name, save_dir=save_dir, chat_id=chat_id)
     else:
-        result = await import_from_url(pending["value"], store=store)
+        result = await import_from_url(pending["value"], store=store, chat_id=chat_id)
 
-    save_profile_fields(store, result.fields, source=result.kind)
-    # only a *successful* import consumes the queued resume/URL, so a failed
-    # attempt (missing pypdf, no network) can be retried without re-sending
-    clear_pending_import(store)
+    save_profile_fields(store, result.fields, source=result.kind, chat_id=chat_id)
+    clear_pending_import(store, chat_id=chat_id)
     return result
 
 
-def save_profile_fields(store: SettingsStore, fields: dict[str, Any], *, source: str) -> dict[str, Any]:
-    """Persist extracted fields (never clobbering a value the user typed later)."""
+def save_profile_fields(store: SettingsStore, fields: dict[str, Any], *, source: str, chat_id: str | int | None = None) -> dict[str, Any]:
+    """Persist extracted fields (never clobbering a value the user typed later).
+
+    When chat_id is given, fields are stored under users.{chat_id}.* so the
+    extraction uses exactly that user's API key/model and never leaks to others.
+    """
     written: dict[str, Any] = {}
-    updates: dict[str, Any] = {}
-    for key, value in (fields or {}).items():
-        if key not in PROFILE_FIELDS or value in (None, "", [], 0):
-            continue
-        updates[f"profile.{key}"] = value
-        written[key] = value
-    updates["profile.source"] = source
-    updates["profile.imported_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    updates["profile.import_error"] = None  # a good import clears the last failure
-    store.update(updates)
+    if chat_id is not None:
+        from .per_user import update_user, set_user
 
+        updates: dict[str, Any] = {}
+        for key, value in (fields or {}).items():
+            if key not in PROFILE_FIELDS or value in (None, "", [], 0):
+                continue
+            updates[f"profile.{key}"] = value
+            written[key] = value
+        updates["profile.source"] = source
+        updates["profile.imported_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        updates["profile.import_error"] = None
+        update_user(store, chat_id, updates)
+        # also clear error in that namespace explicitly if present
+        try:
+            set_user(store, chat_id, "profile.import_error", None)
+        except Exception:
+            pass
+    else:
+        updates: dict[str, Any] = {}
+        for key, value in (fields or {}).items():
+            if key not in PROFILE_FIELDS or value in (None, "", [], 0):
+                continue
+            updates[f"profile.{key}"] = value
+            written[key] = value
+        updates["profile.source"] = source
+        updates["profile.imported_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        updates["profile.import_error"] = None  # a good import clears the last failure
+        store.update(updates)
     from .config import reset_secret_cache
-
     reset_secret_cache()
     return written
 

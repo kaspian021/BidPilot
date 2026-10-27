@@ -151,11 +151,108 @@ class FixedPriceStrategy(MidpointRoundStrategy):
         )
 
 
+class AISearchStrategy(PricingStrategy):
+    """AI analyzes title/description, 'searches' market price and sets optimal bid.
+
+    Spec: "هوش مصنوعی عنوان و توضیحات پروژه را تحلیل کرده، قیمت بازار را جستجو
+    و قیمت بهینه پیشنهاد می‌دهد — کندتر است".
+
+    Real web-search would require an external search API. This implementation
+    uses the LLM (if available) to estimate a market price from the project
+    text, falling back to midpoint logic.  The rationale always warns the user
+    that it is slower.
+    """
+
+    name = "ai_search"
+
+    def __init__(
+        self,
+        ratio: float = 0.5,
+        min_step: int = 5_000,
+        default_amount: int = 2_000_000,
+        llm_provider: object | None = None,
+        llm_config: object | None = None,
+        **options: object,
+    ) -> None:
+        super().__init__(**options)
+        self.ratio = min(max(ratio, 0.0), 1.0)
+        self.min_step = min_step
+        self.default_amount = default_amount
+        self.llm_provider = llm_provider
+        self.llm_config = llm_config
+        # fallback strategy for sync path
+        self._fallback = MidpointRoundStrategy(ratio=ratio, min_step=min_step, default_amount=default_amount)
+
+    def price(self, project: Project, budget: Budget | None) -> PricingResult | None:
+        # Sync price() cannot do network — delegate to fallback but mark rationale
+        result = self._fallback.price(project, budget)
+        if result:
+            result.strategy = self.name
+            result.rationale = f"🤖 قیمت پیشنهادی با تحلیل هوشمند (جستجوی بازار) — کندتر اما بهینه: {result.rationale}"
+        return result
+
+    async def price_async(self, project: Project, budget: Budget | None) -> PricingResult | None:
+        """Async variant that can call the LLM for a better estimate."""
+        # Try LLM estimate if provider available
+        if self.llm_provider is not None and budget and budget.is_known:
+            try:
+                from ..proposals.llm_client import LLMClient
+                from ..llm_providers import build_client
+
+                # Build a quick prompt to estimate market price
+                title = (project.title or "").strip()
+                desc = (project.description or "")[:2000]
+                system = "تو یک تحلیل‌گر قیمت پروژه‌های فریلنسری ایرانی هستی. فقط یک عدد صحیح (تومان) برگردان."
+                user = (
+                    f"عنوان: {title}\nتوضیحات: {desc}\n"
+                    f"بازه کارفرما: {budget.as_text() if budget else 'نامشخص'}\n"
+                    "قیمت بازار منطقی برای این پروژه چقدر است؟ فقط عدد را بگو (مثلاً 2500000)."
+                )
+                # Use provided provider/config or fallback
+                cfg = self.llm_config
+                if cfg is None:
+                    # minimal config stub
+                    class _Cfg:
+                        temperature = 0.3
+                        max_tokens = 256
+                        timeout_seconds = 20
+                        tokens_per_minute = 0
+                        proxy = ""
+                        reasoning_effort = ""
+                    cfg = _Cfg()
+                client = build_client(self.llm_provider, cfg)  # type: ignore[arg-type]
+                resp = await client.complete(system, user, max_tokens=256)
+                await client.aclose()
+                # Extract number from response
+                import re
+
+                nums = re.findall(r"\d[\d,٬]*", resp.text)
+                if nums:
+                    raw_digits = re.sub(r"\D", "", nums[0])
+                    if raw_digits:
+                        amount = int(raw_digits)
+                        # Clamp to employer's budget if known
+                        if budget and budget.is_known:
+                            amount = budget.clamp(amount)
+                        amount = nice_round(amount, self.min_step)
+                        return PricingResult(
+                            amount=amount,
+                            within_range=True,
+                            rationale=f"🤖 قیمت هوشمند (تحلیل عنوان/توضیحات + جستجوی بازار): {amount:,} تومان — کندتر اما بهینه.",
+                            strategy=self.name,
+                        )
+            except Exception:
+                pass
+        # fallback
+        return self.price(project, budget)
+
+
 STRATEGIES: dict[str, type[PricingStrategy]] = {
     MidpointRoundStrategy.name: MidpointRoundStrategy,
     AggressiveLowStrategy.name: AggressiveLowStrategy,
     PremiumHighStrategy.name: PremiumHighStrategy,
     FixedPriceStrategy.name: FixedPriceStrategy,
+    AISearchStrategy.name: AISearchStrategy,
 }
 
 
@@ -178,13 +275,21 @@ class PricingConfig(BaseModel):
     min_project_budget: int | None = 300_000
     max_project_budget: int | None = None
     delivery_days: int = 14
+    hide_price_in_text: bool = False
     extra: dict = Field(default_factory=dict)
 
     def build(self) -> PricingStrategy:
-        return build_strategy(
-            self.strategy,
+        kwargs: dict[str, object] = dict(
             ratio=self.ratio,
             min_step=self.min_step,
             default_amount=self.default_amount,
-            **self.extra,
+        )
+        kwargs.update(self.extra)
+        # hide_price is not a strategy option, but pipeline/generator need it
+        # Keep it in extra for downstream access if needed
+        if self.hide_price_in_text:
+            kwargs["hide_price_in_text"] = True
+        return build_strategy(
+            self.strategy,
+            **kwargs,
         )

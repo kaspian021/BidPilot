@@ -180,6 +180,20 @@ def is_profile_onboarding_done(store: SettingsStore, chat_id: str | int) -> bool
     return False
 
 
+def is_marketplace_onboarding_done(store: SettingsStore, chat_id: str | int) -> bool:
+    """Step 3: marketplace + tone + pricing — all per-user set."""
+    mname = get_user(store, chat_id, "marketplace.name")
+    if not mname:
+        return False
+    tone = get_user(store, chat_id, "proposal.tone")
+    if not tone:
+        return False
+    bp = get_user(store, chat_id, "pricing.bid_percent")
+    if bp is None:
+        return False
+    return True
+
+
 def is_onboarding_blocked(store: SettingsStore, chat_id: str | int) -> bool:
     """True if dashboard should be hidden until steps 1-2 pass."""
     # Global setup (bot token) takes precedence: if bot token not set, don't block (old wizard handles it)
@@ -220,6 +234,7 @@ __all__ = [
     "current_chat_id",
     "is_llm_onboarding_done",
     "is_profile_onboarding_done",
+    "is_marketplace_onboarding_done",
     "is_onboarding_blocked",
     "onboarding_progress",
 ]

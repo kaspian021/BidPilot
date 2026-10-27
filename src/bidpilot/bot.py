@@ -1289,31 +1289,20 @@ class BotService:
                     orig_key = q.key
                     orig_when = q.when
                     # Make when per-user aware: check users.{chat}.profile.source
-                    def _make_when(orig):
+                    def _make_when(orig, ok=orig_key):
                         if orig is None:
                             return None
-                        # Wrap to check per-user source
-                        def _wrapped(s):
-                            # Try per-user source first
+                        def _wrapped(s, ok=ok):
                             per_src = get_user(s, chat_id, "profile.source")
                             if per_src is not None:
-                                # Replicate original logic but with per-user store view
-                                # For manual fields, original checks _profile_source(s) == "manual"
-                                # We simulate by checking per-user source directly
-                                # If per_src is manual/resume/github/portfolio, evaluate accordingly
-                                # To keep simple: if original used _profile_source, we check per-user value
-                                # Otherwise fall back to original
                                 try:
-                                    # Inspect original when via its closure? Hard, so we just infer from question key
-                                    # Instead, directly implement per-user logic based on key
-                                    if orig_key == "profile.source":
+                                    if ok == "profile.source":
                                         return True
-                                    # For resume_path: only if per_src == resume
-                                    if orig_key == "profile.resume_path":
+                                    if ok == "profile.resume_path":
                                         return str(per_src).lower() == "resume"
-                                    if orig_key == "profile.source_url":
+                                    if ok == "profile.source_url":
                                         return str(per_src).lower() in {"github", "portfolio"}
-                                    if orig_key in {"profile.first_name","profile.full_name","profile.role","profile.years_experience","profile.stack","profile.highlights","profile.portfolio_url","profile.signature"}:
+                                    if ok in {"profile.first_name","profile.full_name","profile.role","profile.years_experience","profile.stack","profile.highlights","profile.portfolio_url","profile.signature"}:
                                         return str(per_src).lower() == "manual"
                                 except Exception:
                                     pass
@@ -2655,13 +2644,20 @@ class BotService:
             await self._start_profile_onboarding(chat_id)
             return
         if flow.name == "user_profile":
-            # Profile done (or skip chosen)
             err = str(self.store.get(f"users.{chat_id}.profile.import_error") or self.store.get("profile.import_error") or "")
             if err:
                 await self.send(chat_id, f"⚠️ پروفایل با فایل کامل نشد: {escape(err)}\nدوباره /profile را بزن یا دستی وارد کن.")
                 return
+            from .per_user import is_marketplace_onboarding_done, is_profile_onboarding_done
+            if not is_profile_onboarding_done(self.store, chat_id):
+                await self.send(chat_id, "✅ پروفایل ذخیره شد.")
+                await self._show_dashboard(chat_id)
+                return
+            if is_marketplace_onboarding_done(self.store, chat_id):
+                await self.send(chat_id, "✅ پروفایل ذخیره شد.")
+                await self._show_dashboard(chat_id)
+                return
             await self.send(chat_id, "✅ پروفایل ذخیره شد.\nحالا تنظیمات تکمیلی (سایت، لحن، قیمت‌گذاری) را انجام می‌دهیم.")
-            # Step 3: marketplace + tone + pricing (per-user pricing enhancements)
             try:
                 from .onboarding import user_marketplace_questions, user_style_questions
                 qs = []

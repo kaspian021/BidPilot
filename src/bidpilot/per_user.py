@@ -12,7 +12,11 @@ Also tracks onboarding progress so the dashboard can be blocked until Steps
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
+
+# Context var for per-user credential lookup during source creation
+current_chat_id: ContextVar[str | None] = ContextVar("current_chat_id", default=None)
 
 from .llm_providers import DEFAULT_PROVIDER, PRESETS, get_preset
 from .settings_store import SettingsStore
@@ -59,19 +63,14 @@ def get_user_llm_provider_id(store: SettingsStore, chat_id: str | int) -> str | 
 
 
 def get_user_llm_api_key(store: SettingsStore, chat_id: str | int) -> str | None:
-    # per-provider key storage
+    # per-provider key storage — strictly per-user, no global fallback (isolation)
     provider = get_user_llm_provider_id(store, chat_id) or DEFAULT_PROVIDER
-    # try namespaced key first, then per-provider slot
     key = get_user(store, chat_id, "llm.api_key")
     if key:
         return str(key)
     per_provider = get_user(store, chat_id, f"llm.keys.{provider}")
     if per_provider:
         return str(per_provider)
-    # fallback: legacy global key (migration path)
-    global_key = store.get(f"llm.keys.{provider}") or store.get("llm.api_key")
-    if global_key:
-        return str(global_key)
     return None
 
 
@@ -79,14 +78,10 @@ def get_user_llm_model(store: SettingsStore, chat_id: str | int) -> str | None:
     v = get_user(store, chat_id, "llm.model")
     if v:
         return str(v)
-    # fallback to preset default for provider
+    # fallback to preset default for provider — strictly per-user
     provider = get_user_llm_provider_id(store, chat_id)
     if provider and provider in PRESETS:
         return PRESETS[provider].model
-    # legacy global model
-    gm = store.get("llm.model")
-    if gm:
-        return str(gm)
     return None
 
 
@@ -97,7 +92,7 @@ def get_user_llm_base_url(store: SettingsStore, chat_id: str | int) -> str | Non
     provider = get_user_llm_provider_id(store, chat_id)
     if provider and provider in PRESETS:
         return PRESETS[provider].base_url
-    return store.get("llm.base_url")  # global fallback
+    return None
 
 
 def is_user_llm_verified(store: SettingsStore, chat_id: str | int) -> bool:
@@ -160,30 +155,25 @@ def is_llm_onboarding_done(store: SettingsStore, chat_id: str | int) -> bool:
 
 
 def is_profile_onboarding_done(store: SettingsStore, chat_id: str | int) -> bool:
-    """Step 2: profile source chosen and (if not skip) fields present."""
-    # Check skip flag first (per-user skip marker)
+    """Step 2: profile source chosen and (if not skip) fields present — strictly per-user."""
     skipped = get_user(store, chat_id, "onboarding.profile_skipped")
     if skipped:
         return True
     source = get_user(store, chat_id, "profile.source")
     if not source:
-        source = store.get("profile.source")
-    if not source:
-        full_name = get_user(store, chat_id, "profile.full_name") or store.get("profile.full_name")
+        full_name = get_user(store, chat_id, "profile.full_name")
         if full_name:
             return True
         return False
     s = str(source).strip().lower()
     if s == "skip":
         return True
-    imported = get_user(store, chat_id, "profile.imported_at") or store.get("profile.imported_at")
+    imported = get_user(store, chat_id, "profile.imported_at")
     if imported:
         return True
-    full_name = get_user(store, chat_id, "profile.full_name") or store.get("profile.full_name")
+    full_name = get_user(store, chat_id, "profile.full_name")
     if full_name:
         return True
-    # If source is set but not skip and no fields yet, need to complete import/manual
-    # For per-user, if source chosen but still pending, not done
     pending = get_user(store, chat_id, "profile.import_pending")
     if pending:
         return False
@@ -226,6 +216,8 @@ __all__ = [
     "set_user_llm_verified",
     "build_user_llm_provider",
     "apply_per_user_config",
+    "user_status_text",
+    "current_chat_id",
     "is_llm_onboarding_done",
     "is_profile_onboarding_done",
     "is_onboarding_blocked",
@@ -236,6 +228,11 @@ def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets
     """Inject per-user LLM, pricing, profile into cfg/secrets (mutates cfg, returns secrets)."""
     from .llm_providers import DEFAULT_PROVIDER
     from .config import Secrets, secrets_from_store
+    # Set context for per-user credential lookup during source creation
+    try:
+        current_chat_id.set(str(chat_id))
+    except Exception:
+        pass
 
     # LLM
     provider = build_user_llm_provider(store, chat_id)
@@ -265,6 +262,18 @@ def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets
                     setattr(cfg.profile, field, v if field not in ("stack","highlights") else list(v))
                 except Exception:
                     pass
+        # marketplace per-user: override sources
+        mname = get_user(store, chat_id, "marketplace.name")
+        if mname:
+            from .config import SourceConfig
+            # replace sources with user's chosen site
+            cfg.sources = [SourceConfig(type=str(mname), enabled=True, settings={})]
+            # base_url per-user?
+            base_url = get_user(store, chat_id, "marketplace.base_url")
+            if base_url:
+                for src in cfg.sources:
+                    if src.type == str(mname):
+                        src.settings = {**(src.settings or {}), "base_url": str(base_url)}
         # proposal tone/style per-user? If stored per-user, override
         tone = get_user(store, chat_id, "proposal.tone")
         if tone:
@@ -289,4 +298,69 @@ def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets
         secrets.llm_api_key = provider.api_key
         return cfg, secrets
     return cfg, secrets
+
+
+def user_status_text(store: SettingsStore, chat_id: str | int) -> str:
+    """Per-user dashboard status — no server globals."""
+    from .onboarding import bid_percent as _bid_percent_global
+
+    parts = []
+    # LLM per-user
+    provider = get_user_llm_provider_id(store, chat_id)
+    model = get_user_llm_model(store, chat_id)
+    if provider and model:
+        try:
+            from .llm_providers import get_preset
+            title = get_preset(provider).title
+        except Exception:
+            title = provider
+        parts.append(f"✅ هوش مصنوعی: {title} — {model}")
+    else:
+        parts.append("❌ هوش مصنوعی: تنظیم نشده (/llm)")
+    # Marketplace per-user
+    mname = get_user(store, chat_id, "marketplace.name")
+    if mname:
+        from .onboarding import site_label
+        try:
+            label = site_label(str(mname))
+        except Exception:
+            label = str(mname)
+        parts.append(f"✅ سایت فعال: {label}")
+    else:
+        parts.append("❌ سایت فعال: انتخاب نشده (/market)")
+    # Tone per-user
+    tone = get_user(store, chat_id, "proposal.tone")
+    if tone:
+        parts.append(f"✅ لحن: {tone}")
+    else:
+        parts.append("❌ لحن: ثبت نشده")
+    # Profile per-user
+    full = get_user(store, chat_id, "profile.full_name")
+    if full:
+        parts.append(f"✅ پروفایل: {full}")
+    else:
+        pending = get_user(store, chat_id, "profile.import_pending")
+        if pending:
+            parts.append("⏳ پروفایل: در حال پردازش…")
+        else:
+            parts.append("❌ پروفایل: کامل نشده")
+    # Pricing per-user
+    bp = get_user(store, chat_id, "pricing.bid_percent")
+    if bp is not None:
+        try:
+            parts.append(f"💰 قیمت: {int(bp)}٪ بودجه‌ی کارفرما")
+        except Exception:
+            pass
+    else:
+        # check global fallback for pricing? but per-user isolation means show not set
+        parts.append("💰 قیمت: پیش‌فرض ۵۰٪")
+    # Strategy
+    strat = get_user(store, chat_id, "pricing.strategy")
+    if strat:
+        strat_label = "هوشمند (AI سرچ)" if str(strat) == "ai_search" else "درصدی از بودجه"
+        parts.append(f"🧠 استراتژی قیمت: {strat_label}")
+    hide = get_user(store, chat_id, "pricing.hide_price_in_text")
+    if hide:
+        parts.append("🔒 قیمت در متن: مخفی (فقط فرم)")
+    return "\n".join(parts)
 

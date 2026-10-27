@@ -850,6 +850,127 @@ def user_pricing_questions(store: SettingsStore, chat_id: str | int) -> list[Que
     ]
 
 
+def user_marketplace_questions(store: SettingsStore, chat_id: str | int) -> list[Question]:
+    """Per-user marketplace — each user picks their own site + credentials."""
+    from .per_user import user_key, get_user
+
+    def _ukey(dotted: str):
+        return lambda s: user_key(chat_id, dotted)
+
+    def _user_market_default(s: SettingsStore) -> str:
+        v = get_user(s, chat_id, "marketplace.name")
+        return str(v) if v else _current_marketplace(s)
+
+    def _user_needs_account(s: SettingsStore) -> bool:
+        v = get_user(s, chat_id, "marketplace.name")
+        cur = str(v) if v else _current_marketplace(s)
+        return cur != "mock"
+
+    def _user_cred_key(field_name: str):
+        def _fn(s: SettingsStore) -> str:
+            v = get_user(s, chat_id, "marketplace.name")
+            site = str(v) if v else _current_marketplace(s)
+            return user_key(chat_id, f"credentials.{site}.{field_name}")
+        return _fn
+
+    def _user_site_method(s: SettingsStore) -> str:
+        v = get_user(s, chat_id, "marketplace.name")
+        site = str(v) if v else _current_marketplace(s)
+        return str(get_user(s, chat_id, f"credentials.{site}.method") or store.get(f"credentials.{site}.method") or "cookie")
+
+    return [
+        Question(
+            key="marketplace.name",
+            prompt="روی کدام سایت فریلنسری پیشنهاد بدهیم؟",
+            kind="choice",
+            stage="market",
+            key_fn=_ukey("marketplace.name"),
+            choices=_marketplace_choices(),
+            dynamic_default=_user_market_default,
+        ),
+        Question(
+            key="credentials.method",
+            prompt="ورود به سایت چطور انجام شود؟",
+            kind="choice",
+            stage="market",
+            key_fn=_user_cred_key("method"),
+            choices=[
+                Choice("credentials", "نام کاربری و رمز عبور", "ربات خودش لاگین می‌کند؛ اگر سایت کپچا داشت، از روش کوکی استفاده کن."),
+                Choice("cookie", "کوکی نشست (ساده‌تر و مطمئن‌تر)", "از مرورگر، بعد از لاگین، مقدار PHPSESSID را کپی کن."),
+            ],
+            default="cookie",
+            when=_user_needs_account,
+        ),
+        Question(
+            key="credentials",
+            prompt="نام کاربری حساب",
+            stage="market",
+            key_fn=_user_cred_key("username"),
+            help="فقط برای لاگین ربات استفاده می‌شود.",
+            when=lambda s: _user_needs_account(s) and _user_site_method(s) != "cookie",
+        ),
+        Question(
+            key="credentials",
+            prompt="رمز عبور حساب",
+            kind="secret",
+            stage="market",
+            key_fn=_user_cred_key("password"),
+            when=lambda s: _user_needs_account(s) and _user_site_method(s) != "cookie",
+        ),
+        Question(
+            key="credentials",
+            prompt="کوکی نشست سایت (PHPSESSID=…)",
+            kind="secret",
+            stage="market",
+            key_fn=_user_cred_key("cookie"),
+            help="در مرورگر لاگین کن → DevTools → Application → Cookies → کوکی نشست (معمولاً PHPSESSID) را کپی و همین‌جا بفرست. اگر منقضی شد، دوباره /market را بزن — برای هر سایت، حساب جداست.",
+            when=lambda s: _user_needs_account(s) and _user_site_method(s) == "cookie",
+        ),
+    ]
+
+
+def user_style_questions(store: SettingsStore, chat_id: str | int) -> list[Question]:
+    """Per-user tone/style — each user's proposals sound different."""
+    from .per_user import user_key, get_user
+
+    def _ukey(dotted: str):
+        return lambda s: user_key(chat_id, dotted)
+
+    return [
+        Question(
+            key="proposal.tone",
+            prompt="پیشنهادها را با چه لحنی بنویسیم؟",
+            kind="choice",
+            stage="style",
+            key_fn=_ukey("proposal.tone"),
+            choices=list(TONE_CHOICES),
+            allow_custom=True,
+            help="می‌توانی شماره یکی از گزینه‌ها را بفرستی، یا لحن دلخواهت را با جمله‌ی خودت بنویسی.",
+            dynamic_default=lambda s: get_user(s, chat_id, "proposal.tone") or s.get("proposal.tone") or TONE_CHOICES[0].value,
+        ),
+        Question(
+            key="proposal.style_instructions",
+            prompt="دستورهای سبک نوشتن (چطور و با چه تأکیدی پیشنهاد بدهیم؟)",
+            stage="style",
+            key_fn=_ukey("proposal.style_instructions"),
+            optional=True,
+            help="مثال: «همیشه اول یک سؤال درباره‌ی ددلاین بپرس، روی تحویل مرحله‌ای تأکید کن، از تعریف‌کردن از کارفرما پرهیز کن، جمله‌ها کوتاه باشند.» — با /skip رد می‌شوی.",
+            dynamic_default=lambda s: get_user(s, chat_id, "proposal.style_instructions") or s.get("proposal.style_instructions") or "",
+        ),
+        Question(
+            key="proposal.max_chars",
+            prompt="حداکثر طول هر پیشنهاد (کاراکتر)",
+            kind="int",
+            stage="style",
+            key_fn=_ukey("proposal.max_chars"),
+            default=1500,
+            help="بین ۴۰۰ تا ۳۰۰۰. کوتاه‌تر = خواناتر.",
+            validator=lambda value: None if 400 <= int(value) <= 3000 else "عدد بین ۴۰۰ تا ۳۰۰۰ بنویس.",
+            dynamic_default=lambda s: get_user(s, chat_id, "proposal.max_chars") or s.get("proposal.max_chars") or 1500,
+        ),
+    ]
+
+
 TONE_CHOICES = (
     Choice("حرفه‌ای، صمیمی و بدون اغراق", "حرفه‌ای و صمیمی"),
     Choice("رسمی و کوتاه", "رسمی و کوتاه"),

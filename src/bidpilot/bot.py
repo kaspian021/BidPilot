@@ -1353,6 +1353,7 @@ class BotService:
     async def _show_dashboard(self, chat_id: str) -> None:
         try:
             from .bot_ui import main_menu_keyboard, main_menu_text
+            from .per_user import user_status_text
             from .subscriptions.plans import get_plan
             from .db import Database
             from .subscriptions.manager import SubscriptionManager
@@ -1364,10 +1365,15 @@ class BotService:
                 _, plan = await mgr.effective_plan(chat_id)
                 plan_title = plan.title
             await db.dispose()
-            first = str(self.store.get(f"users.{chat_id}.profile.first_name") or self.store.get("profile.first_name") or self.store.get("profile.full_name") or "").split()[0] if self.store.get(f"users.{chat_id}.profile.full_name") or self.store.get("profile.full_name") else None
-            await self.send(chat_id, main_menu_text(first_name=first, plan_title=plan_title) + "\n\n" + status_text(self.store), main_menu_keyboard())
+            # Strictly per-user: no global fallback
+            first = str(self.store.get(f"users.{chat_id}.profile.first_name") or self.store.get(f"users.{chat_id}.profile.full_name") or "").split()[0] if self.store.get(f"users.{chat_id}.profile.full_name") else None
+            await self.send(chat_id, main_menu_text(first_name=first, plan_title=plan_title) + "\n\n" + user_status_text(self.store, chat_id), main_menu_keyboard())
         except Exception:
-            await self.send(chat_id, status_text(self.store) + "\n\n" + self._menu_hint(), self._menu_keyboard())
+            from .per_user import user_status_text as _ust
+            try:
+                await self.send(chat_id, _ust(self.store, chat_id) + "\n\n" + self._menu_hint(), self._menu_keyboard())
+            except Exception:
+                await self.send(chat_id, self._menu_hint(), self._menu_keyboard())
 
     async def _cmd_start_old(self, chat_id: str) -> None:
         save_chat_id(self.store, chat_id)
@@ -2657,11 +2663,10 @@ class BotService:
             await self.send(chat_id, "✅ پروفایل ذخیره شد.\nحالا تنظیمات تکمیلی (سایت، لحن، قیمت‌گذاری) را انجام می‌دهیم.")
             # Step 3: marketplace + tone + pricing (per-user pricing enhancements)
             try:
-                from .onboarding import marketplace_questions, style_questions
-                # marketplace is global (credentials per site), style/pricing per-user
+                from .onboarding import user_marketplace_questions, user_style_questions
                 qs = []
-                qs.extend(marketplace_questions(self.store))
-                qs.extend(style_questions(self.store))
+                qs.extend(user_marketplace_questions(self.store, chat_id))
+                qs.extend(user_style_questions(self.store, chat_id))
                 qs.extend(user_pricing_questions(self.store, chat_id))
                 await self.send(
                     chat_id,

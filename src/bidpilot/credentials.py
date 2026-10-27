@@ -112,6 +112,36 @@ def site_credentials(
     """Resolve credentials for ``site`` from the store (+ optional legacy values)."""
     store = store or get_store()
     site = str(site).strip().lower()
+    # Per-user isolation: if current_chat_id is set, check per-user credentials first
+    try:
+        from .per_user import current_chat_id as _ctx_chat
+        _chat = _ctx_chat.get()
+        if _chat:
+            _per_prefix = f"users.{_chat}.credentials.{site}"
+            _pm = _clean(store.get(f"{_per_prefix}.method"))
+            if _pm:
+                method = _pm
+                cookie = _clean(store.get(f"{_per_prefix}.cookie"))
+                username = _clean(store.get(f"{_per_prefix}.username"))
+                password = _clean(store.get(f"{_per_prefix}.password"))
+                headers = store.get(f"{_per_prefix}.headers") or {}
+                cookie_name = _clean(store.get(f"{_per_prefix}.cookie_name")) or DEFAULT_COOKIE_NAME
+                # still allow legacy/env fallback below if not found
+                if method not in METHODS:
+                    method = method_default
+                if method == "cookie" and not cookie and username and password:
+                    method = "credentials"
+                return SiteCredentials(
+                    site=site,
+                    method=method,
+                    cookie=cookie,
+                    username=username,
+                    password=password,
+                    headers=dict(headers) if isinstance(headers, Mapping) else {},
+                    cookie_name=cookie_name,
+                )
+    except Exception:
+        pass
     prefix = f"credentials.{site}"
 
     method = _clean(store.get(f"{prefix}.method")) or method_default

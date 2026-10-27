@@ -1232,6 +1232,10 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
                 store.update({"llm.model": preset.model, "llm.base_url": preset.base_url})
     elif key.endswith("llm.model"):
         store.set(key, value)
+        if key.startswith("users."):
+            prefix = key[: -len("llm.model")].rstrip(".")
+            # Changing model must re-verify; bot's model verification will set True on success
+            store.set(f"{prefix}.llm.verified", False)
     else:
         store.set(key, value)
     reset_secret_cache()

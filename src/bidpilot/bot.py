@@ -2585,9 +2585,42 @@ class BotService:
                 # Fallback: if verification infrastructure fails, still store but warn
                 log.warning("Verification failed internally: %s", e)
 
-        # Handle per-user model choice: ensure we store exactly that model
+        # Verify model choice too — test key+model combo (catches deprecated qwen/qwen3-32b etc)
         if store_key.startswith(f"users.{chat_id}.llm.model"):
-            pass
+            provider_id = str(self.store.get(f"users.{chat_id}.llm.provider") or "groq").strip().lower()
+            api_key = str(self.store.get(f"users.{chat_id}.llm.api_key") or self.store.get(f"users.{chat_id}.llm.keys.{provider_id}") or "")
+            from .llm_providers import get_preset, verify_user_key
+            try:
+                preset = get_preset(provider_id)
+                if preset.requires_key and not api_key:
+                    await self.send(chat_id, "⚠️ هنوز کلید API ثبت نشده؛ اول کلید را بفرست یا سرویس بدون کلید (Ollama) انتخاب کن.")
+                    return
+                chosen_model = str(value).strip()
+                if chosen_model:
+                    proxy = str(self.store.get("network.proxy") or self.store.get("llm.proxy") or "")
+                    await self.send(chat_id, f"⏳ در حال تست مدل <code>{escape(chosen_model)}</code> با کلید تو…")
+                    ok, msg = await verify_user_key(provider_id, api_key, chosen_model, proxy=proxy)
+                    if not ok:
+                        if "مدل یافت نشد" in msg or "model_not_found" in msg.lower() or "does not exist" in msg.lower():
+                            await self.send(chat_id, f"⚠️ <b>مدل در دسترس نیست</b>\n{escape(msg)}\n\nمدل دیگری از لیست انتخاب کن یا با /llm سرویس را عوض کن.")
+                        else:
+                            await self.send(chat_id, f"❌ <b>API key معتبر نیست</b>\n{escape(msg)}\n\nکلید را دوباره چک کن یا مدل دیگری امتحان کن.")
+                        return
+                    try:
+                        apply_answer(self.store, question, value)
+                    except Exception as exc:
+                        await self.send(chat_id, f"❌ ذخیره نشد: {escape(str(exc))}")
+                        return
+                    from .per_user import set_user_llm_verified
+                    set_user_llm_verified(self.store, chat_id, True)
+                    await self.send(chat_id, f"✅ {escape(msg)}\nاین مدل دقیقاً برای تو ذخیره شد و همه درخواست‌ها با آن انجام می‌شود.")
+                    self._log(f"chat {chat_id}: verified LLM model {chosen_model} for {provider_id}")
+                    flow.index += 1
+                    await self._advance(chat_id)
+                    return
+            except Exception as e:
+                log.warning("Model verification failed internally: %s", e)
+                # fallback to normal storage
 
         # Per-user profile skip: parse returns KEEP, but we need to store "skip" explicitly to mark onboarding done
         from .onboarding import KEEP as _KEEP

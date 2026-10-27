@@ -61,9 +61,10 @@ PROVIDER_MODELS: dict[str, list[str]] = {
     "groq": [
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
+        "qwen/qwen3.6-27b",
+        "qwen/qwen3.8-27b",
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
-        "qwen/qwen3-32b",
         "gemma2-9b-it",
     ],
     "gemini": [
@@ -372,6 +373,9 @@ async def verify_provider(
         )
     if response.status_code == 429:
         return False, "کلید معتبر است اما سهمیه‌ی رایگان همین لحظه پر شده؛ کمی بعد امتحان کنید."
+    if response.status_code == 404 or (response.status_code >= 400 and "model_not_found" in response.text.lower()) or (response.status_code >= 400 and "does not exist" in response.text.lower()):
+        # Groq deprecated qwen/qwen3-32b on 2026-07-17 / 2026-08-16 — guide user to current catalog
+        return False, f"❌ مدل یافت نشد (model_not_found) — این مدل در {provider.id} منسوخ/در دسترس نیست (HTTP {response.status_code}): {response.text[:180]}. لطفاً مدل دیگری انتخاب کن (مثلاً openai/gpt-oss-120b یا qwen/qwen3.6-27b) با /llm"
     if response.status_code >= 400:
         return False, f"❌ API key معتبر نیست — سرویس خطا داد (HTTP {response.status_code}): {response.text[:180]}"
     try:
@@ -420,9 +424,13 @@ async def verify_user_key(
         timeout=timeout,
         reasoning_effort="low" if is_reasoning_model(chosen_model) else "",
     )
-    if not ok and "API key معتبر نیست" not in msg:
-        # Ensure spec phrase is present for blocking logic
-        msg = f"❌ API key معتبر نیست — {msg}"
+    if not ok:
+        # Model not found should not be labelled as API key invalid
+        if "مدل یافت نشد" in msg or "model_not_found" in msg.lower() or "does not exist" in msg.lower():
+            pass
+        elif "API key معتبر نیست" not in msg:
+            # Ensure spec phrase is present for blocking logic (key errors)
+            msg = f"❌ API key معتبر نیست — {msg}"
     return ok, msg
 
 

@@ -249,18 +249,35 @@ def html_text(html: str, *, max_chars: int = MAX_TEXT_CHARS) -> str:
     return normalise_text(soup.get_text("\n", strip=True))[:max_chars]
 
 
-async def fetch_url_text(url: str, *, timeout: float = 25.0) -> str:
+async def fetch_url_text(url: str, *, timeout: float = 25.0, proxy: str = "", store: SettingsStore | None = None, chat_id: str | int | None = None) -> str:
     """Read a public page (portfolio, GitHub profile) as plain text."""
     target = normalise_url(url)
     parsed = urlparse(target)
     if parsed.scheme not in {"http", "https"}:
         raise ProfileImportError("لینک باید با http:// یا https:// شروع شود.")
 
+    # Resolve proxy: explicit > per-user > global
+    resolved_proxy = (proxy or "").strip()
+    if not resolved_proxy and store is not None:
+        try:
+            resolved_proxy = str(store.get("network.proxy") or store.get("llm.proxy") or "").strip()
+        except Exception:
+            pass
+        if not resolved_proxy and chat_id is not None:
+            try:
+                from .per_user import get_user
+                resolved_proxy = str(get_user(store, chat_id, "network.proxy") or "").strip()
+            except Exception:
+                pass
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 BidPilot",
         "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
     }
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+    client_kwargs: dict[str, object] = {"timeout": timeout, "follow_redirects": True, "headers": headers}
+    if resolved_proxy:
+        client_kwargs["proxy"] = resolved_proxy
+    async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
         try:
             if parsed.netloc.lower().endswith("github.com"):
                 text = await _github_text(client, target)
@@ -268,10 +285,16 @@ async def fetch_url_text(url: str, *, timeout: float = 25.0) -> str:
                     return text
             response = await client.get(target)
         except httpx.HTTPError as exc:
-            raise ProfileImportError(f"لینک باز نشد: {exc}") from exc
+            detail = str(exc).strip() or f"{type(exc).__name__} بدون جزئیات برای {target}"
+            raise ProfileImportError(f"لینک باز نشد: {detail}. آیا لینک عمومی است؟ اگر در ایران هستی با /proxy پروکسی (مثلاً http://127.0.0.1:10809) تنظیم کن.") from exc
+        except Exception as exc:  # pragma: no cover
+            detail = str(exc).strip() or f"{type(exc).__name__} برای {target}"
+            raise ProfileImportError(f"لینک باز نشد: {detail}") from exc
 
     if response.status_code >= 400:
-        raise ProfileImportError(f"صفحه با خطای HTTP {response.status_code} پاسخ داد. لینک عمومی است؟")
+        if response.status_code in {403, 404}:
+            raise ProfileImportError(f"صفحه با خطای HTTP {response.status_code} پاسخ داد (آدرس: {target}). لینک عمومی است؟ اگر در ایران هستی با /proxy پروکسی تنظیم کن.")
+        raise ProfileImportError(f"صفحه با خطای HTTP {response.status_code} پاسخ داد (آدرس: {target}). لینک عمومی است؟")
     text = html_text(response.text)
     if len(text) < 30:
         raise ProfileImportError(
@@ -379,7 +402,12 @@ async def analyse_text(
             payload = await _llm_extract(text, provider, llm_config, kind)
         except Exception as exc:  # network, quota, bad JSON… — heuristics still work
             log.warning("LLM profile extraction failed: %s", exc)
-            result.warnings.append(f"تحلیل با هوش مصنوعی انجام نشد ({exc})؛ از روش جایگزین استفاده شد.")
+            msg = str(exc)
+            # Groq retired qwen/qwen3-32b on 2026-07-17 — guide to current models
+            if "model_not_found" in msg.lower() or "does not exist" in msg.lower() or "مدل یافت نشد" in msg:
+                result.warnings.append(f"تحلیل با هوش مصنوعی انجام نشد ({msg}) — این مدل منسوخ شده. با /llm مدل به‌روز مثل openai/gpt-oss-120b یا qwen/qwen3.6-27b را انتخاب کن؛ از روش جایگزین استفاده شد.")
+            else:
+                result.warnings.append(f"تحلیل با هوش مصنوعی انجام نشد ({msg})؛ از روش جایگزین استفاده شد.")
             payload = None
         if payload:
             result.used_llm = True
@@ -658,7 +686,13 @@ async def import_from_pdf(
 async def import_from_url(url: str, *, store: SettingsStore, kind: str | None = None, chat_id: str | int | None = None) -> ImportedProfile:
     target = normalise_url(url)
     resolved_kind = kind or ("github" if _GITHUB_RE.match(target) else "portfolio")
-    text = await fetch_url_text(target)
+    # Pass store/chat_id so fetch can use proxy if configured
+    proxy = ""
+    try:
+        proxy = str(store.get("network.proxy") or store.get("llm.proxy") or "").strip()
+    except Exception:
+        pass
+    text = await fetch_url_text(target, proxy=proxy, store=store, chat_id=chat_id)
     hints = {"portfolio_url": target}
     return await import_from_text(text, kind=resolved_kind, store=store, hints=hints, chat_id=chat_id)
 

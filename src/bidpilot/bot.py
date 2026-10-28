@@ -488,11 +488,11 @@ class BotService:
             chat_str_tmp = str(chat_id)
             in_flow_tmp = chat_str_tmp in self._flows and self._flows[chat_str_tmp].current is not None
             if not in_flow_tmp:
-                pending_key = self.store.get(f"admin.pending_input:{chat_id}")
+                pending_key = self.store.get(f"admin.pending_input.{chat_id}")
                 if pending_key and self._require_admin(str(chat_id)):
                     low = text.lower().strip()
                     if low.startswith("/cancel") or low == "cancel" or low == "لغو":
-                        self.store.delete(f"admin.pending_input:{chat_id}")
+                        self.store.delete(f"admin.pending_input.{chat_id}")
                         await self.send(chat_id, "❌ لغو شد — مقدار قبلی حفظ شد.")
                         return
                     if not text.startswith("/"):
@@ -510,7 +510,7 @@ class BotService:
                                 self.store.set(str(pending_key), text)
                                 display_val = text
                             self._log_admin_action(chat_id, "pending_input", key=str(pending_key), value=display_val)
-                            self.store.delete(f"admin.pending_input:{chat_id}")
+                            self.store.delete(f"admin.pending_input.{chat_id}")
                             await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(str(pending_key))} = {esc(display_val)}</code>")
                             return
                         except ValueError:
@@ -1089,7 +1089,7 @@ class BotService:
             pass
 
     # ── Professional logging helpers ─────────────────────────────────
-    def _log_event(self, level: str, category: str, message: str, **fields) -> None:
+    def _log_event(self, lvl: str, category: str, message: str, **fields) -> None:
         """Detailed, scrubbed logging for admin toggle — never breaks main flow."""
         try:
             from .logging_utils import log_event, scrub_sensitive
@@ -1105,7 +1105,7 @@ class BotService:
                 except Exception:
                     safe_fields[k] = str(v)[:500]
             safe_msg = scrub_sensitive(message, self.store)
-            log_event(log, level, category, safe_msg, store=self.store, **safe_fields)
+            log_event(log, lvl, category, safe_msg, store=self.store, **safe_fields)
         except Exception:
             pass
 
@@ -1128,7 +1128,7 @@ class BotService:
         try:
             from .logging_utils import setup_file_logging
             setup_file_logging(self.store)
-            self._log_event("INFO", "system", "logging reconfigured", enabled=str(self.store.get("admin.logging.enabled")), level=str(self.store.get("admin.logging.level") or "DEBUG"))
+            self._log_event("INFO", "system", "logging reconfigured", enabled=str(self.store.get("admin.logging.enabled")), log_level=str(self.store.get("admin.logging.level") or "DEBUG"))
         except Exception as e:
             log.warning("Refresh logging failed: %s", e)
 
@@ -1884,11 +1884,11 @@ class BotService:
             if len(parts)==3:
                 _, field, pid = parts
                 if field == "price":
-                    self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{pid}.price_toman")
+                    self.store.set(f"admin.pending_input.{chat_id}", f"admin.plans.{pid}.price_toman")
                     await self.send(chat_id, f"💰 قیمت جدید برای <b>{esc(pid)}</b> را بفرست (عدد به تومان):\nمثلا <code>350000</code>\nلغو: /cancel\nیا دستی: <code>/admin_set plan:{pid} price 350000</code>")
                     return
                 if field == "period":
-                    self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{pid}.period_days")
+                    self.store.set(f"admin.pending_input.{chat_id}", f"admin.plans.{pid}.period_days")
                     await self.send(chat_id, f"📅 دوره جدید برای <b>{esc(pid)}</b> (روز) را بفرست:\nمثلا <code>30</code>\nلغو: /cancel\nیا دستی: <code>/admin_set plan:{pid} period 30</code>")
                     return
                 if field == "limits":
@@ -1900,7 +1900,7 @@ class BotService:
                     full_parts = cmd.split(":")
                     if len(full_parts) == 4:
                         _, _, limit_field, target_pid = full_parts
-                        self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
+                        self.store.set(f"admin.pending_input.{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
                         await self.send(chat_id, f"مقدار جدید برای <b>{esc(limit_field)}</b> در پلن <b>{esc(target_pid)}</b> را بفرست (عدد):\\nلغو: /cancel")
                         return
                 if field == "recommend":
@@ -1914,7 +1914,7 @@ class BotService:
             if len(parts)==4 and parts[1]=="limit":
                 # admin:plan:limit:max_bids_per_hour:starter
                 _, _, limit_field, target_pid = parts
-                self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
+                self.store.set(f"admin.pending_input.{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
                 await self.send(chat_id, f"مقدار جدید برای <b>{esc(limit_field)}</b> در پلن <b>{esc(target_pid)}</b> را بفرست (عدد):\\nلغو: /cancel")
                 return
         if cmd == "revenue":

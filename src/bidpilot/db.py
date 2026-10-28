@@ -140,9 +140,20 @@ class Database:
                 cols2 = {row[1] for row in result2.fetchall()}
                 if "gateway" not in cols2:
                     await conn.execute(sa_text("ALTER TABLE payments ADD COLUMN gateway VARCHAR(32) DEFAULT 'zarinpal'"))
+                # Auto-migrate bids.user_chat_id (added for per-user rate limiting)
+                try:
+                    result3 = await conn.execute(sa_text("PRAGMA table_info(bids)"))
+                    cols3 = {row[1] for row in result3.fetchall()}
+                    if "user_chat_id" not in cols3:
+                        await conn.execute(sa_text("ALTER TABLE bids ADD COLUMN user_chat_id VARCHAR(32)"))
+                except Exception:
+                    pass
                 # Create indexes for new columns if missing (SQLite ignores duplicates with IF NOT EXISTS)
                 await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_user_accounts_referral_code ON user_accounts (referral_code)"))
                 await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_user_accounts_referred_by ON user_accounts (referred_by)"))
+                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_bid_user ON bids (user_chat_id)"))
+                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_bid_source_created ON bids (source, created_at)"))
+                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_bid_status ON bids (status)"))
             except Exception:
                 # Migration is best-effort; never break startup
                 import logging

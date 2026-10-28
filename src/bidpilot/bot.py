@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from html import escape
 from typing import Any
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # Admin helpers alias - bot.py historically used esc/hr as short names
 esc = escape
@@ -217,6 +218,39 @@ class TelegramAPI:
         except BotAPIError as exc:  # pragma: no cover
             log.debug("answerCallbackQuery failed: %s", exc)
 
+    async def send_document(
+        self,
+        chat_id: str | int,
+        file_path: str | Path,
+        *,
+        caption: str = "",
+        filename: str | None = None,
+    ) -> None:
+        """Send a file as document (for log download)."""
+        from pathlib import Path as _P
+        fp = _P(file_path)
+        if not fp.exists():
+            raise BotAPIError(f"فایل یافت نشد: {file_path}")
+        client = await self._get_client()
+        url = f"{self.base_url}/bot{self.token}/sendDocument"
+        # Use httpx multipart upload
+        try:
+            with fp.open("rb") as f:
+                files = {"document": (filename or fp.name, f, "application/octet-stream")}
+                data = {"chat_id": str(chat_id)}
+                if caption:
+                    data["caption"] = caption[:1024]
+                # httpx requires separate call for multipart
+                resp = await client.post(url, data=data, files=files)
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    raise BotAPIError(f"پاسخ نامعتبر تلگرام (HTTP {resp.status_code})")
+                if resp.status_code >= 400 or not payload.get("ok", False):
+                    raise BotAPIError(str(payload.get("description") or f"HTTP {resp.status_code}"))
+        except httpx.HTTPError as exc:
+            raise BotAPIError(self._scrub(f"ارسال فایل ناموفق بود: {exc}")) from exc
+
     async def set_commands(self) -> None:
         commands = [
             {"command": "status", "description": "وضعیت و تنظیمات فعلی"},
@@ -305,6 +339,13 @@ class BotService:
         # Cleanup old temp uploads on startup (resume PDFs are ephemeral)
         try:
             self._cleanup_old_uploads(max_age_hours=1)
+        except Exception:
+            pass
+        # Setup professional file logging (admin toggle)
+        try:
+            from .logging_utils import setup_file_logging
+            setup_file_logging(self.store)
+            self._log_event("INFO", "system", "BotService initialized", chat_id="system")
         except Exception:
             pass
 
@@ -415,6 +456,13 @@ class BotService:
         chat_id = chat.get("id")
         if chat_id is None:
             return
+        # ── Professional logging: every incoming update (DEBUG) ──
+        try:
+            update_type = "callback" if update.get("callback_query") else ("document" if (update.get("message") or {}).get("document") else "message")
+            txt_preview = str((update.get("message") or {}).get("text") or update.get("callback_query",{}).get("data") or "")[:200]
+            self._log_event("DEBUG", "update", f"incoming {update_type}", chat_id=str(chat_id), preview=txt_preview, raw_type=update_type)
+        except Exception:
+            pass
         # ── maintenance mode (admin only) ──
         try:
             if self.store.get_bool("admin.maintenance"):
@@ -461,6 +509,7 @@ class BotService:
                             else:
                                 self.store.set(str(pending_key), text)
                                 display_val = text
+                            self._log_admin_action(chat_id, "pending_input", key=str(pending_key), value=display_val)
                             self.store.delete(f"admin.pending_input:{chat_id}")
                             await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(str(pending_key))} = {esc(display_val)}</code>")
                             return
@@ -534,6 +583,10 @@ class BotService:
         callback_id = str(callback.get("id") or "")
         if chat_id is None:
             return
+        try:
+            self._log_event("DEBUG", "callback", f"callback {data[:80]}", chat_id=str(chat_id), data=data[:200])
+        except Exception:
+            pass
         await self.api.answer_callback(callback_id)
         if not self.is_allowed(chat_id):
             # Allow callbacks from newly auto-added users (e.g. after /start ref_...)
@@ -666,6 +719,10 @@ class BotService:
 
     # -------------------------------------------------------------- commands
     async def handle_command(self, chat_id: str, command: str, rest: str = "") -> None:
+        try:
+            self._log_event("INFO", "command", f"command {command}", chat_id=str(chat_id), command=command, rest=rest[:200] if rest else "")
+        except Exception:
+            pass
         # ── Gate: block all ops until LLM verified (Step 1) ──
         try:
             if is_onboarding_blocked(self.store, chat_id):
@@ -1030,6 +1087,50 @@ class BotService:
                     pass
         except Exception:
             pass
+
+    # ── Professional logging helpers ─────────────────────────────────
+    def _log_event(self, level: str, category: str, message: str, **fields) -> None:
+        """Detailed, scrubbed logging for admin toggle — never breaks main flow."""
+        try:
+            from .logging_utils import log_event, scrub_sensitive
+            # Also scrub fields values that look like secrets
+            safe_fields = {}
+            for k, v in fields.items():
+                try:
+                    sv = str(v)
+                    # Truncate overly long
+                    if len(sv) > 500:
+                        sv = sv[:500] + "…"
+                    safe_fields[k] = scrub_sensitive(sv, self.store)
+                except Exception:
+                    safe_fields[k] = str(v)[:500]
+            safe_msg = scrub_sensitive(message, self.store)
+            log_event(log, level, category, safe_msg, store=self.store, **safe_fields)
+        except Exception:
+            pass
+
+    def _log_admin_action(self, chat_id: str | int, action: str, **details) -> None:
+        """Every admin change is logged at INFO — even minor ones."""
+        try:
+            old_vals = {}
+            # If details contain key/new_value, fetch old for audit
+            if "key" in details:
+                try:
+                    old_vals["old"] = str(self.store.get(details["key"]) or "—")[:300]
+                except Exception:
+                    pass
+            self._log_event("INFO", "admin", f"admin:{action} by {chat_id}", chat_id=str(chat_id), action=action, **details, **old_vals)
+        except Exception:
+            pass
+
+    def _refresh_logging(self) -> None:
+        """Re-apply file handler after toggle/level change (no restart needed)."""
+        try:
+            from .logging_utils import setup_file_logging
+            setup_file_logging(self.store)
+            self._log_event("INFO", "system", "logging reconfigured", enabled=str(self.store.get("admin.logging.enabled")), level=str(self.store.get("admin.logging.level") or "DEBUG"))
+        except Exception as e:
+            log.warning("Refresh logging failed: %s", e)
 
     # ------------------------------------------------------------ start/stop
     async def _cmd_run(self, chat_id: str) -> None:
@@ -1623,7 +1724,15 @@ class BotService:
         return stats
 
     async def _handle_admin_callback(self, chat_id: str, data: str) -> None:
+        try:
+            self._log_event("INFO", "admin", f"admin callback {data[:100]}", chat_id=str(chat_id), data=data[:300])
+        except Exception:
+            pass
         if not self._require_admin(chat_id):
+            try:
+                self._log_event("WARNING", "admin", "admin access denied", chat_id=str(chat_id), data=data[:100])
+            except Exception:
+                pass
             await self.send(chat_id, "⛔ این بخش فقط برای ادمین (7806301378) است.")
             return
         # Routing
@@ -1799,6 +1908,7 @@ class BotService:
                     new = not bool(cur) if cur is not None else True
                     # simplified: store flag
                     self.store.set(f"admin.plans.{pid}.recommended", new)
+                    self._log_admin_action(chat_id, "plan:recommend", plan=pid, recommended=str(new))
                     await self.send(chat_id, f"{'⭐ پیشنهاد ویژه شد' if new else 'حذف از پیشنهاد ویژه'}: {esc(pid)}")
                     return
             if len(parts)==4 and parts[1]=="limit":
@@ -1898,6 +2008,7 @@ class BotService:
                 cur = self.store.get("runtime.submit_mode") or "dry_run"
                 nxt = "live" if cur == "dry_run" else "dry_run"
                 self.store.set("runtime.submit_mode", nxt)
+                self._log_admin_action(chat_id, "sys:mode", old=cur, new=nxt)
                 await self.send(chat_id, f"حالت ارسال → <b>{esc(nxt)}</b>")
                 return
             if sub == "llm":
@@ -1915,6 +2026,7 @@ class BotService:
             if sub == "maintenance":
                 cur = self.store.get_bool("admin.maintenance")
                 self.store.set("admin.maintenance", not cur)
+                self._log_admin_action(chat_id, "sys:maintenance", old=str(cur), new=str(not cur))
                 await self.send(chat_id, f"حالت نگهداری: {'🔴 روشن — کاربران عادی بلاک می‌شوند' if not cur else '🟢 خاموش'}")
                 return
         if cmd == "advanced":
@@ -1923,7 +2035,12 @@ class BotService:
         if cmd.startswith("adv:"):
             sub = cmd.split(":")[1]
             if sub == "logs":
-                await self.send(chat_id, "لاگ: روی سرور <code>tail -f data/bidpilot.log</code> یا <code>bidpilot doctor</code>")
+                # Redirect to new professional logs center
+                try:
+                    self._refresh_logging()
+                except Exception:
+                    pass
+                await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
                 return
             if sub == "cleanup":
                 await self.send(chat_id, "پاکسازی: <code>/admin_set admin.adv.cleanup yes</code> (فعلاً دستی روی سرور انجام می‌شود)")
@@ -1962,9 +2079,103 @@ class BotService:
                 self.store.delete("admin.pending_broadcast")
                 await self.send(chat_id, f"✅ پیام همگانی به {count} کاربر ارسال شد.")
                 return
+        if cmd == "logs" or cmd.startswith("logs:"):
+            # ── Professional logging center ──
+            if cmd == "logs":
+                try:
+                    self._refresh_logging()
+                except Exception:
+                    pass
+                await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+                return
+            if cmd == "logs:toggle":
+                try:
+                    from .logging_utils import is_logging_enabled, set_logging_enabled, get_logging_level
+                    cur = is_logging_enabled(self.store)
+                    set_logging_enabled(self.store, not cur)
+                    self._refresh_logging()
+                    await self.send(chat_id, f"{'🟢 لاگ فعال شد' if not cur else '🔴 لاگ غیرفعال شد'} — سطح: <code>{escape(get_logging_level(self.store))}</code>\\n<i>از این لحظه همه جزئیات {'ثبت می‌شود' if not cur else 'دیگر ثبت نمی‌شود'}.</i>")
+                    await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+                    self._log_admin_action(chat_id, "logs:toggle", enabled=str(not cur))
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+            if cmd.startswith("logs:level:"):
+                try:
+                    lvl = cmd.split(":")[2].upper()
+                    from .logging_utils import set_logging_level
+                    set_logging_level(self.store, lvl)
+                    self._refresh_logging()
+                    desc = {'DEBUG': 'همه جزئیات حتی ریزترین خطاها', 'INFO': 'رویدادهای مهم', 'WARNING': 'فقط هشدارها', 'ERROR': 'فقط خطاهای بحرانی'}.get(lvl, lvl)
+                    await self.send(chat_id, f"✅ سطح لاگ → <b>{escape(lvl)}</b>\\n<i>{escape(desc)}</i>")
+                    await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+                    self._log_admin_action(chat_id, "logs:level", level=lvl)
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+            if cmd == "logs:tail" or cmd.startswith("logs:tail:"):
+                try:
+                    from .logging_utils import tail_logs
+                    lvl = None
+                    if cmd.count(":") == 2:
+                        lvl = cmd.split(":")[2].upper()
+                    lines = tail_logs(n=50, level=lvl if lvl in ("ERROR","WARNING","INFO","DEBUG","CRITICAL") else None)
+                    if not lines:
+                        await self.send(chat_id, "📭 هنوز لاگی ثبت نشده — اول «فعال کردن لاگ» را بزن و چند دستور امتحان کن.", admin_ui.logs_keyboard(self.store))
+                    else:
+                        text = "\\n".join(lines)
+                        if len(text) > 3800:
+                            from pathlib import Path as _P
+                            import tempfile
+                            tmp = _P(tempfile.gettempdir()) / f"bidpilot-tail-{chat_id}.log"
+                            try:
+                                tmp.write_text(text, encoding="utf-8")
+                                await self.api.send_document(chat_id, tmp, caption=f"📜 {len(lines)} خط آخر" + (f" — سطح {lvl}" if lvl else ""))
+                                tmp.unlink(missing_ok=True)
+                            except Exception:
+                                await self.send(chat_id, f"<pre>{escape(text[:3800])}</pre>\\n<i>... ادامه دارد — {len(lines)} خط</i>", admin_ui.logs_keyboard(self.store))
+                        else:
+                            await self.send(chat_id, f"<b>📜 {len(lines)} خط آخر" + (f" — {escape(lvl)}" if lvl else "") + "</b>\\n<pre>" + escape(text) + "</pre>", admin_ui.logs_keyboard(self.store))
+                    self._log_event("DEBUG", "admin", f"view tail {lvl or 'all'}", chat_id=str(chat_id), lines=str(len(lines)))
+                except Exception as e:
+                    await self.send(chat_id, f"خطا در نمایش لاگ: {escape(str(e))}")
+                return
+            if cmd == "logs:clear:ask":
+                await self.send(chat_id, admin_ui.logs_clear_confirm_text(), admin_ui.logs_clear_confirm_keyboard())
+                return
+            if cmd == "logs:clear:yes":
+                try:
+                    from .logging_utils import clear_logs
+                    stats = clear_logs(self.store)
+                    await self.send(chat_id, f"🧹 لاگ‌ها پاک شد — {stats.get('lines',0)} خط ({stats.get('size',0)} بایت) حذف شد.\\n<i>لاگ‌نویسی ادامه دارد.</i>", admin_ui.logs_keyboard(self.store))
+                    self._log_admin_action(chat_id, "logs:clear", cleared_lines=str(stats.get('lines')), cleared_size=str(stats.get('size')))
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+            if cmd == "logs:download":
+                try:
+                    from .logging_utils import get_log_stats
+                    from pathlib import Path as _P
+                    stats = get_log_stats(self.store)
+                    target = _P(stats["file"])
+                    if not target.exists():
+                        await self.send(chat_id, "📭 فایلی برای دانلود نیست — هنوز لاگی ثبت نشده.", admin_ui.logs_keyboard(self.store))
+                        return
+                    await self.api.send_document(chat_id, target, caption=f"📜 BidPilot logs — {stats['lines']} خط · {stats['size_mb']} MB · سطح {stats['level']}")
+                    self._log_event("INFO", "admin", "download logs", chat_id=str(chat_id), file=str(target), size=str(stats['size']))
+                except Exception as e:
+                    log.exception("log download failed")
+                    await self.send(chat_id, f"❌ دانلود ناموفق: {escape(str(e))}")
+                return
+            await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+            return
         await self.send(chat_id, "دستور ادمین نامعتبر.", admin_ui.admin_main_keyboard())
 
     async def _handle_admin_set(self, chat_id: str, rest: str) -> None:
+        try:
+            self._log_event("INFO", "admin", f"admin_set {rest[:150]}", chat_id=str(chat_id), rest=rest[:300])
+        except Exception:
+            pass
         if not rest or " " not in rest.strip():
             await self.send(chat_id, "<b>فرمت:</b> <code>/admin_set &lt;key&gt; &lt;value&gt;</code>\nنمونه‌ها:\n"
                                       "<code>/admin_set pricing.ratio 0.4</code>\n"
@@ -2003,6 +2214,7 @@ class BotService:
                             self.store.set(key, int(value))
                         except ValueError:
                             self.store.set(key, value)
+                        self._log_admin_action(chat_id, f"plan:{pid}:{field}", key=key, value=value)
                         await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(key)} = {esc(value)}</code>")
                         return
                 if rest.startswith("user:"):
@@ -2078,8 +2290,10 @@ class BotService:
                             self.store.set(key, val)
                 except Exception:
                     self.store.set(key, val)
+            self._log_admin_action(chat_id, "admin_set", key=key, value=val)
             await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(key)} = {esc(val)}</code>")
         except Exception as e:
+            self._log_event("ERROR", "admin", f"admin_set failed {key}={val}", chat_id=str(chat_id), error=str(e))
             await self.send(chat_id, f"❌ ذخیره ناموفق: {escape(str(e))}")
 
     async def _handle_admin_search(self, chat_id: str, rest: str) -> None:

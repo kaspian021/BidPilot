@@ -28,6 +28,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any
+from datetime import datetime, timedelta, timezone
+
+# Admin helpers alias - bot.py historically used esc/hr as short names
+esc = escape
+def hr() -> str:
+    return "───────────────"
 
 import httpx
 
@@ -73,6 +79,7 @@ from .per_user import (
     is_profile_onboarding_done,
     is_user_llm_verified,
     onboarding_progress,
+    get_user,
     set_user,
     set_user_llm_verified,
     update_user,
@@ -295,6 +302,11 @@ class BotService:
         self.automation = automation or Automation(
             store=store, config_path=config_path, notify=self.notify_owner
         )
+        # Cleanup old temp uploads on startup (resume PDFs are ephemeral)
+        try:
+            self._cleanup_old_uploads(max_age_hours=1)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- transport
     async def send(self, chat_id: str | int, text: str, reply_markup: dict | None = None) -> bool:
@@ -423,6 +435,43 @@ class BotService:
         text = (message.get("text") or "").strip()
         if not text:
             return
+        # ── Admin pending input (price/period/limits) ──
+        try:
+            chat_str_tmp = str(chat_id)
+            in_flow_tmp = chat_str_tmp in self._flows and self._flows[chat_str_tmp].current is not None
+            if not in_flow_tmp:
+                pending_key = self.store.get(f"admin.pending_input:{chat_id}")
+                if pending_key and self._require_admin(str(chat_id)):
+                    low = text.lower().strip()
+                    if low.startswith("/cancel") or low == "cancel" or low == "لغو":
+                        self.store.delete(f"admin.pending_input:{chat_id}")
+                        await self.send(chat_id, "❌ لغو شد — مقدار قبلی حفظ شد.")
+                        return
+                    if not text.startswith("/"):
+                        # Validate and store pending admin value
+                        try:
+                            clean = text.replace(",", "").replace("٬", "").replace(" ", "").strip()
+                            # Numeric fields
+                            if any(k in str(pending_key) for k in ["price_toman", "period_days", "max_bids", "min_seconds", "max_projects", "max_active", "commission_percent", "discount_percent"]):
+                                val = int(clean)
+                                if val < 0:
+                                    raise ValueError("negative")
+                                self.store.set(str(pending_key), val)
+                                display_val = str(val)
+                            else:
+                                self.store.set(str(pending_key), text)
+                                display_val = text
+                            self.store.delete(f"admin.pending_input:{chat_id}")
+                            await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(str(pending_key))} = {esc(display_val)}</code>")
+                            return
+                        except ValueError:
+                            await self.send(chat_id, f"❌ مقدار نامعتبر: <code>{esc(text)}</code> — فقط عدد بفرست (مثلا 350000).\\nلغو: /cancel")
+                            return
+                        except Exception as e:
+                            await self.send(chat_id, f"❌ خطا: {escape(str(e))}")
+                            return
+        except Exception:
+            pass
         if not self.is_allowed(chat_id):
             # Referral / public onboarding: let anyone join via /start (esp. /start ref_...)
             # Otherwise the invite link is useless. Auto-add them to allowed list.
@@ -787,7 +836,10 @@ class BotService:
             )
             return
 
-        target = self._uploads_dir() / name
+        # Use unique temp name per user to avoid collisions and mark as temp for cleanup
+        import time
+        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:60]
+        target = self._uploads_dir() / f"tmp_{chat_id}_{int(time.time()*1000)}_{safe_name}"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
@@ -856,6 +908,8 @@ class BotService:
             pending = pending_import(self.store)
         if not pending:
             return
+        # Keep path for cleanup before we clear pending
+        pending_path = pending.get("value") if pending.get("type") == "file" else None
         if pending["type"] == "file" and not await self._ensure_pdf_reader(chat_id):
             return
         await self.send(chat_id, "🤖 دارم متن را با هوش مصنوعی شخصی تو تحلیل می‌کنم…")
@@ -872,6 +926,7 @@ class BotService:
                 "اطلاعات قبلی پروفایل حفظ شد (چیزی پاک نشد).\n"
                 "می‌توانی دوباره با /profile فایل/لینک بدهی، یا «ورود دستی» را انتخاب کنی.",
             )
+            self._cleanup_upload_file(pending_path)
             return
         except Exception as exc:
             log.exception("Profile import failed")
@@ -881,9 +936,11 @@ class BotService:
                 f"⚠️ تحلیل پروفایل انجام نشد: {escape(str(exc))}\n"
                 "اطلاعات فعلی حفظ شد؛ با /profile دوباره تلاش کن یا دستی وارد کن.",
             )
+            self._cleanup_upload_file(pending_path)
             return
 
         if result is None:
+            self._cleanup_upload_file(pending_path)
             return
         from .profile_import import clear_import_error
 
@@ -904,6 +961,75 @@ class BotService:
             + (("\n" + warnings) if warnings else "")
             + "\n\nاگر چیزی درست نیست، /profile را بزن و دستی اصلاح کن.",
         )
+        # Cleanup: delete the uploaded PDF after successful extraction (privacy + disk)
+        self._cleanup_upload_file(pending_path)
+        # Also cleanup any legacy stored resume_path files if they exist
+        try:
+            old_path = self.store.get(f"users.{chat_id}.profile.resume_path") or self.store.get("profile.resume_path")
+            if old_path:
+                self._cleanup_upload_file(str(old_path))
+                try:
+                    from .per_user import delete_user
+                    delete_user(self.store, chat_id, "profile.resume_path")
+                except Exception:
+                    pass
+                try:
+                    self.store.delete("profile.resume_path")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Opportunistic cleanup of old tmp files older than 1 hour
+        try:
+            self._cleanup_old_uploads(max_age_hours=1)
+        except Exception:
+            pass
+
+    def _cleanup_upload_file(self, path: str | None) -> None:
+        """Securely delete a single uploaded PDF (ignore missing)."""
+        if not path:
+            return
+        try:
+            from pathlib import Path as _P
+            p = _P(str(path)).expanduser()
+            uploads = self._uploads_dir().resolve()
+            try:
+                target = p.resolve()
+                if uploads in target.parents or target == uploads or str(target).startswith(str(uploads)):
+                    if target.is_file():
+                        target.unlink(missing_ok=True)
+            except Exception:
+                if p.is_file():
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _cleanup_old_uploads(self, max_age_hours: int = 24) -> None:
+        """Delete tmp_* files older than max_age_hours in uploads."""
+        try:
+            from pathlib import Path as _P
+            import time as _time
+            uploads = self._uploads_dir()
+            if not uploads.is_dir():
+                return
+            now = _time.time()
+            for f in uploads.glob("tmp_*"):
+                try:
+                    if f.is_file() and now - f.stat().st_mtime > max_age_hours * 3600:
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            for f in uploads.glob("resume-*.pdf"):
+                try:
+                    if f.is_file() and now - f.stat().st_mtime > 7 * 24 * 3600:
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ start/stop
     async def _cmd_run(self, chat_id: str) -> None:
@@ -1649,14 +1775,25 @@ class BotService:
             if len(parts)==3:
                 _, field, pid = parts
                 if field == "price":
-                    await self.send(chat_id, f"قیمت جدید برای <b>{esc(pid)}</b> را بفرست:\n<code>/admin_set plan:{pid} price 350000</code>")
+                    self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{pid}.price_toman")
+                    await self.send(chat_id, f"💰 قیمت جدید برای <b>{esc(pid)}</b> را بفرست (عدد به تومان):\nمثلا <code>350000</code>\nلغو: /cancel\nیا دستی: <code>/admin_set plan:{pid} price 350000</code>")
                     return
                 if field == "period":
-                    await self.send(chat_id, f"دوره جدید (روز): <code>/admin_set plan:{pid} period 30</code>")
+                    self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{pid}.period_days")
+                    await self.send(chat_id, f"📅 دوره جدید برای <b>{esc(pid)}</b> (روز) را بفرست:\nمثلا <code>30</code>\nلغو: /cancel\nیا دستی: <code>/admin_set plan:{pid} period 30</code>")
                     return
                 if field == "limits":
-                    await self.send(chat_id, f"سقف‌ها: <code>/admin_set plan:{pid} limits max_bids_per_hour 20</code>\nیا <code>/admin_set plan:{pid} limits max_bids_per_day 100</code>")
+                    await self.send(chat_id, f"سقف‌ها برای <b>{esc(pid)}</b> — یکی را انتخاب کن یا دستی بفرست:\\n<code>/admin_set plan:{pid} limits max_bids_per_hour 20</code>\\n<code>/admin_set plan:{pid} limits max_bids_per_day 100</code>\\nبرای تغییر سریع، فقط عدد را بفرست و من از تو می‌پرسم کدام سقف.",
+                        {"inline_keyboard": [[{"text": "⚡ در ساعت", "callback_data": f"admin:plan:limit:max_bids_per_hour:{pid}"}, {"text": "📅 در روز", "callback_data": f"admin:plan:limit:max_bids_per_day:{pid}"}], [{"text": "📆 در ماه", "callback_data": f"admin:plan:limit:max_bids_per_month:{pid}"}, {"text": "⏱ تاخیر", "callback_data": f"admin:plan:limit:min_seconds_between_bids:{pid}"}], [{"text": "◀️ بازگشت", "callback_data": f"admin:plan:{pid}"}]]})
                     return
+                if field == "limit":
+                    # 4-part: admin:plan:limit:max_bids_per_hour:starter -> handled here
+                    full_parts = cmd.split(":")
+                    if len(full_parts) == 4:
+                        _, _, limit_field, target_pid = full_parts
+                        self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
+                        await self.send(chat_id, f"مقدار جدید برای <b>{esc(limit_field)}</b> در پلن <b>{esc(target_pid)}</b> را بفرست (عدد):\\nلغو: /cancel")
+                        return
                 if field == "recommend":
                     cur = self.store.get(f"admin.plans.{pid}.recommended")
                     new = not bool(cur) if cur is not None else True
@@ -1664,6 +1801,12 @@ class BotService:
                     self.store.set(f"admin.plans.{pid}.recommended", new)
                     await self.send(chat_id, f"{'⭐ پیشنهاد ویژه شد' if new else 'حذف از پیشنهاد ویژه'}: {esc(pid)}")
                     return
+            if len(parts)==4 and parts[1]=="limit":
+                # admin:plan:limit:max_bids_per_hour:starter
+                _, _, limit_field, target_pid = parts
+                self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
+                await self.send(chat_id, f"مقدار جدید برای <b>{esc(limit_field)}</b> در پلن <b>{esc(target_pid)}</b> را بفرست (عدد):\\nلغو: /cancel")
+                return
         if cmd == "revenue":
             await self.send(chat_id, admin_ui.revenue_text(self.store), admin_ui.revenue_keyboard())
             return

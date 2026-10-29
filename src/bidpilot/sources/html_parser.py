@@ -1012,7 +1012,7 @@ def parse_list_page(
         cards = fallback_cards(soup, settings)
         used_fallback = bool(cards)
 
-    log.info(
+    log.debug(
         "[PARSER][LIST] source=%s page_chars=%s card_count=%s selector=%r fallback_cards=%s",
         source_name,
         len(html or ""),
@@ -1517,7 +1517,7 @@ def find_bid_form(html: str, settings: dict[str, Any]) -> tuple[Tag | None, dict
                 form, selected_score = candidate, candidate_score
                 break
     if form is not None:
-        log.info(
+        log.debug(
             "[BID][FORM-SELECTED] action=%r method=%s score=%s fields=%r",
             str(form.get("action") or "")[:160],
             str(form.get("method") or "post").lower(),

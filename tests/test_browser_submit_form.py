@@ -33,7 +33,7 @@ PAGE = """<!doctype html><html lang="fa" dir="rtl"><body>
   <input name="validDays" required>
   <div class="tools"><b>B</b></div>
   <div id="editor" contenteditable="true" style="min-height:120px;border:1px solid #888"></div>
-  <textarea name="message" style="display:none" required></textarea>
+  <textarea name="message" id="message" style="display:none" required></textarea>
   <button type="button" id="msg_submit_btn" disabled data-href="/conversation/ajax/bid-send/777">ارسال</button>
 </form></div>
 <script>
@@ -46,7 +46,42 @@ amount.addEventListener('input', () => {
 document.getElementById('editor').addEventListener('input', e => { f.message.value = e.target.innerText; refresh(); });
 f.addEventListener('input', refresh); f.addEventListener('change', refresh);
 function refresh(){ document.getElementById('msg_submit_btn').disabled = !f.checkValidity(); }
+const mode = new URLSearchParams(location.search).get('mode') || 'plain';
+let ifr = null;
+if (mode === 'iframe') {
+  // TinyMCE-like: the real editor lives in an iframe and is copied to the textarea on submit only.
+  document.getElementById('editor').style.display = 'none';
+  f.message.required = false;
+  ifr = document.createElement('iframe');
+  ifr.className = 'tox-edit-area__iframe';
+  ifr.style.cssText = 'width:480px;height:140px';
+  ifr.srcdoc = '<body contenteditable="true" style="min-height:100px"></body>';
+  f.insertBefore(ifr, f.message);
+}
+if (mode === 'tinymce') {
+  document.getElementById('editor').style.display = 'none';
+  f.message.required = false;
+  const store = {html: ''};
+  const ed = {
+    focus() {}, fire() {}, targetElm: f.message,
+    setContent(h) { store.html = h; },
+    getContent() { return store.html.replace(/<[^>]+>/g, ' '); },
+    save() { f.message.value = store.html.replace(/<[^>]+>/g, ' ').trim(); },
+  };
+  window.tinymce = {get: id => (id === 'message' ? ed : null), editors: [ed]};
+}
+function showNotice(cls, text) {
+  const d = document.createElement('div'); d.className = cls; d.textContent = text; document.body.appendChild(d);
+}
 document.getElementById('msg_submit_btn').addEventListener('click', async e => {
+  if (mode === 'iframe') f.message.value = ifr.contentDocument.body.innerText;
+  if (mode === 'tinymce') window.tinymce.editors[0].save();
+  if (mode === 'block') { showNotice('toast', 'مدت انجام کار از حداقل مجاز کمتر است'); return; }
+  if (mode === 'block-sub') {
+    showNotice('swal2-popup', 'اشتراک شما به پایان رسیده است؛ برای ارسال پیشنهاد اشتراک تهیه کنید.');
+    return;
+  }
+  if (!f.message.value.trim()) { showNotice('invalid-feedback', 'متن پیشنهاد الزامی است'); return; }
   const body = new FormData(f); body.set('bidAmount', amount.value.replace(/,/g, ''));
   const r = await fetch(e.target.dataset.href, {method: 'POST', body});
   await r.text();
@@ -122,7 +157,9 @@ def _require_chromium():
 async def test_opens_offcanvas_fills_like_a_human_and_submits(site, tmp_path):
     _require_chromium()
     result = await submit_js_managed_form(**_args(site, tmp_path))
-    if "Playwright" in result.message and ("نصب نیست" in result.message or "دسترس نیست" in result.message or "در دسترس نیست" in result.message):
+    if "Playwright" in result.message and (
+        "نصب نیست" in result.message or "دسترس نیست" in result.message or "در دسترس نیست" in result.message
+    ):
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.SUBMITTED, result.message
     assert len(RECEIVED) == 1
@@ -150,3 +187,54 @@ async def test_field_failure_never_clicks_and_saves_debug(site, tmp_path):
     assert list((tmp_path / "dbg").glob("*.png"))
     html = next((tmp_path / "dbg").glob("*.html")).read_text(encoding="utf-8")
     assert "SECRET" not in html
+
+
+@pytest.mark.asyncio
+async def test_editor_inside_iframe_is_typed_into_not_just_the_hidden_textarea(site, tmp_path):
+    """TinyMCE copies its iframe content over the textarea on submit; filling only the textarea sends nothing."""
+    _require_chromium()
+    result = await submit_js_managed_form(**_args(site, tmp_path, page_url=f"{site}/project/777?mode=iframe"))
+    if "نصب نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    assert "پیشنهاد آزمایشی" in RECEIVED[0]["raw"] or "%D9%BE" in RECEIVED[0]["raw"]
+
+
+@pytest.mark.asyncio
+async def test_editor_public_api_is_used_when_present(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=tinymce")
+    )
+    if "نصب نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+
+
+@pytest.mark.asyncio
+async def test_click_without_request_reports_the_sites_own_message(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(**_args(site, tmp_path, page_url=f"{site}/project/777?mode=block"))
+    if "نصب نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert RECEIVED == []
+    assert result.payload_debug["request_sent"] is False
+    assert "حداقل مجاز" in result.message
+    assert not result.subscription_required
+    assert list((tmp_path / "dbg").glob("*click-no-request.png"))
+
+
+@pytest.mark.asyncio
+async def test_subscription_notice_after_click_stops_the_source(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=block-sub")
+    )
+    if "نصب نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert result.subscription_required is True
+    assert RECEIVED == []

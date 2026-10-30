@@ -335,3 +335,22 @@ async def test_connection_errors_without_text_still_name_the_problem(sleeps):
     with pytest.raises(LLMError, match="ConnectTimeout"):
         await client.complete("sys", "user")
     await client.aclose()
+
+
+async def test_truncated_reasoning_is_not_retried_on_the_same_model(sleeps):
+    """After the one escalation a still-empty answer must not trigger backoff retries (4 s, 12 s ...)."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "", "reasoning": "…"}, "finish_reason": "length"}]},
+        )
+
+    client = make_client(handler, max_retries=2)
+    with pytest.raises(LLMError):
+        await client.complete("sys", "user", max_tokens=900)
+    assert calls["n"] == 2
+    assert sleeps == []
+    await client.aclose()

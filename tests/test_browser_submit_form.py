@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -19,6 +20,7 @@ from bidpilot.sources.browser_submit import submit_js_managed_form
 
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><body>
 <div id="bid_status_custom"></div>
+<img src="/pixel.png" width="1" height="1">
 <button class="bid-send--button" data-project-id="777" id="open"
   onclick="document.getElementById('panel').style.display='block';
            setTimeout(()=>document.getElementById('panel').style.transform='none',20)">ارسال پیشنهاد</button>
@@ -90,6 +92,7 @@ document.getElementById('msg_submit_btn').addEventListener('click', async e => {
 </script></body></html>"""
 
 RECEIVED: list[dict] = []
+HITS: list[str] = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -97,6 +100,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        HITS.append(self.path)
+        if self.path.startswith('/slow/'):
+            time.sleep(4)  # a server that does not answer in time
         body = PAGE.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -118,7 +124,9 @@ class Handler(BaseHTTPRequestHandler):
 @pytest.fixture()
 def site():
     RECEIVED.clear()
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    HITS.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}"
@@ -237,4 +245,29 @@ async def test_subscription_notice_after_click_stops_the_source(site, tmp_path):
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.FAILED
     assert result.subscription_required is True
+    assert RECEIVED == []
+
+
+@pytest.mark.asyncio
+async def test_images_and_trackers_are_not_downloaded(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(**_args(site, tmp_path))
+    if "نصب نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert "/pixel.png" not in HITS
+
+
+@pytest.mark.asyncio
+async def test_slow_page_names_the_stage_and_retries_once_before_any_click(site, tmp_path):
+    _require_chromium()
+    bid_cfg = {"valid_days": 7, "browser_debug_dir": str(tmp_path / "dbg"), "page_load_timeout_seconds": 1}
+    result = await submit_js_managed_form(**_args(site, tmp_path, page_url=f"{site}/slow/777", bid_cfg=bid_cfg))
+    if "نصب نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert "بازشدن صفحهٔ پروژه" in result.message
+    assert result.payload_debug["request_sent"] is False
+    assert result.payload_debug["stage"] == "page_load"
+    assert sum(1 for hit in HITS if hit.startswith("/slow/")) == 2  # one automatic retry, no more
     assert RECEIVED == []

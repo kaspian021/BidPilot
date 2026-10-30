@@ -158,6 +158,7 @@ class LLMClient:
         tokens_per_minute: int = 0,
         proxy: str = "",
         reasoning_effort: str = "",
+        total_timeout: float = 90.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -174,6 +175,8 @@ class LLMClient:
         self.proxy = (proxy or "").strip()
         #: "low"/"medium"/"high" for reasoning models; empty = provider default
         self.reasoning_effort = (reasoning_effort or "").strip().lower()
+        #: hard wall-clock cap for one complete() incl. retries/escalations (free models can stall for minutes)
+        self.total_timeout = max(5.0, float(total_timeout))
         self._client = client
         self._budget_key = f"{self.base_url}|{self.model}"
         self._spent = _BUDGETS.setdefault(self._budget_key, deque())
@@ -236,6 +239,14 @@ class LLMClient:
         spend.tokens = actual or reserved
 
     # ------------------------------------------------------------------- calls
+    def _apply_reasoning(self, payload: dict) -> None:
+        """Ask reasoning models to think briefly: free OpenRouter models otherwise burn the whole budget."""
+        if "openrouter.ai" in self.base_url:
+            # OpenRouter's unified parameter; models that cannot reason ignore it.
+            payload["reasoning"] = {"effort": self.reasoning_effort or "low"}
+        elif self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+
     async def complete(
         self,
         system: str,
@@ -256,16 +267,20 @@ class LLMClient:
         }
         if response_format:
             payload["response_format"] = response_format
-        if self.reasoning_effort:
-            payload["reasoning_effort"] = self.reasoning_effort
+        self._apply_reasoning(payload)
         client = await self._get_client()
         last_error: Exception | None = None
         started = time.monotonic()
         reserved = estimate_tokens(system) + estimate_tokens(user) + wants
         spend: _Spend | None = None
         attempt = 0
+        escalated = False
+        dropped_reasoning = False
 
         while True:
+            if time.monotonic() - started > self.total_timeout:
+                last_error = last_error or LLMError("زمان کل مجاز تماس با مدل تمام شد")
+                break
             try:
                 spend = await self._reserve(reserved)
                 response = await client.post(
@@ -278,6 +293,17 @@ class LLMClient:
                         f"LLM HTTP {response.status_code}: {response.text[:200]}",
                         retry_after=_parse_retry_after(response),
                     )
+                if (
+                    response.status_code == 400
+                    and not dropped_reasoning
+                    and ("reasoning" in payload or "reasoning_effort" in payload)
+                    and "reasoning" in response.text.casefold()
+                ):
+                    # this model rejects the reasoning knob: retry once without it
+                    dropped_reasoning = True
+                    payload.pop("reasoning", None)
+                    payload.pop("reasoning_effort", None)
+                    continue
                 if response.status_code >= 400:
                     # bad key / unknown model: retrying the same provider is pointless
                     raise LLMError(
@@ -311,7 +337,8 @@ class LLMClient:
                 return result
             except (httpx.HTTPError, LLMError, ValueError) as exc:
                 last_error = exc
-                if isinstance(exc, EmptyCompletionError) and exc.truncated and wants < 3_200:
+                if isinstance(exc, EmptyCompletionError) and exc.truncated and wants < 3_200 and not escalated:
+                    escalated = True
                     # a reasoning model ate the output budget: give it room and go
                     # again — this is not a network retry, so it has its own counter
                     wants = min(wants * 2, 4_000)
@@ -329,13 +356,20 @@ class LLMClient:
                     backoff = 4.0 * (3**attempt)
                     sleep_for = max(float(told), backoff) if told else backoff
                     sleep_for = min(sleep_for, 65.0)
-                    log.warning("LLM call failed (%s); retrying in %.1fs", exc, sleep_for)
+                    if time.monotonic() - started + sleep_for > self.total_timeout:
+                        break
+                    log.warning(
+                        "LLM call failed (%s); retrying in %.1fs", str(exc).strip() or type(exc).__name__, sleep_for
+                    )
                     await asyncio.sleep(sleep_for)
                     attempt += 1
                     continue
                 break
 
-        raise LLMError(f"LLM call failed: {last_error}")
+        detail = (str(last_error).strip() if last_error else "") or (
+            type(last_error).__name__ if last_error else "unknown"
+        )
+        raise LLMError(f"LLM call failed: {detail}")
 
 
 __all__ = [

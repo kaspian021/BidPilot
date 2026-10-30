@@ -172,38 +172,128 @@ async def _human_fill_input(page: Any, control: Any, logical_name: str, value: s
     )
 
 
+_EDITOR_API_JS = """
+(el, payload) => {
+  const fire = (node, name) => node.dispatchEvent(new Event(name, {bubbles: true}));
+  try {
+    if (window.tinymce) {
+      let ed = (el.id && tinymce.get && tinymce.get(el.id)) || null;
+      if (!ed && tinymce.editors) {
+        for (let i = 0; i < tinymce.editors.length; i++) {
+          const cand = tinymce.editors[i];
+          if (cand && (cand.targetElm === el || (cand.getElement && cand.getElement() === el))) { ed = cand; break; }
+        }
+      }
+      if (ed) {
+        ed.focus();
+        ed.setContent(payload.html);
+        ed.save();
+        fire(el, 'input'); fire(el, 'change');
+        return {kind: 'tinymce', text: ed.getContent({format: 'text'}) || ''};
+      }
+    }
+  } catch (e) {}
+  try {
+    if (window.CKEDITOR && CKEDITOR.instances) {
+      const ins = CKEDITOR.instances[el.name] || CKEDITOR.instances[el.id];
+      if (ins) {
+        ins.setData(payload.html);
+        ins.updateElement();
+        fire(el, 'change');
+        return {kind: 'ckeditor4', text: String(ins.getData() || '').replace(/<[^>]+>/g, ' ')};
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+"""
+
+_IFRAME_EDITOR_SELECTORS = (
+    "iframe.tox-edit-area__iframe",
+    "iframe[id$='_ifr']",
+    "iframe.cke_wysiwyg_frame",
+    "iframe.note-editor",
+)
+
+
+def _norm_text(value: str) -> str:
+    return " ".join(re.sub(r"<[^>]+>", " ", str(value or "")).split())
+
+
+def _contains_probe(haystack: str, value: str) -> bool:
+    probe = _norm_text(value)[:25]
+    return bool(probe) and probe in _norm_text(haystack)
+
+
+async def _type_lines(page: Any, value: str) -> None:
+    lines = value.replace("\r\n", "\n").split("\n")
+    for index, line in enumerate(lines):
+        if index:
+            await page.keyboard.press("Enter")
+        if line:
+            await page.keyboard.insert_text(line)
+
+
 async def _human_fill_message(page: Any, form: Any, control: Any, value: str) -> str:
-    """Write the proposal into the visible rich editor and keep the hidden <textarea> in sync."""
-    editor = None
+    """Write the proposal into the site's rich editor and keep the hidden <textarea> in sync.
+
+    Order: the editor's own public API (TinyMCE/CKEditor — what the site's code
+    reads on submit), then real typing inside an editor iframe, then a visible
+    contenteditable, then the plain textarea. Whatever path wins, the textarea
+    that is actually submitted is verified to hold the text.
+    """
+    import html as html_lib
+
+    html_value = "".join(
+        f"<p>{html_lib.escape(line)}</p>" if line.strip() else "<p><br></p>"
+        for line in value.replace("\r\n", "\n").split("\n")
+    )
+
+    async def textarea_value() -> str:
+        return str(await control.evaluate("(el) => el.value || ''"))
+
+    async def ensure_textarea(method: str) -> str:
+        if not _contains_probe(await textarea_value(), value):
+            await control.evaluate(_SET_VALUE_JS, value)
+            return method + "+textarea_js"
+        return method
+
+    try:
+        outcome = await control.evaluate(_EDITOR_API_JS, {"html": html_value, "text": value})
+        if outcome and _contains_probe(outcome.get("text", ""), value):
+            return await ensure_textarea(str(outcome.get("kind") or "editor_api"))
+    except Exception as exc:  # noqa: BLE001
+        log.info("[BID][BROWSER-EDITOR] api fill failed error_type=%s", type(exc).__name__)
+
+    for scope in (form, page):
+        for selector in _IFRAME_EDITOR_SELECTORS:
+            try:
+                body = scope.frame_locator(selector).first.locator("body")
+                if (
+                    not await scope.locator(selector).count()
+                    or not await scope.locator(selector).first.is_visible()
+                ):
+                    continue
+                await body.click(timeout=_STEP_TIMEOUT_MS)
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Delete")
+                await _type_lines(page, value)
+                if _contains_probe(await body.inner_text(timeout=_STEP_TIMEOUT_MS), value):
+                    return await ensure_textarea("iframe_editor")
+            except Exception as exc:  # noqa: BLE001
+                log.info("[BID][BROWSER-EDITOR] iframe typing failed error_type=%s", type(exc).__name__)
+
     for scope in (form, page):
         candidate = scope.locator(_EDITOR_SELECTOR).first
         try:
-            if await candidate.count() and await candidate.is_visible():
-                editor = candidate
-                break
-        except Exception:  # noqa: BLE001
-            continue
-
-    if editor is not None:
-        try:
-            await editor.scroll_into_view_if_needed(timeout=_STEP_TIMEOUT_MS)
-            await editor.click(timeout=_STEP_TIMEOUT_MS)
+            if not (await candidate.count() and await candidate.is_visible()):
+                continue
+            await candidate.scroll_into_view_if_needed(timeout=_STEP_TIMEOUT_MS)
+            await candidate.click(timeout=_STEP_TIMEOUT_MS)
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Delete")
-            lines = value.replace("\r\n", "\n").split("\n")
-            for index, line in enumerate(lines):
-                if index:
-                    await page.keyboard.press("Enter")
-                if line:
-                    await page.keyboard.insert_text(line)
-            synced = str(await control.evaluate("(el) => el.value || ''"))
-            probe = " ".join(value.split())[:25]
-            if probe and probe in " ".join(re.sub(r"<[^>]+>", " ", synced).split()):
-                return "editor"
-            # The editor shows the text but did not mirror it to the textarea
-            # (custom editor wired to a different event): mirror it ourselves.
-            await control.evaluate(_SET_VALUE_JS, value)
-            return "editor+textarea_js"
+            await _type_lines(page, value)
+            return await ensure_textarea("editor")
         except Exception as exc:  # noqa: BLE001
             log.info("[BID][BROWSER-EDITOR] editor typing failed error_type=%s", type(exc).__name__)
 
@@ -214,6 +304,41 @@ async def _human_fill_message(page: Any, form: Any, control: Any, value: str) ->
         pass
     await control.evaluate(_SET_VALUE_JS, value)
     return "textarea_js"
+
+
+async def control_message_state(form: Any, field_name: str) -> str:
+    """One-line summary of what the message textarea holds right before the click (for diagnosis)."""
+    if not field_name:
+        return "no_field"
+    control = form.locator(_attr_selector("name", field_name)).first
+    length = int(await control.evaluate("(el) => (el.value || '').length"))
+    return f"textarea_chars={length}"
+
+
+_NOTICE_JS = """
+() => {
+  const selectors = ['.swal2-popup', '.swal-modal', '.sweet-alert', '.toast', '.toast-message', '.iziToast',
+    '.noty_body', '.toastify', '.alert', '[role=alert]', '.modal.show .modal-body', '.modal.in .modal-body',
+    '.invalid-feedback', '.text-danger', '.help-block', '.parsley-errors-list', 'label.error', '.error-message'];
+  const out = [], seen = new Set();
+  for (const sel of selectors) {
+    for (const el of document.querySelectorAll(sel)) {
+      const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+      if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none') continue;
+      const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+      if (text && text.length < 400 && !seen.has(text)) { seen.add(text); out.push(text); }
+    }
+  }
+  return out.slice(0, 8);
+}
+"""
+
+
+async def _visible_notices(page: Any) -> list[str]:
+    try:
+        return [str(item) for item in await page.evaluate(_NOTICE_JS)]
+    except Exception:  # noqa: BLE001 - page may be navigating
+        return []
 
 
 async def _dump_debug(
@@ -471,7 +596,7 @@ async def _submit_once(
                         cand = page.locator(sel).first
                         if await cand.count() and await cand.is_visible():
                             cta = cand
-                            log.info(
+                            log.debug(
                                 "[BID][BROWSER-CTA] source=%s id=%s cta_selector=%r",
                                 source_name,
                                 project_id,
@@ -672,67 +797,154 @@ async def _submit_once(
                 else ""
             )
             expected_path = endpoint_parts.path.rstrip("/")
-            try:
-                # Listen first, then perform one real click. Never replay the
-                # endpoint directly if the site does not issue the request.
-                async with page.expect_response(
-                    lambda response: (
-                        response.request.method.upper() == "POST"
-                        and _origin(response.url) == _origin(base_url)
-                        and urlsplit(response.url).path.rstrip("/") == expected_path
-                    ),
-                    timeout=30_000,
-                ) as response_info:
-                    # From this point a timeout may be ambiguous: even if the
-                    # click call raises, avoid claiming that no submit happened.
-                    action_clicked = True
-                    await submitter.click()
-                response = await response_info.value
-            except PlaywrightTimeoutError:
-                safe_debug["request_sent"] = "unknown"
-                # Ambiguous network timeout — not a JS interstitial. The site often
-                # still records the bid and only the XHR response is lost (seen for
-                # 621342/621322). Check the page's own success indicator before
-                # declaring failure; if it flipped to "پیشنهاد ثبت شد" we treat
-                # the bid as confirmed.
-                log.warning(
-                    "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_no_response clicked=true",
-                    source_name,
-                    project_id,
+
+            def _is_bid_request(url: str, method: str) -> bool:
+                return (
+                    method.upper() == "POST"
+                    and _origin(url) == _origin(base_url)
+                    and urlsplit(url).path.rstrip("/") == expected_path
                 )
+
+            loop = asyncio.get_running_loop()
+            response_future: asyncio.Future = loop.create_future()
+            request_seen = {"value": False}
+
+            def on_request(request: Any) -> None:
+                if _is_bid_request(request.url, request.method):
+                    request_seen["value"] = True
+
+            def on_response(resp: Any) -> None:
+                if not response_future.done() and _is_bid_request(resp.url, resp.request.method):
+                    response_future.set_result(resp)
+
+            try:
+                editor_check = await control_message_state(form, field_mapping.get("description", ""))
+            except Exception:  # noqa: BLE001
+                editor_check = "unknown"
+            log.info(
+                "[BID][BROWSER-PRECLICK] source=%s id=%s message_state=%s",
+                source_name,
+                project_id,
+                editor_check,
+            )
+            baseline_notices = set(await _visible_notices(page))
+            response_timeout = float(bid_cfg.get("response_timeout_seconds") or 20)
+            page.on("request", on_request)
+            page.on("response", on_response)
+            new_notices: list[str] = []
+            try:
+                # Exactly one real click. Never replay the endpoint directly if
+                # the site does not issue the request.
+                action_clicked = True
+                await submitter.click()
+                clicked_at = time.monotonic()
+                while not response_future.done():
+                    elapsed = time.monotonic() - clicked_at
+                    if elapsed >= response_timeout:
+                        break
+                    if elapsed >= 2.5 and not request_seen["value"]:
+                        # Nothing left the browser: the page itself is telling us why.
+                        new_notices = [n for n in await _visible_notices(page) if n not in baseline_notices]
+                        if new_notices:
+                            break
+                    await asyncio.sleep(0.35)
+            finally:
+                page.remove_listener("request", on_request)
+                page.remove_listener("response", on_response)
+
+            if not response_future.done():
+                if not new_notices:
+                    new_notices = [n for n in await _visible_notices(page) if n not in baseline_notices]
+                # The UI may already show the success state even if we missed the XHR.
                 try:
                     await page.wait_for_function(
                         "(initial) => { const el = document.querySelector('#bid_status_custom'); "
                         "const txt = (el?.textContent || '').trim(); "
                         "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(txt) && txt !== initial; }",
                         arg=initial_bid_status,
-                        timeout=4_000,
+                        timeout=2_000,
                     )
                     status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
                     log.info(
-                        "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_but_ui_confirmed status_text=%r",
+                        "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=ui_confirmed_without_response status_text=%r",
                         source_name,
                         project_id,
                         status_text,
                     )
                     return SubmissionResult(
                         status=SubmissionStatus.SUBMITTED,
-                        message=f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد (پس از تایم‌اوت): {status_text}",
+                        message=f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد: {status_text}",
                         http_status=200,
                         payload_debug=safe_debug,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
+
+                joined = " | ".join(new_notices)[:400]
+                if not request_seen["value"]:
+                    # Definite: no request left the browser, so nothing was registered.
+                    safe_debug["request_sent"] = False
+                    try:
+                        invalid = await form.evaluate(
+                            "(el) => [...el.querySelectorAll(':invalid, .is-invalid')]"
+                            ".map(e => e.name || e.id || e.className).slice(0, 6)"
+                        )
+                    except Exception:  # noqa: BLE001
+                        invalid = []
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "click-no-request")
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=click_sent_no_request notices=%r invalid=%r",
+                        source_name,
+                        project_id,
+                        new_notices,
+                        invalid,
+                    )
+                    if new_notices and html_parser.requires_subscription(f"<div>{joined}</div>"):
+                        daily = html_parser.is_daily_limit_error(f"<div>{joined}</div>")
+                        return SubmissionResult(
+                            status=SubmissionStatus.FAILED,
+                            message=(
+                                f"⛔ سقف ارسال روزانه پر شده است ({joined[:120]}). حساب رایگان روزی ۱ پیشنهاد اجازه می‌دهد. "
+                                if daily
+                                else f"⛔ اشتراک حساب به پایان رسیده یا محدود شده ({joined[:120]}). "
+                            )
+                            + "برای ادامه اشتراک تهیه کنید. جست‌وجو متوقف شد.",
+                            subscription_required=True,
+                            payload_debug=safe_debug,
+                        )
+                    reason = (
+                        f"سایت پس از کلیک پیام داد: «{joined}»."
+                        if joined
+                        else "پس از کلیک هیچ درخواستی به سایت فرستاده نشد و پیامی هم نمایش داده نشد "
+                        + (f"(فیلدهای نامعتبر: {', '.join(map(str, invalid))})" if invalid else "")
+                        + "؛ اعتبارسنجی سمت مرورگر فرم را رد کرده است."
+                    )
+                    return SubmissionResult(
+                        status=SubmissionStatus.FAILED,
+                        message=(
+                            f"پیشنهاد ثبت نشد. {reason} اسکرین‌شات و فرم در data/browser_debug ذخیره شد؛ "
+                            "همین پروژه چند بار پشت‌سرهم تلاش نمی‌شود."
+                        ),
+                        payload_debug=safe_debug,
+                    )
+
+                # A request left the browser but no answer came back: genuinely ambiguous.
+                safe_debug["request_sent"] = "unknown"
+                log.warning(
+                    "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=request_sent_no_response waited=%.0fs",
+                    source_name,
+                    project_id,
+                    response_timeout,
+                )
                 return SubmissionResult(
                     status=SubmissionStatus.FAILED,
                     message=(
-                        "سایت پس از کلیک پاسخی نفرستاد (تایم‌اوت شبکه). ممکن است پیشنهاد ثبت شده باشد — "
-                        "صفحهٔ پروژه را دستی باز کن و اگر «پیشنهاد ثبت شد» دیدی، دوباره ارسال نکن. "
-                        "این چرخه به‌عنوان خطای موقتی ثبت شد و دور بعد خودکار دوباره وضعیت را می‌سنجد."
+                        "درخواست ثبت پیشنهاد فرستاده شد ولی سایت پاسخی نداد (تایم‌اوت شبکه). ممکن است پیشنهاد ثبت شده "
+                        "باشد؛ دور بعد وضعیت از روی صفحهٔ پروژه سنجیده می‌شود و ارسال تکراری انجام نمی‌شود."
                     ),
                     payload_debug=safe_debug,
-                    javascript_required=False,
                 )
+            response = response_future.result()
 
             safe_debug["request_sent"] = True
             response_text = await response.text()

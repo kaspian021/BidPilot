@@ -253,3 +253,85 @@ def test_build_client_carries_proxy_and_low_effort_for_reasoning_models():
     assert client.proxy == "http://127.0.0.1:10809"
     assert client.reasoning_effort == "low"
     assert client.tokens_per_minute == 7000
+
+
+async def test_openrouter_gets_the_unified_low_reasoning_parameter():
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(__import__("json").loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "سلام"}, "finish_reason": "stop"}]}
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = LLMClient("https://openrouter.ai/api/v1", "key", "vendor/free-model:free", client=http)
+    await client.complete("sys", "user")
+    assert seen[0]["reasoning"] == {"effort": "low"}
+    assert "reasoning_effort" not in seen[0]
+    await client.aclose()
+
+
+async def test_a_model_that_rejects_the_reasoning_parameter_is_retried_without_it():
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        seen.append(payload)
+        if "reasoning" in payload:
+            return httpx.Response(400, text='{"error": "Unsupported parameter: reasoning"}')
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "سلام"}, "finish_reason": "stop"}]}
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = LLMClient("https://openrouter.ai/api/v1", "key", "m", client=http)
+    response = await client.complete("sys", "user")
+    assert response.text == "سلام"
+    assert len(seen) == 2 and "reasoning" not in seen[1]
+    await client.aclose()
+
+
+async def test_reasoning_truncation_escalates_only_once_then_gives_up_quickly(sleeps):
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(__import__("json").loads(request.content)["max_tokens"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "", "reasoning": "…"}, "finish_reason": "length"}]},
+        )
+
+    client = make_client(handler, max_retries=0)
+    with pytest.raises(LLMError):
+        await client.complete("sys", "user", max_tokens=900)
+    assert seen == [900, 1800]  # never 3600 and never a third call
+    await client.aclose()
+
+
+async def test_total_timeout_stops_endless_retrying(monkeypatch, sleeps):
+    import bidpilot.proposals.llm_client as llm_client
+
+    ticks = iter(range(0, 10_000, 40))
+    monkeypatch.setattr(llm_client.time, "monotonic", lambda: float(next(ticks)))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="busy")
+
+    client = make_client(handler, max_retries=5, total_timeout=90)
+    with pytest.raises(LLMError):
+        await client.complete("sys", "user")
+    assert calls["n"] <= 3
+    await client.aclose()
+
+
+async def test_connection_errors_without_text_still_name_the_problem(sleeps):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("")
+
+    client = make_client(handler, max_retries=0)
+    with pytest.raises(LLMError, match="ConnectTimeout"):
+        await client.complete("sys", "user")
+    await client.aclose()

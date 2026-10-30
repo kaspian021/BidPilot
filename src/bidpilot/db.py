@@ -102,6 +102,59 @@ class EventRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+def _sql_literal(value: object) -> str | None:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return None
+
+
+def migrate_schema(sync_conn) -> list[str]:
+    """Bring an existing database up to the current models, never destroying data.
+
+    ``create_all`` only creates *missing tables*; it does not add columns that
+    later releases introduced (e.g. ``bids.user_chat_id``), so an old SQLite
+    file made every INSERT/SELECT fail with "no column named ...". This adds
+    every missing column (nullable, with the model default when it is a plain
+    literal) and every missing index, and returns what it changed.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text as sa_text
+
+    changes: list[str] = []
+    inspector = sa_inspect(sync_conn)
+    existing_tables = set(inspector.get_table_names())
+    dialect = sync_conn.dialect
+    quote = dialect.identifier_preparer.quote
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        present = {col["name"] for col in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present or column.primary_key:
+                continue
+            ddl = f"ALTER TABLE {quote(table.name)} ADD COLUMN {quote(column.name)} {column.type.compile(dialect=dialect)}"
+            default = None
+            if column.server_default is not None and getattr(column.server_default, "arg", None) is not None:
+                arg = column.server_default.arg
+                default = str(getattr(arg, "text", arg))
+            elif column.default is not None and getattr(column.default, "is_scalar", False):
+                default = _sql_literal(column.default.arg)
+            if default is not None:
+                ddl += f" DEFAULT {default}"
+            sync_conn.execute(sa_text(ddl))
+            changes.append(f"{table.name}.{column.name}")
+        known_indexes = {ix["name"] for ix in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            if index.name and index.name not in known_indexes:
+                index.create(sync_conn, checkfirst=True)
+                changes.append(f"index:{index.name}")
+    return changes
+
+
 class Database:
     def __init__(self, url: str) -> None:
         self.url = url
@@ -120,6 +173,19 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            try:
+                migrated = await conn.run_sync(migrate_schema)
+                if migrated:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "[DB][MIGRATE] دیتابیس قدیمی به‌روز شد؛ ستون/ایندکس اضافه‌شده: %s", ", ".join(migrated)
+                    )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception("DB schema migration failed")
+                raise
             # ── Lightweight migrations for existing DBs (old installs) ──
             # SQLite has no IF NOT EXISTS for ADD COLUMN constraints in old versions,
             # so we do manual PRAGMA checks.
@@ -130,19 +196,35 @@ class Database:
                 result = await conn.execute(sa_text("PRAGMA table_info(user_accounts)"))
                 cols = {row[1] for row in result.fetchall()}  # row[1] = name
                 if "referral_code" not in cols:
-                    await conn.execute(sa_text("ALTER TABLE user_accounts ADD COLUMN referral_code VARCHAR(16)"))
+                    await conn.execute(
+                        sa_text("ALTER TABLE user_accounts ADD COLUMN referral_code VARCHAR(16)")
+                    )
                 if "referred_by" not in cols:
-                    await conn.execute(sa_text("ALTER TABLE user_accounts ADD COLUMN referred_by VARCHAR(32)"))
+                    await conn.execute(
+                        sa_text("ALTER TABLE user_accounts ADD COLUMN referred_by VARCHAR(32)")
+                    )
                 if "granted_milestones" not in cols:
-                    await conn.execute(sa_text("ALTER TABLE user_accounts ADD COLUMN granted_milestones TEXT DEFAULT '[]'"))
+                    await conn.execute(
+                        sa_text("ALTER TABLE user_accounts ADD COLUMN granted_milestones TEXT DEFAULT '[]'")
+                    )
                 # Ensure gateway column on payments
                 result2 = await conn.execute(sa_text("PRAGMA table_info(payments)"))
                 cols2 = {row[1] for row in result2.fetchall()}
                 if "gateway" not in cols2:
-                    await conn.execute(sa_text("ALTER TABLE payments ADD COLUMN gateway VARCHAR(32) DEFAULT 'zarinpal'"))
+                    await conn.execute(
+                        sa_text("ALTER TABLE payments ADD COLUMN gateway VARCHAR(32) DEFAULT 'zarinpal'")
+                    )
                 # Create indexes for new columns if missing (SQLite ignores duplicates with IF NOT EXISTS)
-                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_user_accounts_referral_code ON user_accounts (referral_code)"))
-                await conn.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_user_accounts_referred_by ON user_accounts (referred_by)"))
+                await conn.execute(
+                    sa_text(
+                        "CREATE INDEX IF NOT EXISTS ix_user_accounts_referral_code ON user_accounts (referral_code)"
+                    )
+                )
+                await conn.execute(
+                    sa_text(
+                        "CREATE INDEX IF NOT EXISTS ix_user_accounts_referred_by ON user_accounts (referred_by)"
+                    )
+                )
             except Exception:
                 # Migration is best-effort; never break startup
                 import logging
@@ -181,4 +263,4 @@ class Database:
         return self.session_factory()
 
 
-__all__ = ["Base", "BidRow", "Database", "EventRow", "ProjectRow", "select"]
+__all__ = ["Base", "BidRow", "Database", "EventRow", "ProjectRow", "migrate_schema", "select"]

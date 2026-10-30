@@ -369,8 +369,11 @@ class BotService:
             log.warning("Telegram send failed for %s: %s", chat_id, exc)
             return False
 
-    async def notify_owner(self, text: str) -> None:
-        """Used by the scheduler/CLI to push a message to the configured chats."""
+    async def notify_owner(self, text: str, chat_id: str | int | None = None) -> None:
+        """Push a scheduler/CLI message: to ``chat_id`` alone when known, else to the configured chats."""
+        if chat_id is not None:
+            await self.send(str(chat_id), text)
+            return
         for chat_id in self.store.get_list("telegram.chat_ids"):
             try:
                 await self.send(str(chat_id), text)

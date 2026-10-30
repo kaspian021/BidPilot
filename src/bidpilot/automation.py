@@ -9,6 +9,7 @@ chat starts the very same :class:`bidpilot.scheduler.Scheduler` in-process, and
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -23,6 +24,28 @@ from .settings_store import SettingsStore
 log = logging.getLogger(__name__)
 
 Notify = Callable[[str], Awaitable[Any]]
+
+
+def _accepts_chat_id(callback: Any) -> bool:
+    """True when ``callback`` can take ``chat_id=`` (older/simple notifiers take only the text)."""
+    try:
+        params = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "chat_id" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def scope_notifications(cfg: Any, chat_id: str | int | None) -> Any:
+    """Send this run's Telegram events only to the chat that started it.
+
+    ``telegram.chat_ids`` is the *allow-list* of everybody who may use the bot.
+    Using it as the recipient list made every user receive every other user's
+    bid reports (projects, prices, proposal text). With no known starter (CLI
+    ``--run``) the configured list is kept as the operator set it.
+    """
+    if chat_id is not None and str(chat_id).strip():
+        cfg.notifications.chat_ids = [str(chat_id).strip()]
+    return cfg
 
 
 @dataclass
@@ -75,6 +98,8 @@ class Automation:
     _app: Application | None = None
     _scheduler: Scheduler | None = None
     _notified_first_cycle: bool = False
+    #: chat that pressed /run: its reports go to it alone, never to every linked chat
+    _owner_chat_id: str | None = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -85,7 +110,10 @@ class Automation:
         if self.notify is None:
             return
         try:
-            await self.notify(text)
+            if self._owner_chat_id is not None and _accepts_chat_id(self.notify):
+                await self.notify(text, chat_id=self._owner_chat_id)
+            else:
+                await self.notify(text)
         except Exception as exc:  # pragma: no cover - network
             log.warning("Could not notify owner: %s", exc)
 
@@ -105,6 +133,8 @@ class Automation:
                 except Exception as e:
                     log.debug("per-user config apply failed: %s", e)
                     secrets = None
+            scope_notifications(cfg, chat_id)
+            self._owner_chat_id = str(chat_id) if chat_id is not None else None
             app = build_application(cfg, secrets) if secrets is not None else build_application(cfg)
             await app.setup()
         except Exception as exc:
@@ -152,6 +182,7 @@ class Automation:
                     cfg2, secrets2 = apply_per_user_config(self.store, str(_chat_for_factory), cfg2, None)
                 except Exception:
                     pass
+            scope_notifications(cfg2, _chat_for_factory)
             return build_application(cfg2, secrets2) if secrets2 is not None else build_application(cfg2)
 
         self._app = app

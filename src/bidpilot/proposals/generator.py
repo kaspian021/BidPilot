@@ -100,6 +100,23 @@ def looks_like_refusal(text: str) -> bool:
     return any(marker.casefold().replace("‌", " ") in folded for marker in REFUSAL_MARKERS)
 
 
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def sanitize_llm_text(text: str) -> str:
+    """Remove model artefacts that are never part of a proposal (saves a slow repair round-trip).
+
+    Reasoning models sometimes leak ``<think>`` blocks and nearly all chat models
+    sprinkle markdown (**bold**, # headings, `code`) that the bid form shows literally.
+    """
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("**", "").replace("`", "")
+    cleaned = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]*", "", cleaned)
+    return cleaned.strip()
+
+
 def validate_proposal(
     text: str,
     config: ProposalConfig,
@@ -257,7 +274,7 @@ class ProposalGenerator:
                 failures.append(f"{provider.id}: {exc}")
                 continue
 
-            text = response.text.strip()
+            text = sanitize_llm_text(response.text)
             if looks_like_refusal(text):
                 # A refusal means the model refused the *project* itself
                 # (e.g. game cheats). Never repair it — a repaired refusal
@@ -290,6 +307,12 @@ class ProposalGenerator:
                         if not any("خیلی بلند" in i for i in report_trimmed.issues):
                             pass
             report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
+            if not report.ok and len(text) < 60:
+                # Garbage (a stray word, leaked reasoning): a repair call on a slow free model
+                # costs a minute and rarely works. Go straight to the next provider.
+                log.info("Provider %s returned an unusable %d-char answer; trying the next one", provider.id, len(text))
+                failures.append(f"{provider.id}: پاسخ نامعتبر/خیلی کوتاه ({len(text)} نویسه)")
+                continue
             if not report.ok:
                 log.info(
                     "Proposal validation issues from %s: %s — asking for a repair pass",
@@ -299,8 +322,9 @@ class ProposalGenerator:
                 try:
                     repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
                     fixed = await self._complete_proposal(client, system, repair)
-                    if validate_proposal(fixed.text.strip(), self.settings, amount, hide_price=hide_price).ok:
-                        text = fixed.text.strip()
+                    fixed_text = sanitize_llm_text(fixed.text)
+                    if validate_proposal(fixed_text, self.settings, amount, hide_price=hide_price).ok:
+                        text = fixed_text
                         response = fixed
                 except LLMError as exc:
                     log.warning("Repair pass failed (%s): %s", provider.id, exc)
@@ -436,4 +460,4 @@ class ProposalGenerator:
                 versions.append(candidate)
 
 
-__all__ = ["ProposalGenerator", "ProposalError", "validate_proposal", "format_toman"]
+__all__ = ["ProposalGenerator", "ProposalError", "sanitize_llm_text", "validate_proposal", "format_toman"]

@@ -6,12 +6,15 @@ one project never stops the batch and every decision can be explained later.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .config import AppConfig
+from .error_analyzer import analyze_error, analyze_with_llm
 from .filters import ProjectFilter
 from .models import (
     BidPlan,
@@ -37,6 +40,15 @@ from .sources.base import (
 from .text import parse_days
 
 log = logging.getLogger(__name__)
+
+#: (user, source, project) -> (consecutive failed submissions, monotonic time until which we skip).
+#: Without this a project whose form is rejected every time is re-generated (LLM) and
+#: re-submitted (browser) on every poll, burning minutes and quota for nothing.
+_SUBMIT_FAILURES: dict[tuple[str, str, str], tuple[int, float]] = {}
+_MAX_SUBMIT_FAILURES = 2
+#: signature of an unknown error -> AI explanation (one cheap LLM call per distinct error, not per project)
+_AI_ANALYSIS_CACHE: dict[str, dict[str, str]] = {}
+_FAILURE_COOLDOWN_SECONDS = 45 * 60
 
 
 @dataclass
@@ -191,6 +203,7 @@ class BidPipeline:
                     await self.process_project(project, report)
                 except Exception as exc:  # never let one project kill the batch
                     log.exception("Project %s failed", project.uid)
+                    await self._rollback_quietly()
                     report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
                 if report.authentication_failed or report.javascript_required or report.subscription_required:
                     if report.subscription_required:
@@ -214,7 +227,14 @@ class BidPipeline:
             )
             report.subscription_required = isinstance(exc, SubscriptionRequiredError) or any(
                 marker in detail.casefold()
-                for marker in ("اشتراک", "اعتبار کافی نیست", "سقف ارسال", "محدودیت روزانه", "subscription", "daily limit")
+                for marker in (
+                    "اشتراک",
+                    "اعتبار کافی نیست",
+                    "سقف ارسال",
+                    "محدودیت روزانه",
+                    "subscription",
+                    "daily limit",
+                )
             )
             # A JS interstitial on the *listing* page used to fall through as a
             # generic error and be retried (hammered) every poll interval.
@@ -225,7 +245,9 @@ class BidPipeline:
                 detail,
                 exc_info=log.isEnabledFor(logging.DEBUG),
             )
-            if not (report.authentication_failed or report.javascript_required or report.subscription_required):
+            if not (
+                report.authentication_failed or report.javascript_required or report.subscription_required
+            ):
                 await self._notify_error(source.name, f"اجرای منبع «{source.name}» ناموفق بود: {detail}")
             elif report.subscription_required:
                 report.subscription_message = detail
@@ -411,6 +433,21 @@ class BidPipeline:
             )
             return None
 
+        failure_key = (self.user_chat_id or "", project.source, str(project.external_id))
+        failures, retry_after = _SUBMIT_FAILURES.get(failure_key, (0, 0.0))
+        if failures >= _MAX_SUBMIT_FAILURES:
+            remaining = retry_after - time.monotonic()
+            if remaining > 0:
+                reason = (
+                    f"ارسال این پروژه {failures} بار پشت‌سرهم شکست خورد؛ "
+                    f"حدود {int(remaining // 60) + 1} دقیقهٔ دیگر دوباره امتحان می‌شود."
+                )
+                report.skipped += 1
+                await self._emit_skip(project, reason, report)
+                log.info("[PIPELINE][FAILURE-COOLDOWN] source=%s id=%s failures=%s", project.source, project.external_id, failures)
+                return None
+            _SUBMIT_FAILURES.pop(failure_key, None)
+
         if bid_state is None and getattr(self.sources[project.source], "requires_bid_status_check", False):
             reason = "وضعیت پیشنهاد در صفحهٔ پروژه قابل تشخیص نبود؛ برای جلوگیری از ارسال تکراری رد شد."
             report.skipped += 1
@@ -573,14 +610,37 @@ class BidPipeline:
         if result.status == SubmissionStatus.SUBMITTED:
             # Keep a minimal project identity only, so the bid row can reference
             # the marketplace item without storing the full scraped page data.
-            project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
-            if project_row is None:
-                project_row = await self.repo.save_project(project)
-            await self.repo.save_bid(project_row.id, plan, user_chat_id=self.user_chat_id)
+            # The proposal is already live on the marketplace at this point. A
+            # local bookkeeping failure must never turn it into a "failed" bid or
+            # poison the DB session for every following project.
+            try:
+                project_row = await self.repo.get_project_row_by_uid(project.source, project.external_id)
+                if project_row is None:
+                    project_row = await self.repo.save_project(project)
+                await self.repo.save_bid(project_row.id, plan, user_chat_id=self.user_chat_id)
+            except Exception as exc:
+                await self._rollback_quietly()
+                detail = f"{type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
+                log.error(
+                    "[PIPELINE][SAVE-BID-FAILED] source=%s id=%s پیشنهاد در سایت ثبت شد ولی در دیتابیس محلی ذخیره نشد: %s",
+                    project.source,
+                    project.external_id,
+                    detail,
+                )
+                report.errors.append(
+                    f"{project.uid}: پیشنهاد ثبت شد ولی ذخیره‌ی محلی ناموفق بود ({detail}). "
+                    "وضعیت از روی صفحهٔ سایت تشخیص داده می‌شود و ارسال تکراری انجام نمی‌شود."
+                )
             report.submitted += 1
+            _SUBMIT_FAILURES.pop((self.user_chat_id or "", project.source, str(project.external_id)), None)
         else:
             # Failed attempts stay in logs/reports only; persist accepted bids only.
             report.failed += 1
+            await self._attach_ai_analysis(result)
+            if self.live and not (report.subscription_required or report.authentication_failed):
+                key = (self.user_chat_id or "", project.source, str(project.external_id))
+                count = _SUBMIT_FAILURES.get(key, (0, 0.0))[0] + 1
+                _SUBMIT_FAILURES[key] = (count, time.monotonic() + _FAILURE_COOLDOWN_SECONDS)
             log.warning(
                 "Bid failed for %s: %s (%.0f ms)",
                 project.uid,
@@ -588,7 +648,12 @@ class BidPipeline:
                 (time.monotonic() - started) * 1000,
             )
 
-        is_timeout = "تایم‌اوت" in (result.message or "") or "پاسخ مسیر ثبت پیشنهاد دریافت نشد" in (result.message or "") or "پس از کلیک، پاسخ" in (result.message or "") or "پاسخی نفرستاد" in (result.message or "")
+        is_timeout = (
+            "تایم‌اوت" in (result.message or "")
+            or "پاسخ مسیر ثبت پیشنهاد دریافت نشد" in (result.message or "")
+            or "پس از کلیک، پاسخ" in (result.message or "")
+            or "پاسخی نفرستاد" in (result.message or "")
+        )
         await self.notifiers.dispatch(
             Event(
                 kind=EventKind.BID_SUBMITTED
@@ -602,6 +667,38 @@ class BidPipeline:
         return plan
 
     # ------------------------------------------------------------- helpers
+    async def _attach_ai_analysis(self, result: SubmissionResult) -> None:
+        """Explain an *unrecognised* failure in plain Persian with the bot's own LLM.
+
+        Known failures are explained instantly by the rule-based analyzer; the model is
+        only consulted for new kinds of errors, once per distinct message, within 15 s,
+        so a flaky provider can never slow the poll loop.
+        """
+        message = (result.message or "").strip()
+        if not message or analyze_error(message, status_code=result.http_status)["category"] != "unknown":
+            return
+        signature = re.sub(r"\d+", "#", message)[:120]
+        analysis = _AI_ANALYSIS_CACHE.get(signature)
+        if analysis is None:
+            analysis = {}
+            try:
+                clients = self.generator._clients_ready()
+                if clients:
+                    found = await asyncio.wait_for(analyze_with_llm(message, clients[0][1]), timeout=15)
+                    analysis = found or {}
+            except Exception as exc:  # noqa: BLE001 - analysis is a nicety, never a failure source
+                log.debug("AI failure analysis skipped: %s", type(exc).__name__)
+            _AI_ANALYSIS_CACHE[signature] = analysis
+        if analysis:
+            result.payload_debug["analysis"] = analysis
+
+    async def _rollback_quietly(self) -> None:
+        """Reset a DB session left in 'rolled back' state by a failed flush."""
+        try:
+            await self.repo.session.rollback()
+        except Exception:  # pragma: no cover - rollback must never raise
+            log.debug("session rollback failed", exc_info=True)
+
     async def _session_really_dead(self, source_name: str) -> bool:
         """Confirm a suspected auth failure with the account page itself.
 

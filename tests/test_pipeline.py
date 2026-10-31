@@ -468,3 +468,55 @@ async def test_pipeline_revisits_skipped_project_when_new_skills_are_found(tmp_p
     assert second.new == 1  # skipped projects are not remembered in the database
     assert second.duplicates == 0
     await application.close()
+
+
+@pytest.mark.asyncio
+async def test_bookkeeping_failure_after_live_submit_does_not_break_the_batch(tmp_path, monkeypatch):
+    """A successful marketplace bid must survive a DB error and not poison later projects."""
+    config = make_config(tmp_path)
+    application, _ = await build_app(config)
+    try:
+        real_save = Repository.save_bid
+        calls = {"n": 0}
+
+        async def flaky_save(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                from sqlalchemy.exc import OperationalError
+
+                raise OperationalError("INSERT", {}, Exception("table bids has no column named user_chat_id"))
+            return await real_save(self, *args, **kwargs)
+
+        monkeypatch.setattr(Repository, "save_bid", flaky_save)
+        reports = await application.cycle()
+        report = reports[0]
+        assert report.submitted == 2  # both counted, the first despite the DB error
+        assert report.failed == 0
+        assert any("ذخیره‌ی محلی" in error for error in report.errors)
+        assert calls["n"] == 2  # the second project could still be saved afterwards
+    finally:
+        await application.close()
+
+
+async def test_project_that_keeps_failing_is_put_on_cooldown(tmp_path, monkeypatch):
+    from bidpilot import pipeline as pipeline_module
+    from bidpilot.models import SubmissionResult, SubmissionStatus
+    from bidpilot.sources.mock.adapter import MockSource
+
+    pipeline_module._SUBMIT_FAILURES.clear()
+    attempts = {"n": 0}
+
+    async def always_fail(self, project, proposal, amount, delivery_days=None):
+        attempts["n"] += 1
+        return SubmissionResult(status=SubmissionStatus.FAILED, message="رد شد")
+
+    monkeypatch.setattr(MockSource, "submit_bid", always_fail)
+    application, _ = await build_app(make_config(tmp_path))
+    try:
+        for _ in range(4):
+            await application.cycle()
+        # 2 projects x 2 allowed failures, then the cooldown stops further attempts
+        assert attempts["n"] == 4
+    finally:
+        pipeline_module._SUBMIT_FAILURES.clear()
+        await application.close()

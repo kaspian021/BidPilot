@@ -72,6 +72,7 @@ def admin_main_keyboard() -> dict:
             [{"text": "💰 منطق درآمدی", "callback_data": "admin:revenue"}, {"text": "💳 درگاه‌ها", "callback_data": "admin:gateways"}],
             [{"text": "🎁 دعوت و پاداش", "callback_data": "admin:referrals"}, {"text": "📈 گزارشات", "callback_data": "admin:reports"}],
             [{"text": "⚙️ سیستم و فیلترها", "callback_data": "admin:system"}, {"text": "🔧 پیشرفته", "callback_data": "admin:advanced"}],
+            [{"text": "📜 مرکز لاگ‌ها — فعال/غیرفعال", "callback_data": "admin:logs"}],
             [{"text": "📢 پیام همگانی", "callback_data": "admin:broadcast"}, {"text": "↩️ بازگشت به داشبورد", "callback_data": "cmd:status"}],
         ]
     }
@@ -337,11 +338,24 @@ def advanced_text(store: SettingsStore) -> str:
     lines = [h2("🔧 پیشرفته", " broadcast + دیباگ + نگهداری")]
     maint = store.get_bool("admin.maintenance")
     lines.append(f"نگهداری: <b>{'روشن — ربات برای کاربران عادی پاسخ نمی‌دهد' if maint else 'خاموش'}</b>")
-    lines.append(f"نسخه: {esc(store.get('app.version') or '0.9.x')} · دیباگ لاگ: {esc('فعال' if store.get_bool('admin.debug') else 'خاموش')}")
-    lines.append(f"ادمین‌های اضافه: {esc(', '.join(store.get_list('admin.extra_ids')) or '—')}")
-    lines.append(f"بان لیست: {len(store.get_list('admin.banned_ids'))} نفر")
+    # Logging status — new professional center
+    try:
+        from .logging_utils import get_log_stats, is_logging_enabled, get_logging_level
+        stats = get_log_stats(store)
+        enabled = stats["enabled"]
+        lvl = stats["level"]
+        size_txt = f"{stats['size_mb']} MB" if stats["exists"] else "—"
+        lines.append(f"📜 لاگ حرفه‌ای: <b>{'🟢 فعال' if enabled else '🔴 غیرفعال'}</b> · سطح: <code>{esc(lvl)}</code> · حجم: {esc(size_txt)} · خطا: {stats['errors']}")
+    except Exception:
+        lines.append(f"نسخه: {esc(store.get('app.version') or '0.9.x')} · دیباگ لاگ: {esc('فعال' if store.get_bool('admin.debug') else 'خاموش')}")
+        lines.append(f"ادمین‌های اضافه: {esc(', '.join(store.get_list('admin.extra_ids')) or '—')}")
+        lines.append(f"بان لیست: {len(store.get_list('admin.banned_ids'))} نفر")
+    else:
+        lines.append(f"نسخه: {esc(store.get('app.version') or '0.9.x')}")
+        lines.append(f"ادمین‌های اضافه: {esc(', '.join(store.get_list('admin.extra_ids')) or '—')}")
+        lines.append(f"بان لیست: {len(store.get_list('admin.banned_ids'))} نفر")
     lines.append(hr())
-    lines.append("<i>این بخش فقط برای شماست — هر تغییری لاگ می‌شود.</i>")
+    lines.append("<i>این بخش فقط برای شماست — هر تغییری لاگ می‌شود. برای کنترل کامل لاگ‌ها به «مرکز لاگ‌ها» بروید.</i>")
     return "\n".join(lines)
 
 def advanced_keyboard() -> dict:
@@ -349,9 +363,134 @@ def advanced_keyboard() -> dict:
         "inline_keyboard": [
             [{"text": "📢 پیام همگانی", "callback_data": "admin:broadcast"},
              {"text": "🚧 نگهداری روشن/خاموش", "callback_data": "admin:sys:maintenance"}],
-            [{"text": "📜 مشاهده لاگ", "callback_data": "admin:adv:logs"},
+            [{"text": "📜 مرکز لاگ‌ها (حرفه‌ای)", "callback_data": "admin:logs"},
              {"text": "🗑️ پاکسازی دیتابیس قدیمی", "callback_data": "admin:adv:cleanup"}],
             [{"text": "👥 افزودن ادمین دوم", "callback_data": "admin:adv:addadmin"}],
             [{"text": "↩️ پنل ادمین", "callback_data": "admin:main"}],
         ]
     }
+
+# ── logs — professional detailed logging center ─────────────────
+def logs_text(store: SettingsStore) -> str:
+    """Full professional log center overview — shows everything admin needs."""
+    try:
+        from .logging_utils import get_log_stats
+        stats = get_log_stats(store)
+    except Exception as e:
+        return h2("📜 مرکز لاگ‌ها", "خطا در خواندن آمار") + f"\n❌ {esc(str(e))}"
+
+    enabled = stats["enabled"]
+    lvl = stats["level"]
+    exists = stats["exists"]
+    size_mb = stats["size_mb"]
+    total_mb = stats["total_mb"]
+    max_mb = stats["max_mb"]
+    lines = stats["lines"]
+    errors = stats["errors"]
+    warns = stats["warns"]
+    last = stats["last"]
+    file_path = stats["file"]
+
+    status_icon = "🟢" if enabled else "🔴"
+    status_txt = "فعال — همه جزئیات ثبت می‌شود" if enabled else "غیرفعال — فقط خطاهای مهم"
+    level_desc = {
+        "DEBUG": "همه چیز حتی جزئی‌ترین تاخیرها، تغییرات و خطاهای ریز",
+        "INFO": "رویدادهای مهم + تغییرات تنظیمات + خطاها",
+        "WARNING": "فقط هشدارها و خطاها",
+        "ERROR": "فقط خطاهای بحرانی",
+    }.get(lvl, "")
+
+    # Build overview
+    out = [h2("📜 مرکز لاگ‌ها — حرفه‌ای", "فعال/غیرفعال + سطح جزئیات")]
+    out.append(f"{status_icon} <b>وضعیت:</b> <b>{esc(status_txt)}</b>")
+    out.append(f"سطح فعلی: <code>{esc(lvl)}</code> — <i>{esc(level_desc)}</i>")
+    out.append(hr())
+    out.append(f"<b>فایل لاگ:</b> <code>{esc(file_path)}</code>")
+    if exists:
+        pct = int(size_mb / max_mb * 100) if max_mb else 0
+        bar = "█" * min(pct // 10, 10) + "░" * (10 - min(pct // 10, 10))
+        out.append(f"حجم فعلی: <b>{size_mb} MB</b> / {max_mb} MB [{bar}] {pct}٪")
+        out.append(f"حجم کل با بکاپ‌ها: <b>{total_mb} MB</b> (۵ فایل چرخشی)")
+        out.append(f"خطوط: <b>{lines:,}</b> · هشدار: <b>{warns}</b> · خطا: <b>{errors}</b>".replace(",", "٬"))
+        out.append(f"آخرین لاگ: <code>{esc(last)}</code>")
+    else:
+        out.append("فایل هنوز ساخته نشده — با فعال کردن، اولین لاگ اینجا ظاهر می‌شود.")
+        out.append(f"مسیر: <code>{esc(file_path)}</code> (خودکار ساخته می‌شود)")
+    out.append(hr())
+    out.append("<b>چه چیزی ثبت می‌شود؟</b>")
+    out.append("• هر دستور /start, /llm, /profile, /market, /preview, /run و… با chat_id")
+    out.append("• هر کلیک دکمه (callback) و هر تغییر تنظیمات (قبل→بعد)")
+    out.append("• جستجوی هوشمند، تولید پیشنهاد، خطای LLM, تاخیر شبکه")
+    out.append("• پرداخت‌ها، دعوت‌ها، تمدید اشتراک، پیام همگانی")
+    out.append("• حتی خطاهای جزئی: کوکی نامعتبر، ریت‌لیمیت، انتخاب مدل اشتباه")
+    out.append("• <b>حریم خصوصی:</b> توکن، API key، کوکی و رمز عبور ماسک می‌شود (***).")
+    out.append(hr())
+    if not enabled:
+        out.append("💡 <i>توسعه هستی؟ فعال کن تا همه باگ‌های ریز و درشت با جزئیات کامل ثبت شود — بعد لاگ را دانلود کن و به AI بده تا حل کند.</i>")
+    else:
+        out.append("✅ <i>حالت توسعه فعال است — حالا هر کاری بکنی با جزئیات ثبت می‌شود.</i>")
+    return "\n".join(out)
+
+def logs_keyboard(store: SettingsStore) -> dict:
+    try:
+        from .logging_utils import get_log_stats, is_logging_enabled
+        stats = get_log_stats(store)
+        enabled = stats["enabled"]
+        lvl = stats["level"]
+        exists = stats["exists"]
+    except Exception:
+        enabled = False
+        lvl = "INFO"
+        exists = False
+
+    # Toggle button
+    toggle_txt = "🔴 غیرفعال کن" if enabled else "🟢 فعال کردن لاگ"
+    toggle_cb = "admin:logs:toggle"
+
+    # Level buttons — highlight current
+    def lvl_btn(level: str, icon: str, label: str) -> dict:
+        active = "✅ " if lvl == level else ""
+        return {"text": f"{active}{icon} {level}", "callback_data": f"admin:logs:level:{level}"}
+
+    kb = []
+    kb.append([{"text": toggle_txt, "callback_data": toggle_cb}])
+    kb.append([
+        lvl_btn("DEBUG", "🐛", "DEBUG"),
+        lvl_btn("INFO", "ℹ️", "INFO"),
+    ])
+    kb.append([
+        lvl_btn("WARNING", "⚠️", "WARN"),
+        lvl_btn("ERROR", "❌", "ERROR"),
+    ])
+    # View / download / clear
+    if exists:
+        kb.append([
+            {"text": "👁 ۵۰ خط آخر", "callback_data": "admin:logs:tail"},
+            {"text": "🚨 فقط خطاها", "callback_data": "admin:logs:tail:ERROR"},
+        ])
+        kb.append([
+            {"text": "📥 دانلود فایل لاگ", "callback_data": "admin:logs:download"},
+            {"text": "🧹 پاکسازی", "callback_data": "admin:logs:clear:ask"},
+        ])
+    else:
+        kb.append([{"text": "📂 فایل هنوز نیست — فعال کن", "callback_data": "admin:logs:toggle"}])
+    kb.append([{"text": "↩️ پنل ادمین", "callback_data": "admin:main"}, {"text": "🔧 پیشرفته", "callback_data": "admin:advanced"}])
+    return {"inline_keyboard": kb}
+
+def logs_clear_confirm_text() -> str:
+    return (
+        h2("🧹 پاکسازی لاگ‌ها", "تایید نهایی")
+        + "\n⚠️ آیا مطمئنی می‌خواهی <b>همه لاگ‌ها</b> (فایل اصلی + ۵ بکاپ) پاک شود؟\n"
+        + "این کار غیرقابل برگشت است اما بعد از آن لاگ‌نویسی ادامه می‌یابد.\n"
+        + hr()
+        + "\n<i>اگر فقط می‌خواهی فایل سبک شود، بگذار چرخش خودکار (۵ MB) انجامش دهد.</i>"
+    )
+
+def logs_clear_confirm_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ بله، پاک کن", "callback_data": "admin:logs:clear:yes"},
+             {"text": "❌ لغو", "callback_data": "admin:logs"}],
+        ]
+    }
+

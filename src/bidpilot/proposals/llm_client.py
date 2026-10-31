@@ -349,6 +349,10 @@ class LLMClient:
                         wants,
                     )
                     continue
+                if isinstance(exc, EmptyCompletionError) and exc.truncated:
+                    # Already gave it more room (or could not): the same model will burn the same
+                    # budget thinking again. Fail now so the caller moves to the next provider.
+                    break
                 if not getattr(exc, "retryable", True):
                     break
                 if attempt < self.max_retries:

@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ..models import SubmissionResult, SubmissionStatus
+from ..priority_lock import PriorityLock, submit_priority
 from . import html_parser
 
 log = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ _EDITOR_SELECTOR = ", ".join(
 )
 _NUMERIC_FIELDS = {"amount", "days", "_validDays"}
 _STEP_TIMEOUT_MS = 3_000
-_browser_lock: asyncio.Lock | None = None
+_browser_lock: PriorityLock | None = None
 
 
 def _digits(value: str) -> str:
@@ -1156,8 +1157,9 @@ async def submit_js_managed_form(**kwargs: Any) -> SubmissionResult:
     """Run the browser workflow serially; retry once only if Chromium died before any click."""
     global _browser_lock
     if _browser_lock is None:
-        _browser_lock = asyncio.Lock()
-    async with _browser_lock:
+        _browser_lock = PriorityLock()
+    # paid plans are served first when several users/sites wait for the one browser
+    async with _browser_lock.hold(submit_priority.get()):
         result = await _submit_once(**kwargs)
         if (result.payload_debug or {}).get("retryable"):
             log.warning(

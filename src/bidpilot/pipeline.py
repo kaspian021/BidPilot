@@ -77,6 +77,10 @@ class RunReport:
     proposed: list[str] = field(default_factory=list)
     #: the real reason the LLM failed (shown to the user instead of "template")
     llm_error: str = ""
+    #: the plan cap that stopped this run ("hour" | "day" | "month" | "gap"), with the wording to show
+    limit_code: str = ""
+    limit_reason: str = ""
+    limit_retry_after: int = 0
     #: pages the AI read while discovering projects (0 = selector mode)
     ai_pages: int = 0
     ai_calls: int = 0
@@ -87,7 +91,7 @@ class RunReport:
         # dedicated, actionable message rather than a duplicate generic digest.
         if self.authentication_failed or self.javascript_required or self.subscription_required:
             return False
-        return bool(self.new or self.submitted or self.failed or self.errors)
+        return bool(self.new or self.submitted or self.failed or self.errors or self.limit_code in ("hour", "day", "month"))
 
     def digest_lines(self, *, limit: int = 4) -> list[str]:
         """Compact, group-by-reason report — one message per cycle instead of 50."""
@@ -192,6 +196,15 @@ class BidPipeline:
                     detail = session_detail or "وضعیت ورود تأیید نشد."
                     raise SourceError(f"ارسال واقعی متوقف شد؛ احراز هویت «{source.name}» تأیید نشد: {detail}")
 
+            # A full hourly/daily/monthly cap means nothing can be sent until it frees
+            # up: do not even read the marketplace (saves requests, LLM calls and the
+            # anti-bot risk of scraping for nothing). Polling resumes by itself.
+            early = await self.rate_limiter.check(source.name)
+            if early.hard:
+                self._note_limit(report, early)
+                log.info("[PIPELINE][LIMIT] source=%s code=%s retry_after=%ss (poll skipped)", source.name, early.code, early.retry_after)
+                return report
+
             projects = await source.fetch_projects()
             report.fetched = len(projects)
             discovery = getattr(source, "last_discovery", None)
@@ -205,6 +218,9 @@ class BidPipeline:
                     log.exception("Project %s failed", project.uid)
                     await self._rollback_quietly()
                     report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
+                if report.limit_code in ("hour", "day", "month"):
+                    log.info("[PIPELINE][LIMIT] source=%s code=%s stopping the current project batch", source.name, report.limit_code)
+                    break
                 if report.authentication_failed or report.javascript_required or report.subscription_required:
                     if report.subscription_required:
                         stop_reason = "STOP-SUBSCRIPTION"
@@ -505,15 +521,28 @@ class BidPipeline:
         if hint and hint < delivery:
             delivery = hint
 
-        # 4) rate limit / caps — check before paying for LLM
-        rate = await self.rate_limiter.check()
-        if not rate.allowed:
-            report.skipped += 1
-            plan = BidPlan(project=project, amount=amount, rationale=pricing.rationale)
-            plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
-            await self._emit_skip(project, rate.reason, report)
-            return plan
+        # 4) rate limit / caps — reserve a slot before paying for the LLM. The slot is
+        # shared with the user's other marketplaces running at the same time, so two
+        # sites can never both take the last free bid of the hour.
+        async with self.rate_limiter.slot(project.source) as rate:
+            if not rate.allowed:
+                report.skipped += 1
+                plan = BidPlan(project=project, amount=amount, rationale=pricing.rationale)
+                plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
+                self._note_limit(report, rate)
+                await self._emit_skip(project, rate.reason, report)
+                return plan
+            return await self._propose_and_submit(project, report, pricing, amount, delivery)
 
+    def _note_limit(self, report: RunReport, rate) -> None:
+        """Remember the cap that stopped this run (first one wins) for the digest."""
+        if not report.limit_code:
+            report.limit_code = rate.code
+            report.limit_reason = rate.reason
+            report.limit_retry_after = int(rate.retry_after or 0)
+
+    async def _propose_and_submit(self, project: Project, report: RunReport, pricing, amount: int, delivery: int) -> BidPlan:
+        """Steps 5-6: write the proposal, then send it (or dry-run). Runs inside a rate slot."""
         # 5) proposal
         try:
             proposal = await self.generator.generate(project, amount, delivery)
@@ -618,6 +647,9 @@ class BidPipeline:
                 if project_row is None:
                     project_row = await self.repo.save_project(project)
                 await self.repo.save_bid(project_row.id, plan, user_chat_id=self.user_chat_id)
+                # visible to the user's other marketplaces (other DB sessions) right now,
+                # so their cap checks count this bid before it would be possible to overshoot
+                await self.repo.commit()
             except Exception as exc:
                 await self._rollback_quietly()
                 detail = f"{type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"

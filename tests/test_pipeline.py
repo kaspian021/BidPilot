@@ -128,7 +128,12 @@ async def test_rate_limit_caps_bids(tmp_path):
     report = (await application.cycle())[0]
 
     assert report.submitted == 1
-    assert report.skipped == 2  # second project hits the hourly cap, third is filtered
+    # the second project hits the hourly cap and the run stops there: the rest of
+    # the batch is not even inspected (no wasted requests while nothing can be sent)
+    assert report.skipped == 1
+    assert report.limit_code == "hour"
+    assert "سقف ساعتی" in report.limit_reason
+    assert report.limit_retry_after > 0
     await application.close()
 
 

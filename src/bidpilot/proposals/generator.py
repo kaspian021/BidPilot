@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
 import re
 from dataclasses import dataclass
@@ -177,6 +179,9 @@ class ProposalGenerator:
         self._llm_api_key = llm_api_key
         self._llm_keys = dict(llm_keys or {})
         self._clients: dict[str, LLMClient] = {}
+        #: several marketplaces share one user's key: cap the simultaneous model calls
+        #: (the provider's requests-per-minute limit is per key, not per site)
+        self._llm_gate = asyncio.Semaphore(max(1, int(getattr(config.llm, "max_concurrency", 2) or 2)))
         #: why the last LLM attempt failed (empty when it worked or was not used)
         self.last_llm_error: str = ""
         self._env = Environment(
@@ -186,6 +191,14 @@ class ProposalGenerator:
             trim_blocks=True,
             lstrip_blocks=True,
         )
+
+    def fork(self) -> ProposalGenerator:
+        """A view for one marketplace run: shares clients and the concurrency gate,
+        but has its own ``last_llm_error`` so simultaneous sites cannot overwrite
+        each other's diagnostics."""
+        clone = copy.copy(self)
+        clone.last_llm_error = ""
+        return clone
 
     # ------------------------------------------------------------------ llm
     @property
@@ -357,12 +370,12 @@ class ProposalGenerator:
             response = await self._call(client, system, user, min(budget * 2, 2_200))
         return response
 
-    @staticmethod
-    async def _call(client: LLMClient, system: str, user: str, budget: int) -> LLMResponse:
-        try:
-            return await client.complete(system, user, max_tokens=budget)
-        except TypeError:  # a minimal client (tests, older wrappers) has no such kwarg
-            return await client.complete(system, user)
+    async def _call(self, client: LLMClient, system: str, user: str, budget: int) -> LLMResponse:
+        async with self._llm_gate:
+            try:
+                return await client.complete(system, user, max_tokens=budget)
+            except TypeError:  # a minimal client (tests, older wrappers) has no such kwarg
+                return await client.complete(system, user)
 
     def generate_from_template(self, project: Project, amount: int, delivery_days: int | None, hide_price: bool = False) -> Proposal:
         """Render the longest template that fits ``proposal.max_chars``.

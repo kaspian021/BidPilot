@@ -433,6 +433,52 @@ def _failure(
     )
 
 
+async def _find_submitter(
+    page: Any, form: Any, submitter_id: str, endpoint_attribute: str, endpoint_url: str
+) -> tuple[Any | None, str]:
+    """Locate the visible submit button, waiting for slow pages and trying fallbacks.
+
+    Returns ``(locator, "")`` or ``(None, short diagnosis)``. The old code looked once,
+    right after filling, and gave up if the button was momentarily hidden (layout still
+    settling, offcanvas animation, validator re-rendering); on slow connections that
+    discarded a fully filled form.
+    """
+    candidates: list[tuple[str, Any]] = []
+    if submitter_id:
+        candidates.append(("id", form.locator(_attr_selector("id", submitter_id)).first))
+    else:
+        candidates.append(
+            ("endpoint", form.locator(_attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)).first)
+        )
+    candidates.append(("type=submit", form.locator("button[type=submit], input[type=submit]").first))
+    candidates.append(("text", form.locator("button, input[type=button]").filter(has_text="ارسال").first))
+
+    seen: dict[str, str] = {}
+    for _ in range(8):  # ~6s in total
+        for label, loc in candidates:
+            try:
+                count = await loc.count()
+                if not count:
+                    seen[label] = "پیدا نشد"
+                    continue
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=1500)
+                except Exception:  # noqa: BLE001
+                    pass
+                if await loc.is_visible():
+                    return loc, ""
+                seen[label] = "پنهان"
+            except Exception as exc:  # noqa: BLE001
+                seen[label] = type(exc).__name__
+        await page.wait_for_timeout(750)
+    try:
+        form_visible = await form.is_visible()
+    except Exception:  # noqa: BLE001
+        form_visible = None
+    detail = "، ".join(f"{k}: {v}" for k, v in seen.items())
+    return None, f"{detail}؛ فرم {'نمایان' if form_visible else 'پنهان'}"
+
+
 async def _submit_once(
     *,
     source_name: str,
@@ -801,23 +847,22 @@ async def _submit_once(
                         debug=safe_debug,
                     )
 
-                if submitter_id:
-                    submitter = form.locator(_attr_selector("id", submitter_id)).first
-                else:
-                    submitter = form.locator(
-                        _attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)
-                    ).first
-                # In some Parscoders offcanvas layouts the submit button is below the fold;
-                # scroll it into view and give the JS validator a moment to enable it.
-                try:
-                    if await submitter.count():
-                        await submitter.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(400)
-                except Exception:
-                    pass
-                if await submitter.count() == 0 or not await submitter.is_visible():
+                submitter, submit_diag = await _find_submitter(
+                    page, form, submitter_id, endpoint_attribute, endpoint_url
+                )
+                if submitter is None:
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT-NOT-FOUND] source=%s id=%s diag=%s",
+                        source_name,
+                        project_id,
+                        submit_diag,
+                    )
+                    safe_debug["submit_button"] = submit_diag
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "submit-not-found")
                     return _failure(
-                        "دکمه اصلی ارسال در فرم مرورگر پیدا یا قابل‌مشاهده نیست؛ هیچ پیشنهادی ارسال نشد.",
+                        "دکمهٔ «ارسال پیشنهاد» بعد از پر شدن فرم دیده نشد "
+                        f"({submit_diag}). هیچ پیشنهادی ارسال نشد؛ احتمالاً چیدمان صفحهٔ سایت عوض شده یا "
+                        "صفحه کامل بارگذاری نشده. اسکرین‌شات در data/browser_debug ذخیره شد.",
                         debug=safe_debug,
                     )
                 # Wait briefly for the button to become enabled after the last field change

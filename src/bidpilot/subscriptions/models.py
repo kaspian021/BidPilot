@@ -3,16 +3,38 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from bidpilot.db import Base
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Timezone-aware UTC datetimes on every backend.
+
+    SQLite stores ``UTCDateTime()`` without the offset and hands back
+    *naive* values; comparing those with ``utcnow()`` raised ``TypeError`` and the
+    plan of every paid/referral user silently fell back to "free".
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
 
 
 class UserAccountRow(Base):
@@ -23,11 +45,11 @@ class UserAccountRow(Base):
     telegram_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     telegram_first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     plan_id: Mapped[str] = mapped_column(String(32), default="free")
-    plan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    plan_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    plan_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    plan_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now(), onupdate=func.now())
     # JSON blob for per-user settings mirroring settings_store (profile, filters, etc.)
     settings_json: Mapped[str] = mapped_column(Text, default="{}")
     # stats cache
@@ -46,10 +68,10 @@ class SubscriptionRecord(Base):
     user_chat_id: Mapped[str] = mapped_column(String(32), index=True)
     plan_id: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), default="pending")  # pending, active, expired, cancelled
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     auto_renew: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
 
 class PaymentRow(Base):
@@ -64,8 +86,8 @@ class PaymentRow(Base):
     status: Mapped[str] = mapped_column(String(32), default="created")  # created, sent, verified, failed, cancelled
     gateway: Mapped[str] = mapped_column(String(32), default="zarinpal")
     zarinpal_response: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
+    verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
 
 class ReferralRow(Base):
@@ -76,5 +98,5 @@ class ReferralRow(Base):
     invitee_chat_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     invitee_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")  # pending, qualified, purchased
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
+    qualified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

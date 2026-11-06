@@ -334,7 +334,7 @@ class HtmlMarketSource(Source):
                 continue
 
             final_path = urlsplit(str(response.url)).path.casefold()
-            log.info(
+            log.debug(
                 "[AUTH][VERIFY-RESPONSE] source=%s requested_path=%s status=%s final_path=%s html_chars=%s",
                 self.name,
                 urlsplit(str(path)).path,
@@ -543,7 +543,7 @@ class HtmlMarketSource(Source):
         mode = self.discovery_mode()
         ai_enabled = self.ai_discovery_enabled()
         cfg = self.discovery_settings()
-        log.info(
+        log.debug(
             "[FETCH][START] source=%s base_url=%s mode=%s ai_enabled=%s log_extraction_details=%s",
             self.name,
             self.base_url,
@@ -576,7 +576,7 @@ class HtmlMarketSource(Source):
                     )
                 self.last_discovery_error = str(exc)
         else:
-            log.info(
+            log.debug(
                 "[FETCH][AI-BYPASSED] source=%s mode=%s reason=see_DISCOVERY_DISABLED",
                 self.name,
                 mode,
@@ -964,7 +964,7 @@ class HtmlMarketSource(Source):
 
         # Keep the target URL query-free in logs; the HTML size and final path
         # are enough to diagnose an empty/changed form or a login/challenge page.
-        log.info(
+        log.debug(
             "[BID][PAGE-RESPONSE] source=%s id=%s status=%s final_url=%s html_chars=%s content_type=%r",
             self.name,
             project.external_id,

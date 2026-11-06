@@ -9,6 +9,7 @@ chat starts the very same :class:`bidpilot.scheduler.Scheduler` in-process, and
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -25,6 +26,28 @@ log = logging.getLogger(__name__)
 Notify = Callable[[str], Awaitable[Any]]
 
 
+def _accepts_chat_id(callback: Any) -> bool:
+    """True when ``callback`` can take ``chat_id=`` (older/simple notifiers take only the text)."""
+    try:
+        params = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "chat_id" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def scope_notifications(cfg: Any, chat_id: str | int | None) -> Any:
+    """Send this run's Telegram events only to the chat that started it.
+
+    ``telegram.chat_ids`` is the *allow-list* of everybody who may use the bot.
+    Using it as the recipient list made every user receive every other user's
+    bid reports (projects, prices, proposal text). With no known starter (CLI
+    ``--run``) the configured list is kept as the operator set it.
+    """
+    if chat_id is not None and str(chat_id).strip():
+        cfg.notifications.chat_ids = [str(chat_id).strip()]
+    return cfg
+
+
 @dataclass
 class RunSummary:
     cycles: int = 0
@@ -36,6 +59,7 @@ class RunSummary:
     started_at: datetime | None = None
     last_cycle_at: datetime | None = None
     last_error: str = ""
+    sites: list[str] = field(default_factory=list)
 
     def add(self, reports: list[Any]) -> None:
         self.cycles += 1
@@ -75,6 +99,10 @@ class Automation:
     _app: Application | None = None
     _scheduler: Scheduler | None = None
     _notified_first_cycle: bool = False
+    #: chat that pressed /run: its reports go to it alone, never to every linked chat
+    _owner_chat_id: str | None = None
+    #: the plan this run started under (shown by /status)
+    _ent: Any = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -85,76 +113,113 @@ class Automation:
         if self.notify is None:
             return
         try:
-            await self.notify(text)
+            if self._owner_chat_id is not None and _accepts_chat_id(self.notify):
+                await self.notify(text, chat_id=self._owner_chat_id)
+            else:
+                await self.notify(text)
         except Exception as exc:  # pragma: no cover - network
             log.warning("Could not notify owner: %s", exc)
 
     # ------------------------------------------------------------------ start
+    def _build_for(self, chat_id, sites: list[str] | None):
+        """Config + application for one user, built under that user's identity."""
+        from .per_user import apply_per_user_config, user_scope
+
+        cfg = load_config(self.config_path, store=self.store)
+        secrets = None
+        if chat_id is not None:
+            try:
+                cfg, secrets = apply_per_user_config(self.store, str(chat_id), cfg, None, sites=sites)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("per-user config apply failed: %s", exc)
+                secrets = None
+        scope_notifications(cfg, chat_id)
+        # sources read the account of the *ambient* user while they are constructed
+        with user_scope(chat_id):
+            app = build_application(cfg, secrets) if secrets is not None else build_application(cfg)
+        try:
+            app.user_chat_id = str(chat_id) if chat_id is not None else None
+        except Exception:  # pragma: no cover - exotic fakes
+            pass
+        return cfg, app
+
+    async def _plan_sites(self, chat_id, cfg) -> tuple[list[str] | None, Any]:
+        """(sites to run, entitlements) for ``chat_id``; (None, None) without a user."""
+        if chat_id is None:
+            return None, None
+        from .subscriptions.entitlements import resolve_entitlements
+        from .user_sites import user_sites
+
+        ent = await resolve_entitlements(cfg.database_url, chat_id)
+        kept, paused = ent.allowed_sites(user_sites(self.store, chat_id))
+        if paused:
+            log.info("[AUTOMATION][PLAN-SITES] chat=%s plan=%s paused_by_plan=%s", chat_id, ent.plan_id, paused)
+        return kept, ent
+
     async def start(self, chat_id: str | int | None = None) -> tuple[bool, str]:
         if self.running:
             return False, "رصد از قبل در حال اجراست."
         try:
-            cfg = load_config(self.config_path, store=self.store)
-            secrets = None
-            # Per-user LLM/pricing/profile isolation: if chat_id is known, inject its overrides
-            if chat_id is not None:
-                try:
-                    from .per_user import apply_per_user_config
-                    from .config import Secrets, secrets_from_store
-                    cfg, secrets = apply_per_user_config(self.store, str(chat_id), cfg, None)
-                except Exception as e:
-                    log.debug("per-user config apply failed: %s", e)
-                    secrets = None
-            app = build_application(cfg, secrets) if secrets is not None else build_application(cfg)
+            cfg0 = load_config(self.config_path, store=self.store)
+            planned, ent = await self._plan_sites(chat_id, cfg0)
+            self._owner_chat_id = str(chat_id) if chat_id is not None else None
+            cfg, app = self._build_for(chat_id, planned)
             await app.setup()
         except Exception as exc:
             log.exception("Could not start automation")
             return False, f"برنامه ساخته نشد: {exc}"
 
-        # Refuse to start LIVE discovery if we cannot prove that the marketplace
-        # session is valid. This catches CLI --run as well as the Telegram button.
+        # Refuse to start LIVE discovery for a marketplace whose session cannot be
+        # proven valid (CLI --run and the Telegram button alike). Sites are checked
+        # at the same time; one broken login only drops that site.
+        broken: dict[str, str] = {}
         if cfg.runtime.live:
             names = self.sources or list(app.sources)
-            for name in names:
+
+            async def check(name: str) -> tuple[str, bool, str]:
                 source = app.sources.get(name)
                 if source is None:
-                    continue
+                    return name, True, ""
                 try:
-                    session_ok, session_detail = await source.verify_session()
+                    ok, detail = await source.verify_session()
                 except Exception as exc:
-                    session_ok = False
-                    session_detail = f"بررسی نشست با خطای {type(exc).__name__} متوقف شد."
-                log.info(
-                    "[AUTOMATION][SESSION-CHECK] source=%s live=True ok=%s detail=%r",
-                    name,
-                    session_ok,
-                    session_detail,
-                )
-                if not session_ok:
-                    message = (
-                        f"⛔ <b>وارد حساب کاربری «{name}» نیستیم یا نشست معتبر نیست.</b>\n"
-                        "جست‌وجو و ارسال پیشنهاد شروع نشد. از /market ورود/کوکی را به‌روز کن، "
-                        "با /test وضعیت ورود را بررسی کن و سپس دوباره /run را بزن.\n"
-                        f"جزئیات: {session_detail or 'ورود تأیید نشد.'}"
-                    )
-                    await self._say(message)
-                    await app.close()
-                    return False, "ورود به حساب تأیید نشد؛ عملیات شروع نشد."
+                    ok, detail = False, f"بررسی نشست با خطای {type(exc).__name__} متوقف شد."
+                log.info("[AUTOMATION][SESSION-CHECK] source=%s live=True ok=%s detail=%r", name, ok, detail)
+                return name, ok, detail
 
-        # Capture chat_id for per-user factory
-        _chat_for_factory = chat_id
-        def make_app() -> Application:
-            cfg2 = load_config(self.config_path, store=self.store)
-            secrets2 = None
-            if _chat_for_factory is not None:
+            for name, ok, detail in await asyncio.gather(*(check(n) for n in names)):
+                if not ok:
+                    broken[name] = detail or "ورود تأیید نشد."
+            if broken and len(broken) >= len(names):
+                label = self._label(next(iter(broken)))
+                message = (
+                    f"⛔ <b>وارد حساب کاربری «{label}» نیستیم یا نشست معتبر نیست.</b>\n"
+                    "جست‌وجو و ارسال پیشنهاد شروع نشد. از /market ورود/کوکی را به‌روز کن، "
+                    "با /test وضعیت ورود را بررسی کن و سپس دوباره /run را بزن.\n"
+                    f"جزئیات: {next(iter(broken.values()))}"
+                )
+                await self._say(message)
+                await app.close()
+                return False, "ورود به حساب تأیید نشد؛ عملیات شروع نشد."
+            for name in broken:  # keep running the healthy sites
+                source = app.sources.pop(name, None)
                 try:
-                    from .per_user import apply_per_user_config
-                    cfg2, secrets2 = apply_per_user_config(self.store, str(_chat_for_factory), cfg2, None)
-                except Exception:
+                    if source is not None and hasattr(source, "aclose"):
+                        await source.aclose()
+                except Exception:  # pragma: no cover
                     pass
-            return build_application(cfg2, secrets2) if secrets2 is not None else build_application(cfg2)
+
+        _chat = chat_id
+
+        async def make_app() -> Application:
+            """Rebuilt on settings / plan changes: re-reads the plan and the site list."""
+            cfg2 = load_config(self.config_path, store=self.store)
+            planned2, _ = await self._plan_sites(_chat, cfg2)
+            _, app2 = self._build_for(_chat, planned2)
+            return app2
 
         self._app = app
+        self._ent = ent
         self._scheduler = Scheduler(
             app,
             interval=self.interval,
@@ -164,10 +229,45 @@ class Automation:
             on_report=self._on_report,
         )
         self.summary = RunSummary(started_at=datetime.now(timezone.utc))
+        self.summary.sites = list(app.sources)
         self._notified_first_cycle = False
         self._task = asyncio.create_task(self._run_scheduler(), name="bidpilot-runner")
         mode = "واقعی 🔴" if cfg.runtime.live else "آزمایشی 🧪"
-        return True, f"رصد شروع شد — حالت {mode}، هر {self._scheduler.interval} ثانیه."
+        text = f"رصد شروع شد — حالت {mode}، هر {self._scheduler.interval} ثانیه."
+        text += self._start_details(chat_id, ent, planned, broken)
+        return True, text
+
+    @staticmethod
+    def _label(site: str) -> str:
+        try:
+            from .onboarding import site_label
+
+            return site_label(site)
+        except Exception:  # noqa: BLE001
+            return site
+
+    def _start_details(self, chat_id, ent, planned, broken: dict[str, str]) -> str:
+        """Plain-language lines after the start: which sites run, what the plan allows."""
+        if ent is None or not planned:
+            return ""
+        from .user_sites import user_sites
+
+        running = [n for n in planned if n not in broken]
+        lines = [""]
+        if running:
+            joined = "، ".join(self._label(n) for n in running)
+            lines.append(f"🌐 سایت‌های فعال ({len(running)} از {ent.max_sites} مجاز): {joined}")
+        for name, why in broken.items():
+            lines.append(f"⚠️ «{self._label(name)}» فعلاً کنار گذاشته شد: {why} — از /market درستش کن.")
+        waiting = [n for n in user_sites(self.store, chat_id) if n not in planned]
+        if waiting:
+            lines.append(
+                f"⏸ {('، '.join(self._label(n) for n in waiting))} منتظر پلن بالاتر است؛ "
+                "با ارتقا (/plans) یا دعوت دوستان (/invite) خودکار شروع می‌شود."
+            )
+        month = "نامحدود" if ent.monthly_unlimited else str(ent.per_month)
+        lines.append(f"📊 پلن «{ent.plan_title}»: {ent.per_hour} پیشنهاد در ساعت · {ent.per_day} در روز · {month} در ماه")
+        return "\n".join(lines)
 
     async def _run_scheduler(self) -> None:
         try:
@@ -211,9 +311,8 @@ class Automation:
     async def _on_report(self, reports: list[Any]) -> None:
         self.summary.add(reports)
         if any(getattr(report, "authentication_failed", False) for report in reports):
-            # Application._dispatch_digest sends the explicit authentication alert.
-            if self._scheduler is not None:
-                self._scheduler.request_stop()
+            # Application._dispatch_digest sends the explicit authentication alert; the
+            # Scheduler parks only that site and stops the run when none is left.
             return
         if any(getattr(report, "javascript_required", False) for report in reports):
             # Application._dispatch_digest sends the JavaScript alert; the
@@ -248,13 +347,24 @@ class Automation:
             if summary.cycles:
                 head += f" (آخرین اجرا: {summary.cycles} دور)"
             return head + "\nبرای شروع: /run"
-        return (
-            "🚀 <b>رصد در حال اجراست</b>\n"
-            f"⏱ {summary.running_for} | {summary.cycles} دور\n"
-            f"🔎 {summary.fetched} پروژه | 📨 {summary.submitted} ارسال | "
-            f"🧪 {summary.dry_run} آزمایشی\n"
-            "توقف: /stop"
+        lines = [
+            "🚀 <b>رصد در حال اجراست</b>",
+            f"⏱ {summary.running_for} | {summary.cycles} دور",
+        ]
+        app = self._app
+        sites = list(getattr(app, "sources", {}) or summary.sites)
+        if sites:
+            lines.append("🌐 سایت‌ها: " + "، ".join(self._label(n) for n in sites))
+        ent = getattr(app, "_last_entitlements", None) or self._ent
+        if ent is not None:
+            lines.append(f"{ent.plan_badge} پلن «{ent.plan_title}» · {ent.per_hour} در ساعت · {ent.max_sites} سایت همزمان")
+        lines.append(
+            f"🔎 {summary.fetched} پروژه | 📨 {summary.submitted} ارسال | 🧪 {summary.dry_run} آزمایشی"
         )
+        if summary.failed:
+            lines.append(f"❌ {summary.failed} ارسال ناموفق — علت هر کدام در پیام خودش آمده است.")
+        lines.append("توقف: /stop")
+        return "\n".join(lines)
 
 
 __all__ = ["Automation", "RunSummary"]

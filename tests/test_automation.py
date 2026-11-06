@@ -397,3 +397,67 @@ async def test_automation_on_report_does_not_stop_when_javascript_is_required(en
 
     assert not stopper.stopped
     assert notes == []
+
+
+async def test_run_reports_go_only_to_the_chat_that_started_it(env, tmp_path, monkeypatch):
+    """Every allowed chat used to receive every other user's bid reports."""
+    import bidpilot.automation as automation_module
+
+    monkeypatch.chdir(tmp_path)
+    env.set("telegram.chat_ids", ["111", "222"])
+    env.update({"marketplace.name": "parscoders", "runtime.submit_mode": "dry_run"})
+    seen_cfgs = []
+
+    class FakeApp:
+        def __init__(self, cfg):
+            self.config = cfg
+            self.sources = {}
+
+        async def setup(self):
+            return None
+
+        async def close(self):
+            return None
+
+    def fake_build(cfg, *args):
+        seen_cfgs.append(list(cfg.notifications.chat_ids))
+        return FakeApp(cfg)
+
+    monkeypatch.setattr(automation_module, "build_application", fake_build)
+
+    class IdleScheduler:
+        def __init__(self, *args, **kwargs):
+            self.interval = 1
+
+        async def run_forever(self):
+            return None
+
+        def request_stop(self):
+            return None
+
+    monkeypatch.setattr(automation_module, "Scheduler", IdleScheduler)
+    delivered = []
+
+    async def notify(text, chat_id=None):
+        delivered.append((text, chat_id))
+
+    automation = Automation(store=env, config_path=CONFIG, notify=notify)
+    ok, _ = await automation.start(chat_id="222")
+    assert ok
+    await automation._task
+    assert seen_cfgs[0] == ["222"]  # the Telegram notifier is built for the starter only
+
+    await automation._say("hello")
+    assert delivered == [("hello", "222")]
+
+
+async def test_a_notify_callback_without_chat_id_still_works(env):
+    notes = []
+
+    async def old_style(text):
+        notes.append(text)
+
+    automation = Automation(store=env, config_path=CONFIG, notify=old_style)
+    automation._owner_chat_id = "222"
+    await automation._say("hi")
+    assert notes == ["hi"]

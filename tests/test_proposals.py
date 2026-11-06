@@ -328,3 +328,12 @@ def test_template_does_not_invent_matching_past_experience():
     assert "همان روز کار را استارت بزنم" not in proposal.text
     assert "همین روز شروع کنم" not in proposal.text
     assert "راهکار را بر اساس نیازها و محدودیت‌های اعلام‌شده‌ی همین پروژه تنظیم می‌کنم" in proposal.text
+
+
+def test_sanitize_llm_text_strips_markdown_and_leaked_reasoning():
+    from bidpilot.proposals.generator import sanitize_llm_text
+
+    raw = "<think>باید فکر کنم</think>\n## سلام\nمن **پایتون** کار می‌کنم و `کد` می‌نویسم."
+    cleaned = sanitize_llm_text(raw)
+    assert "think" not in cleaned and "**" not in cleaned and "`" not in cleaned and "#" not in cleaned
+    assert cleaned.startswith("سلام")

@@ -18,7 +18,19 @@ from .zarinpal import PaymentRequest, ZarinpalClient, ZarinpalConfig  # keep ali
 log = logging.getLogger(__name__)
 
 
+SIMULATED_PREFIX = "SIM-"
+
+
+class SimulatedPaymentError(RuntimeError):
+    """The gateway is not configured, so no real payment can exist."""
+
+
 class SubscriptionManager:
+    #: Development only (``payments.allow_simulated``). Without a configured gateway the
+    #: gateways answer with fake ``SIM-`` payments that always "verify": allowing that in
+    #: production let anybody activate a paid plan for free.
+    allow_simulated: bool = False
+
     def __init__(self, session: AsyncSession, zarinpal_config: ZarinpalConfig | None = None) -> None:
         self.session = session
         self.zarinpal_config = zarinpal_config or ZarinpalConfig(merchant_id="")
@@ -148,6 +160,14 @@ class SubscriptionManager:
             payment.zarinpal_response = json.dumps({"error": result.message, "code": result.code}, ensure_ascii=False)
             await self.session.flush()
             raise RuntimeError(result.message)
+        if str(result.authority or "").startswith(SIMULATED_PREFIX) and not self.allow_simulated:
+            payment.status = "failed"
+            payment.zarinpal_response = json.dumps({"error": "gateway_not_configured"}, ensure_ascii=False)
+            await self.session.flush()
+            raise SimulatedPaymentError(
+                "درگاه پرداخت هنوز تنظیم نشده است، پس خرید آنلاین فعلاً ممکن نیست. "
+                "به پشتیبانی پیام بده تا پلن را برایت فعال کنند؛ یا با دعوت دوستان رایگان ارتقا بگیر: /invite"
+            )
         payment.authority = result.authority
         payment.status = "sent"
         payment.zarinpal_response = json.dumps({"authority": result.authority, "payment_url": result.payment_url}, ensure_ascii=False)
@@ -178,6 +198,10 @@ class SubscriptionManager:
                 sandbox = sb
         from .gateways import get_gateway as _get_gw2
 
+        if str(authority).startswith(SIMULATED_PREFIX) and not self.allow_simulated:
+            payment.status = "failed"
+            await self.session.flush()
+            raise SimulatedPaymentError("این پرداخت واقعی نیست (درگاه تنظیم نشده بود)؛ پلن فعال نشد.")
         client = _get_gw2(gateway_id, merchant_id=merchant, sandbox=sandbox)
         verify = await client.verify(authority, payment.amount_toman)
         if not verify.ok:

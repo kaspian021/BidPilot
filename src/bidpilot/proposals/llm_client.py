@@ -343,6 +343,10 @@ class LLMClient:
                     # again — this is not a network retry, so it has its own counter
                     wants = min(wants * 2, 4_000)
                     payload["max_tokens"] = wants
+                    if "openrouter.ai" in self.base_url and "reasoning" in payload:
+                        # second attempt: switch thinking off entirely (a model that insists on
+                        # reasoning rejects it and the knob is dropped below)
+                        payload["reasoning"] = {"enabled": False}
                     reserved = estimate_tokens(system) + estimate_tokens(user) + wants
                     log.info(
                         "LLM answered empty because it ran out of output tokens; retrying with max_tokens=%s",

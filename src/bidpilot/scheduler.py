@@ -2,8 +2,10 @@
 
 Failure policy (deliberately asymmetric):
 
-* **Authentication failure** -> hard stop. Bidding logged-out risks duplicate
-  or misdirected proposals, and only the user can fix the cookie.
+* **Authentication failure / expired subscription** -> that *site* is parked until
+  the user fixes it (changing settings reloads and retries it). With several
+  marketplaces running, the others keep going; when *no* site is left the whole
+  run stops, exactly like the single-site behaviour before.
 * **JavaScript-required interstitial** -> pause *that one source* with an
   exponentially growing cooldown and keep everything else running. These
   pages are usually transient anti-bot responses; the old behaviour killed
@@ -39,7 +41,7 @@ class Scheduler:
         interval: int | None = None,
         jitter: int | None = None,
         sources: list[str] | None = None,
-        app_factory: Callable[[], Application] | None = None,
+        app_factory: Callable[[], Application | Any] | None = None,
         store: SettingsStore | None = None,
         on_report: Callable[[list[Any]], Any] | None = None,
         javascript_cooldown: int | None = None,
@@ -55,6 +57,8 @@ class Scheduler:
         self._paused_until: dict[str, float] = {}
         #: source name -> consecutive JavaScript-required reports (backoff input)
         self._js_streak: dict[str, int] = {}
+        #: source name -> why it was parked until the user fixes it ("auth" | "subscription")
+        self._blocked: dict[str, str] = {}
         self._stop = asyncio.Event()
         self.consecutive_errors = 0
         # When the user changes something in the Telegram bot (tone, key, live mode,
@@ -81,19 +85,31 @@ class Scheduler:
         if self._app_factory is None:
             return False
         stamp = self._store.stamp()
-        if stamp == self._settings_stamp:
+        # a bigger plan (payment, referral reward) may allow more marketplaces than were built
+        wants_rebuild = bool(getattr(self.app, "needs_rebuild", False))
+        if stamp == self._settings_stamp and not wants_rebuild:
             return False
         try:
             # the process-wide secrets cache predates this change
             reset_secret_cache()
             new_app = self._app_factory()
+            if inspect.isawaitable(new_app):
+                new_app = await new_app
             await new_app.setup()
         except Exception as exc:  # keep the old, working app
             log.error("Could not apply new settings: %s", exc)
             return False
         old_app = self.app
+        # keep what the old app learned (current plan) so a rebuild is not announced twice
+        try:
+            new_app._last_entitlements = getattr(old_app, "_last_entitlements", None)
+            new_app._alerted_until = getattr(old_app, "_alerted_until", {})
+        except Exception:  # pragma: no cover
+            pass
         self.app = new_app
         self._settings_stamp = stamp
+        # the user touched the settings (new cookie, renewed subscription): retry parked sites
+        self._blocked.clear()
         log.info("Settings changed — reloaded configuration and sources.")
         try:
             await old_app.close()
@@ -131,7 +147,22 @@ class Scheduler:
         if not names:
             return self.sources
         now = time.monotonic()
-        return [name for name in names if self._paused_until.get(name, 0.0) <= now]
+        return [
+            name for name in names if self._paused_until.get(name, 0.0) <= now and name not in self._blocked
+        ]
+
+    def _park_failed_sources(self, reports: list[Any]) -> None:
+        """Park sites whose login / subscription is broken; log which one and why."""
+        for report in reports or []:
+            name = str(getattr(report, "source", "") or "")
+            if not name:
+                continue
+            if getattr(report, "subscription_required", False):
+                self._blocked[name] = "subscription"
+                log.error("[SCHEDULER][PARK-SUBSCRIPTION] source=%s subscription expired / daily limit reached", name)
+            elif getattr(report, "authentication_failed", False):
+                self._blocked[name] = "auth"
+                log.error("[SCHEDULER][PARK-AUTH] source=%s login is not verified", name)
 
     def _pause_javascript_sources(self, reports: list[Any]) -> None:
         for report in reports or []:
@@ -201,12 +232,11 @@ class Scheduler:
                     log.info(report.summary())
                     for error in report.errors:
                         log.warning("cycle error: %s", error)
-                if any(getattr(report, "subscription_required", False) for report in reports):
-                    log.error("[SCHEDULER][STOP-SUBSCRIPTION] subscription expired / daily limit reached; stopping polling")
-                    self.request_stop()
-                    break
-                if any(getattr(report, "authentication_failed", False) for report in reports):
-                    log.error("[SCHEDULER][STOP-AUTH] marketplace login is not verified; stopping polling")
+                self._park_failed_sources(reports)
+                if self._blocked and not self._active_sources() and not self._paused_until:
+                    # no marketplace left to work on: same outcome as the single-site days
+                    reason = "STOP-SUBSCRIPTION" if "subscription" in self._blocked.values() else "STOP-AUTH"
+                    log.error("[SCHEDULER][%s] no usable marketplace left (%s); stopping polling", reason, self._blocked)
                     self.request_stop()
                     break
                 # JavaScript interstitials pause the offending source only;

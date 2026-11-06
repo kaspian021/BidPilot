@@ -159,7 +159,23 @@ class Database:
     def __init__(self, url: str) -> None:
         self.url = url
         self._ensure_sqlite_dir(url)
-        self.engine = create_async_engine(url, echo=False, future=True)
+        kwargs: dict = {}
+        if url.startswith("sqlite") and ":memory:" not in url:
+            # several marketplaces (one session each) write at the same time: wait for the
+            # lock instead of failing with "database is locked"
+            kwargs["connect_args"] = {"timeout": 30}
+        self.engine = create_async_engine(url, echo=False, future=True, **kwargs)
+        if url.startswith("sqlite") and ":memory:" not in url:
+            from sqlalchemy import event
+
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def _sqlite_pragmas(dbapi_connection, _record):  # pragma: no cover - driver glue
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")  # readers never block the writer
+                    cursor.execute("PRAGMA busy_timeout=30000")
+                finally:
+                    cursor.close()
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
 
     @staticmethod

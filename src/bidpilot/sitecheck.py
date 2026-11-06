@@ -64,15 +64,23 @@ async def check_site(
     config_path: str = "config/config.yaml",
     site: str | None = None,
     fetch_projects: bool = True,
+    chat_id: str | int | None = None,
 ) -> SiteCheck:
-    """Verify the active (or given) marketplace account, without sending anything."""
+    """Verify the active (or given) marketplace account, without sending anything.
+
+    With ``chat_id`` the *user's own* account for that site is checked (never the
+    machine-wide one that belongs to the operator).
+    """
+    from .per_user import user_scope
+
     cfg, secrets = _site_env(store, config_path)
     name = str(site or store.get("marketplace.name") or DEFAULT_SITE).strip().lower()
     label = site_label(name)
-    creds = site_credentials(name, store)
+    creds = site_credentials(name, store, chat_id=chat_id) if chat_id is not None else site_credentials(name, store)
 
     try:
-        source = create_source(name, _source_settings(cfg, name), cfg, secrets)
+        with user_scope(chat_id):
+            source = create_source(name, _source_settings(cfg, name), cfg, secrets)
     except Exception as exc:  # unknown source / broken config
         return SiteCheck(name, label, False, f"سایت ساخته نشد: {exc}", method=creds.method)
 

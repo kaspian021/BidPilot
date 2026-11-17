@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ..models import SubmissionResult, SubmissionStatus
+from ..outcome_analyst import evidence_from_html, evidence_from_notices, seconds_until_site_reset
 from ..priority_lock import PriorityLock, submit_priority
 from . import html_parser
 
@@ -433,6 +434,93 @@ def _failure(
     )
 
 
+def limit_result(
+    source_name: str, snippet: str, daily: bool, http_status: int | None, debug: dict[str, Any]
+) -> SubmissionResult:
+    """A quota/subscription answer from the site, worded for *this* site and *this* account.
+
+    A daily quota is the site's own rule and resets by itself: the site is paused until
+    then (``retry_after_seconds``) and the account is *not* declared broken. Only a real
+    expiry / missing credit stops the site until the user fixes the account.
+    """
+    from ..error_analyzer import site_name_fa
+    from ..ratelimit import format_wait
+
+    label = site_name_fa(source_name)
+    shown = (snippet or "").strip()[:140]
+    if daily:
+        wait = seconds_until_site_reset()
+        return SubmissionResult(
+            status=SubmissionStatus.FAILED,
+            message=(
+                f"⛔ سقف ارسال روزانهٔ حساب شما در {label} پر شده است"
+                + (f" (پیام سایت: «{shown}»)" if shown else "")
+                + f". این محدودیت خود سایت است؛ ربات {label} را کنار می‌گذارد و حدود {format_wait(wait)} دیگر "
+                "(بعد از بازنشانی روزانه) خودکار ادامه می‌دهد."
+            ),
+            http_status=http_status,
+            retry_after_seconds=wait,
+            payload_debug=debug,
+        )
+    return SubmissionResult(
+        status=SubmissionStatus.FAILED,
+        message=(
+            f"⛔ اشتراک یا اعتبار حساب شما در {label} کافی نیست"
+            + (f" (پیام سایت: «{shown}»)" if shown else "")
+            + f". بعد از تمدید در خود {label}، دوباره /run بزن."
+        ),
+        http_status=http_status,
+        subscription_required=True,
+        payload_debug=debug,
+    )
+
+
+async def _find_submitter(
+    page: Any, form: Any, submitter_id: str, endpoint_attribute: str, endpoint_url: str
+) -> tuple[Any | None, str]:
+    """Locate the visible submit button, waiting for slow pages and trying fallbacks.
+
+    Returns ``(locator, "")`` or ``(None, short diagnosis)``. The old code looked once,
+    right after filling, and gave up if the button was momentarily hidden (layout still
+    settling, offcanvas animation, validator re-rendering); on slow connections that
+    discarded a fully filled form.
+    """
+    candidates: list[tuple[str, Any]] = []
+    if submitter_id:
+        candidates.append(("id", form.locator(_attr_selector("id", submitter_id)).first))
+    else:
+        candidates.append(
+            ("endpoint", form.locator(_attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)).first)
+        )
+    candidates.append(("type=submit", form.locator("button[type=submit], input[type=submit]").first))
+    candidates.append(("text", form.locator("button, input[type=button]").filter(has_text="ارسال").first))
+
+    seen: dict[str, str] = {}
+    for _ in range(8):  # ~6s in total
+        for label, loc in candidates:
+            try:
+                count = await loc.count()
+                if not count:
+                    seen[label] = "پیدا نشد"
+                    continue
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=1500)
+                except Exception:  # noqa: BLE001
+                    pass
+                if await loc.is_visible():
+                    return loc, ""
+                seen[label] = "پنهان"
+            except Exception as exc:  # noqa: BLE001
+                seen[label] = type(exc).__name__
+        await page.wait_for_timeout(750)
+    try:
+        form_visible = await form.is_visible()
+    except Exception:  # noqa: BLE001
+        form_visible = None
+    detail = "، ".join(f"{k}: {v}" for k, v in seen.items())
+    return None, f"{detail}؛ فرم {'نمایان' if form_visible else 'پنهان'}"
+
+
 async def _submit_once(
     *,
     source_name: str,
@@ -801,23 +889,22 @@ async def _submit_once(
                         debug=safe_debug,
                     )
 
-                if submitter_id:
-                    submitter = form.locator(_attr_selector("id", submitter_id)).first
-                else:
-                    submitter = form.locator(
-                        _attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)
-                    ).first
-                # In some Parscoders offcanvas layouts the submit button is below the fold;
-                # scroll it into view and give the JS validator a moment to enable it.
-                try:
-                    if await submitter.count():
-                        await submitter.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(400)
-                except Exception:
-                    pass
-                if await submitter.count() == 0 or not await submitter.is_visible():
+                submitter, submit_diag = await _find_submitter(
+                    page, form, submitter_id, endpoint_attribute, endpoint_url
+                )
+                if submitter is None:
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT-NOT-FOUND] source=%s id=%s diag=%s",
+                        source_name,
+                        project_id,
+                        submit_diag,
+                    )
+                    safe_debug["submit_button"] = submit_diag
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "submit-not-found")
                     return _failure(
-                        "دکمه اصلی ارسال در فرم مرورگر پیدا یا قابل‌مشاهده نیست؛ هیچ پیشنهادی ارسال نشد.",
+                        "دکمهٔ «ارسال پیشنهاد» بعد از پر شدن فرم دیده نشد "
+                        f"({submit_diag}). هیچ پیشنهادی ارسال نشد؛ احتمالاً چیدمان صفحهٔ سایت عوض شده یا "
+                        "صفحه کامل بارگذاری نشده. اسکرین‌شات در data/browser_debug ذخیره شد.",
                         debug=safe_debug,
                     )
                 # Wait briefly for the button to become enabled after the last field change
@@ -968,17 +1055,12 @@ async def _submit_once(
                             invalid,
                         )
                         if new_notices and html_parser.requires_subscription(f"<div>{joined}</div>"):
-                            daily = html_parser.is_daily_limit_error(f"<div>{joined}</div>")
-                            return SubmissionResult(
-                                status=SubmissionStatus.FAILED,
-                                message=(
-                                    f"⛔ سقف ارسال روزانه پر شده است ({joined[:120]}). حساب رایگان روزی ۱ پیشنهاد اجازه می‌دهد. "
-                                    if daily
-                                    else f"⛔ اشتراک حساب به پایان رسیده یا محدود شده ({joined[:120]}). "
-                                )
-                                + "برای ادامه اشتراک تهیه کنید. جست‌وجو متوقف شد.",
-                                subscription_required=True,
-                                payload_debug=safe_debug,
+                            return limit_result(
+                                source_name,
+                                joined,
+                                html_parser.is_daily_limit_error(f"<div>{joined}</div>"),
+                                None,
+                                {**safe_debug, "evidence": evidence_from_notices(new_notices)},
                             )
                         reason = (
                             f"سایت پس از کلیک پیام داد: «{joined}»."
@@ -993,7 +1075,7 @@ async def _submit_once(
                                 f"پیشنهاد ثبت نشد. {reason} اسکرین‌شات و فرم در data/browser_debug ذخیره شد؛ "
                                 "همین پروژه چند بار پشت‌سرهم تلاش نمی‌شود."
                             ),
-                            payload_debug=safe_debug,
+                            payload_debug={**safe_debug, "evidence": evidence_from_notices(new_notices)},
                         )
 
                     # A request left the browser but no answer came back: genuinely ambiguous.
@@ -1040,31 +1122,20 @@ async def _submit_once(
                     if html_parser.requires_subscription(response_text):
                         sub_snippet = html_parser.subscription_limit_snippet(response_text)
                         daily = html_parser.is_daily_limit_error(response_text)
-                        if daily:
-                            msg = (
-                                f"⛔ سقف ارسال روزانه پر شده است ({sub_snippet[:120]}). "
-                                "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
-                                "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
-                            )
-                        else:
-                            msg = (
-                                f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_snippet[:120]}). "
-                                "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
-                            )
                         log.warning(
-                            "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=subscription_required daily=%s snippet=%r",
+                            "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=%s snippet=%r",
                             source_name,
                             project_id,
                             response.status,
-                            daily,
+                            "daily_limit" if daily else "subscription_required",
                             sub_snippet,
                         )
-                        return SubmissionResult(
-                            status=SubmissionStatus.FAILED,
-                            message=msg,
-                            http_status=response.status,
-                            subscription_required=True,
-                            payload_debug=safe_debug,
+                        return limit_result(
+                            source_name,
+                            sub_snippet,
+                            daily,
+                            response.status,
+                            {**safe_debug, "evidence": evidence_from_html(response_text)},
                         )
                     pause = html_parser.requires_javascript(response_text)
                     log.warning(
@@ -1086,7 +1157,7 @@ async def _submit_once(
                         ),
                         http_status=response.status,
                         javascript_required=pause,
-                        payload_debug=safe_debug,
+                        payload_debug={**safe_debug, "evidence": evidence_from_html(response_text)},
                     )
 
                 log.info(

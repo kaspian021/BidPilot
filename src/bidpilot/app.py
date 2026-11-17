@@ -311,6 +311,24 @@ class Application:
                         ),
                     )
                 )
+            elif getattr(report, "site_limit_seconds", 0):
+                wait = int(report.site_limit_seconds)
+                # one alert per quota window (the scheduler keeps the site paused meanwhile)
+                if self._first_time("site-limit", source, wait):
+                    await self._send(
+                        Event(
+                            kind=EventKind.ERROR,
+                            title=f"سقف روزانهٔ {label} پر شد",
+                            body=(
+                                f"⏳ سقف ارسال روزانهٔ حساب شما در «{label}» پر شده است.\n"
+                                f"{getattr(report, 'site_limit_message', '') or ''}\n\n"
+                                f"✅ «{label}» تا حدود {format_wait(wait)} دیگر کنار گذاشته می‌شود و بعد از بازنشانی خودکار ادامه می‌دهد؛ "
+                                "لازم نیست دستی کاری بکنی."
+                                + ("\nبقیهٔ سایت‌ها همچنان کار می‌کنند." if len(reports) > 1 else "")
+                                + f"\nسقف بالاتر می‌خواهی؟ اشتراک خود «{label}» را ارتقا بده."
+                            ),
+                        )
+                    )
             elif getattr(report, "javascript_required", False):
                 # the scheduler retries after a cooldown: do not repeat the identical alert
                 if cooldown and not self._first_time("js", source, cooldown):

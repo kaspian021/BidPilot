@@ -82,6 +82,8 @@ class RuntimeConfig(BaseModel):
     max_bids_per_day: int = 60
     min_seconds_between_bids: int = 90
     max_projects_per_poll: int = 30
+    #: bids prepared (details, price, LLM text) while the previous one is being submitted
+    prefetch_bids: int = 1
     notify_on_skip: bool = True
     #: one grouped message per cycle instead of one message per project
     notify_digest: bool = True

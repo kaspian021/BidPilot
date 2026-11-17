@@ -7,6 +7,14 @@ import re
 
 log = logging.getLogger(__name__)
 
+_SITE_NAMES = {"parscoders": "پارس‌کدرز", "karlancer": "کارلنسر", "ponisha": "پونیشا"}
+
+
+def site_name_fa(source: str) -> str:
+    """Persian site name for messages (falls back to the raw source id)."""
+    return _SITE_NAMES.get(str(source or "").strip().lower(), str(source or "سایت"))
+
+
 # Known patterns -> (category, user_message, action)
 _KNOWN: list[tuple[re.Pattern[str], str, str, str]] = [
     (
@@ -14,6 +22,19 @@ _KNOWN: list[tuple[re.Pattern[str], str, str, str]] = [
         "local_db",
         "پیشنهاد در سایت ثبت شد ولی ذخیره‌ی آن در دیتابیس محلی شکست خورد.",
         "نیازی به ارسال دوباره نیست؛ ربات از روی صفحهٔ سایت تکراری‌ها را تشخیص می‌دهد. ربات را یک‌بار ری‌استارت کن تا دیتابیس خودکار ارتقا یابد.",
+    ),
+    (
+        re.compile(r"دکمه.*ارسال.*(?:پیدا|دیده)", re.IGNORECASE),
+        "submit_button_missing",
+        "فرم پر شد ولی دکمهٔ «ارسال پیشنهاد» در صفحه دیده نشد؛ هیچ پیشنهادی ثبت نشد.",
+        "ربات خودش دوباره تلاش می‌کند. اگر برای همهٔ پروژه‌ها تکرار شد، معمولاً صفحهٔ سایت کند باز می‌شود یا چیدمانش عوض شده؛ "
+        "اسکرین‌شات در data/browser_debug است و برای بررسی بفرستش.",
+    ),
+    (
+        re.compile(r"TargetClosed|browser has been closed|مرورگر.*بسته", re.IGNORECASE),
+        "browser_closed",
+        "مرورگر داخلی ربات وسط ارسال بسته شد؛ پیشنهادی ثبت نشد.",
+        "معمولاً با ری‌استارت ربات یا دور بعدی درست می‌شود. اگر پنجرهٔ Chromium را خودت بستی، دوباره /run بزن.",
     ),
     (
         re.compile(r"پس از کلیک.*(?:هیچ درخواستی|پیام داد)|click_sent_no_request", re.IGNORECASE),

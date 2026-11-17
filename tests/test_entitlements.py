@@ -155,3 +155,36 @@ async def test_priority_lock_aging_prevents_starvation():
     lock.release()
     await asyncio.gather(old, new)
     assert order[0] == "old-free"
+
+
+# ------------------------------------------------- regressions from a real run
+async def test_paid_plan_with_expiry_is_not_downgraded_by_naive_sqlite_datetimes(tmp_path):
+    """SQLite returned naive datetimes; comparing with utcnow() raised TypeError → free plan."""
+    from datetime import timedelta
+
+    from bidpilot.db import Database
+    from bidpilot.models import utcnow
+    from bidpilot.subscriptions.entitlements import entitlements_from_session
+    from bidpilot.subscriptions.manager import SubscriptionManager
+
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'p.sqlite3'}")
+    await db.init()
+    async with db.session_factory() as s:
+        user = await SubscriptionManager(s).get_or_create_user("5")
+        user.plan_id, user.plan_expires_at = "pro", utcnow() + timedelta(days=3)
+        await s.commit()
+    async with db.session_factory() as s:
+        found = await entitlements_from_session(s, "5")
+    await db.dispose()
+    assert (found.plan_id, found.max_sites) == ("pro", 3)
+    assert found.expires_at.tzinfo is not None
+
+
+def test_new_submit_failures_get_truthful_explanations():
+    from bidpilot.error_analyzer import analyze_error
+
+    missing = analyze_error("دکمه اصلی ارسال در فرم مرورگر پیدا یا قابل‌مشاهده نیست؛ هیچ پیشنهادی ارسال نشد.")
+    assert missing["category"] == "submit_button_missing"
+    assert "تنظیمات مرورگر" not in missing["action"]
+    closed = analyze_error("Locator.count: Target page, context or browser has been closed")
+    assert closed["category"] == "browser_closed"

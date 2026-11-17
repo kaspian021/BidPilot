@@ -53,10 +53,20 @@ def _bid_block(bid: BidPlan) -> str:
             analysis = ai if isinstance(ai, dict) and ai.get("title") else analyze_error(
                 bid.result.message, status_code=bid.result.http_status
             )
-            if analysis.get("category") != "unknown":
-                lines.append(f"🔍 علت: {_e(analysis.get('title'))}")
+            if analysis.get("category") != "unknown" or analysis.get("source") == "ai":
+                by_ai = analysis.get("source") == "ai"
+                lines.append(f"🔍 علت{' (برداشت هوش مصنوعی از پیام سایت)' if by_ai else ''}: {_e(analysis.get('title'))}")
+                if analysis.get("explanation"):
+                    lines.append(f"💡 توضیح: {_e(analysis.get('explanation'))}")
                 if analysis.get("action"):
                     lines.append(f"🛠 اقدام: {_e(analysis.get('action'))}")
+                follow = {
+                    "now": "🔁 ربات همین حالا دوباره تلاش می‌کند.",
+                    "later": "🔁 ربات بعداً خودش دوباره تلاش می‌کند.",
+                    "never": "🛑 این مورد بدون اقدام تو حل نمی‌شود؛ ربات تکرارش نمی‌کند.",
+                }.get(str(analysis.get("retry", "")))
+                if follow:
+                    lines.append(follow)
     if bid.proposal:
         lines.append(f"🤖 منبع متن: {_e(bid.proposal.generated_by)}")
     return "\n".join(lines)

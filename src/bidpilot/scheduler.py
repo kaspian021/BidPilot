@@ -157,7 +157,12 @@ class Scheduler:
             name = str(getattr(report, "source", "") or "")
             if not name:
                 continue
-            if getattr(report, "subscription_required", False):
+            wait = int(getattr(report, "site_limit_seconds", 0) or 0)
+            if wait and not getattr(report, "subscription_required", False):
+                # the site's own daily quota: leave it alone until it resets, then resume by itself
+                self._paused_until[name] = max(self._paused_until.get(name, 0.0), time.monotonic() + wait)
+                log.warning("[SCHEDULER][PAUSE-SITE-LIMIT] source=%s paused_for=%ss (site quota reached)", name, wait)
+            elif getattr(report, "subscription_required", False):
                 self._blocked[name] = "subscription"
                 log.error("[SCHEDULER][PARK-SUBSCRIPTION] source=%s subscription expired / daily limit reached", name)
             elif getattr(report, "authentication_failed", False):

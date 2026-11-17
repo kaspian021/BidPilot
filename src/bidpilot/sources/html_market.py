@@ -33,9 +33,10 @@ from ..config import AppConfig, Secrets
 from ..credentials import SiteCredentials, site_credentials
 from ..llm_providers import build_client, resolve_chain
 from ..models import Project, Proposal, SubmissionResult, SubmissionStatus
+from ..outcome_analyst import evidence_from_html
 from . import html_parser as parser
 from .base import AuthenticationRequiredError, JavaScriptRequiredError, Source, SourceError
-from .browser_submit import submit_js_managed_form
+from .browser_submit import limit_result, submit_js_managed_form
 from .discovery import (
     MAX_DETAIL_PAGES,
     MAX_PROJECTS,
@@ -1203,30 +1204,19 @@ class HtmlMarketSource(Source):
         if parser.requires_subscription(response.text):
             sub_msg = parser.subscription_limit_snippet(response.text)
             daily = parser.is_daily_limit_error(response.text)
-            if daily:
-                message = (
-                    f"⛔ سقف ارسال روزانه پر شده است ({sub_msg[:120]}). "
-                    "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
-                    "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
-                )
-            else:
-                message = (
-                    f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_msg[:120]}). "
-                    "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
-                )
             log.warning(
-                "[BID][SUBMIT-RESPONSE] source=%s id=%s outcome=subscription_required daily=%s snippet=%r",
+                "[BID][SUBMIT-RESPONSE] source=%s id=%s outcome=%s snippet=%r",
                 self.name,
                 project.external_id,
-                daily,
+                "daily_limit" if daily else "subscription_required",
                 sub_msg,
             )
-            return SubmissionResult(
-                status=SubmissionStatus.FAILED,
-                message=message,
-                http_status=response.status_code,
-                subscription_required=True,
-                payload_debug={"action": action, "fields": sorted(payload)},
+            return limit_result(
+                self.name,
+                sub_msg,
+                daily,
+                response.status_code,
+                {"action": action, "fields": sorted(payload), "evidence": evidence_from_html(response.text)},
             )
 
         _ok_preview, _ = parser.detect_success(response.status_code, response.text, bid_cfg)

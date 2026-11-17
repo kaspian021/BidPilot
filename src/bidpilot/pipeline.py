@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .config import AppConfig
-from .error_analyzer import analyze_error, analyze_with_llm
 from .filters import ProjectFilter
 from .models import (
     BidPlan,
@@ -26,6 +24,8 @@ from .models import (
     SubmissionStatus,
 )
 from .notifications.base import NotifierDispatcher
+from .outcome_analyst import _CACHE as _AI_ANALYSIS_CACHE  # noqa: F401  (re-exported for tests)
+from .outcome_analyst import analyze_outcome, clamp_wait
 from .pricing.strategy import PricingConfig, PricingStrategy
 from .proposals.generator import ProposalError, ProposalGenerator
 from .ratelimit import RateLimiter
@@ -47,8 +47,14 @@ log = logging.getLogger(__name__)
 _SUBMIT_FAILURES: dict[tuple[str, str, str], tuple[int, float]] = {}
 _MAX_SUBMIT_FAILURES = 2
 #: signature of an unknown error -> AI explanation (one cheap LLM call per distinct error, not per project)
-_AI_ANALYSIS_CACHE: dict[str, dict[str, str]] = {}
 _FAILURE_COOLDOWN_SECONDS = 45 * 60
+
+
+@dataclass
+class _Prepared:
+    """A bid that is fully written and priced; only the rate slot and the send are left."""
+
+    plan: BidPlan
 
 
 @dataclass
@@ -75,6 +81,9 @@ class RunReport:
     skip_reasons: dict[str, int] = field(default_factory=dict)
     #: titles of the projects that made it all the way to a proposal
     proposed: list[str] = field(default_factory=list)
+    #: the site's own daily quota is used up: pause THIS site for this many seconds (account is fine)
+    site_limit_seconds: int = 0
+    site_limit_message: str = ""
     #: the real reason the LLM failed (shown to the user instead of "template")
     llm_error: str = ""
     #: the plan cap that stopped this run ("hour" | "day" | "month" | "gap"), with the wording to show
@@ -89,7 +98,7 @@ class RunReport:
     def has_news(self) -> bool:
         # Auth / subscription / JS failures are surfaced by the runner as a
         # dedicated, actionable message rather than a duplicate generic digest.
-        if self.authentication_failed or self.javascript_required or self.subscription_required:
+        if self.authentication_failed or self.javascript_required or self.subscription_required or self.site_limit_seconds:
             return False
         return bool(self.new or self.submitted or self.failed or self.errors or self.limit_code in ("hour", "day", "month"))
 
@@ -154,6 +163,7 @@ class BidPipeline:
         )
         self.live = config.runtime.live if live is None else live
         self.max_projects = max_projects or config.runtime.max_projects_per_poll
+        self.prefetch = max(1, int(getattr(config.runtime, "prefetch_bids", 1) or 1))
         self.delivery_days = int(config.pricing.get("delivery_days", 14))
         self.user_chat_id = str(user_chat_id) if user_chat_id else None
         # Ensure limiter is scoped to the same user
@@ -211,29 +221,7 @@ class BidPipeline:
             if discovery is not None:
                 report.ai_pages = int(getattr(discovery, "pages_read", 0) or 0)
                 report.ai_calls = int(getattr(discovery, "llm_calls", 0) or 0)
-            for project in projects[: self.max_projects]:
-                try:
-                    await self.process_project(project, report)
-                except Exception as exc:  # never let one project kill the batch
-                    log.exception("Project %s failed", project.uid)
-                    await self._rollback_quietly()
-                    report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
-                if report.limit_code in ("hour", "day", "month"):
-                    log.info("[PIPELINE][LIMIT] source=%s code=%s stopping the current project batch", source.name, report.limit_code)
-                    break
-                if report.authentication_failed or report.javascript_required or report.subscription_required:
-                    if report.subscription_required:
-                        stop_reason = "STOP-SUBSCRIPTION"
-                    elif report.authentication_failed:
-                        stop_reason = "STOP-AUTH"
-                    else:
-                        stop_reason = "PAUSE-JAVASCRIPT"
-                    log.error(
-                        "[PIPELINE][%s] source=%s stopping the current project batch",
-                        stop_reason,
-                        source.name,
-                    )
-                    break
+            await self._run_batch(source.name, projects[: self.max_projects], report)
         except Exception as exc:  # fetch/auth failure for the whole source
             detail = str(exc).strip() or type(exc).__name__
             report.errors.append(detail)
@@ -314,7 +302,11 @@ class BidPipeline:
         return plan
 
     # -------------------------------------------------------------- one item
-    async def process_project(self, project: Project, report: RunReport) -> BidPlan | None:
+    async def prepare_project(self, project: Project, report: RunReport) -> _Prepared | BidPlan | None:
+        """Everything that needs no rate slot and no browser: filter, details, duplicate check,
+        price and the proposal text. Safe to run while the previous bid is being submitted.
+        It never touches the database session.
+        """
         # 1) Filter first; a rejected/observed project is never persisted.
         budget_debug = project.budget.model_dump() if project.budget else None
         raw = project.raw or {}
@@ -521,18 +513,8 @@ class BidPipeline:
         if hint and hint < delivery:
             delivery = hint
 
-        # 4) rate limit / caps — reserve a slot before paying for the LLM. The slot is
-        # shared with the user's other marketplaces running at the same time, so two
-        # sites can never both take the last free bid of the hour.
-        async with self.rate_limiter.slot(project.source) as rate:
-            if not rate.allowed:
-                report.skipped += 1
-                plan = BidPlan(project=project, amount=amount, rationale=pricing.rationale)
-                plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
-                self._note_limit(report, rate)
-                await self._emit_skip(project, rate.reason, report)
-                return plan
-            return await self._propose_and_submit(project, report, pricing, amount, delivery)
+        # 4) proposal text (LLM) — prepared ahead of the submit queue
+        return await self._write_proposal(project, report, pricing, amount, delivery)
 
     def _note_limit(self, report: RunReport, rate) -> None:
         """Remember the cap that stopped this run (first one wins) for the digest."""
@@ -541,9 +523,8 @@ class BidPipeline:
             report.limit_reason = rate.reason
             report.limit_retry_after = int(rate.retry_after or 0)
 
-    async def _propose_and_submit(self, project: Project, report: RunReport, pricing, amount: int, delivery: int) -> BidPlan:
-        """Steps 5-6: write the proposal, then send it (or dry-run). Runs inside a rate slot."""
-        # 5) proposal
+    async def _write_proposal(self, project: Project, report: RunReport, pricing, amount: int, delivery: int):
+        """Step 5: write the proposal. Returns a ready-to-send :class:`_Prepared` (or a skip plan)."""
         try:
             proposal = await self.generator.generate(project, amount, delivery)
         except ProposalError as exc:
@@ -556,14 +537,110 @@ class BidPipeline:
         if getattr(self.generator, "last_llm_error", "") and not report.llm_error:
             report.llm_error = str(self.generator.last_llm_error)
         report.proposed.append(project.title)
-        plan = BidPlan(
-            project=project,
-            amount=amount,
-            delivery_days=delivery,
-            proposal=proposal,
-            rationale=pricing.rationale,
+        return _Prepared(
+            BidPlan(
+                project=project,
+                amount=amount,
+                delivery_days=delivery,
+                proposal=proposal,
+                rationale=pricing.rationale,
+            )
         )
 
+    async def submit_prepared(self, prepared: _Prepared, report: RunReport) -> BidPlan:
+        """Step 4+6: reserve a rate slot (shared by all of the user's sites), then send or dry-run."""
+        plan = prepared.plan
+        project = plan.project
+        async with self.rate_limiter.slot(project.source) as rate:
+            if not rate.allowed:
+                report.skipped += 1
+                plan.result = SubmissionResult(status=SubmissionStatus.SKIPPED, message=rate.reason)
+                self._note_limit(report, rate)
+                await self._emit_skip(project, rate.reason, report)
+                return plan
+            return await self._send(plan, report)
+
+    async def process_project(self, project: Project, report: RunReport) -> BidPlan | None:
+        """Prepare and send one project (sequential; the batch runner overlaps these)."""
+        prepared = await self.prepare_project(project, report)
+        if isinstance(prepared, _Prepared):
+            return await self.submit_prepared(prepared, report)
+        return prepared
+
+    async def _run_batch(self, source_name: str, projects: list[Project], report: RunReport) -> None:
+        """Prepare project N+1 (details, price, LLM text) while project N is being submitted.
+
+        A bid costs ~1 minute in the browser and the LLM ~20 s; doing them one after the other
+        left one of the two idle all the time. A small bounded queue keeps the browser busy and
+        never prepares more than ``prefetch`` bids ahead (so a hard cap wastes little LLM work).
+        Submission itself stays strictly sequential and in order.
+        """
+        queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, self.prefetch))
+        done = object()
+
+        def should_stop() -> bool:
+            return bool(
+                report.limit_code in ("hour", "day", "month")
+                or report.site_limit_seconds
+                or report.authentication_failed
+                or report.javascript_required
+                or report.subscription_required
+            )
+
+        async def producer() -> None:
+            try:
+                for project in projects:
+                    if should_stop():
+                        break
+                    try:
+                        item: object = await self.prepare_project(project, report)
+                    except Exception as exc:  # never let one project kill the batch
+                        log.exception("Project %s failed", project.uid)
+                        report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
+                        continue
+                    if isinstance(item, _Prepared):
+                        await queue.put(item)
+            finally:
+                await queue.put(done)
+
+        task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is done:
+                    break
+                try:
+                    await self.submit_prepared(item, report)  # type: ignore[arg-type]
+                except Exception as exc:
+                    log.exception("Project %s failed", item.plan.project.uid)  # type: ignore[attr-defined]
+                    await self._rollback_quietly()
+                    report.errors.append(f"{item.plan.project.uid}: {str(exc).strip() or type(exc).__name__}")  # type: ignore[attr-defined]
+                if report.limit_code in ("hour", "day", "month"):
+                    log.info("[PIPELINE][LIMIT] source=%s code=%s stopping the current project batch", source_name, report.limit_code)
+                    break
+                if report.site_limit_seconds:
+                    log.info("[PIPELINE][SITE-LIMIT] source=%s stopping the current project batch", source_name)
+                    break
+                if report.authentication_failed or report.javascript_required or report.subscription_required:
+                    stop_reason = (
+                        "STOP-SUBSCRIPTION"
+                        if report.subscription_required
+                        else "STOP-AUTH"
+                        if report.authentication_failed
+                        else "PAUSE-JAVASCRIPT"
+                    )
+                    log.error("[PIPELINE][%s] source=%s stopping the current project batch", stop_reason, source_name)
+                    break
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _send(self, plan: BidPlan, report: RunReport) -> BidPlan:
+        """Step 6: submit (or dry-run). Runs inside a rate slot."""
+        project = plan.project
+        proposal = plan.proposal
+        amount = plan.amount
+        delivery = plan.delivery_days
         # 6) submit (or dry run)
         started = time.monotonic()
         if not self.live:
@@ -668,8 +745,21 @@ class BidPipeline:
         else:
             # Failed attempts stay in logs/reports only; persist accepted bids only.
             report.failed += 1
-            await self._attach_ai_analysis(result)
-            if self.live and not (report.subscription_required or report.authentication_failed):
+            await self._attach_ai_analysis(result, project.source)
+            if result.retry_after_seconds:
+                report.site_limit_seconds = int(result.retry_after_seconds)
+                report.site_limit_message = result.message
+                log.warning(
+                    "[PIPELINE][SITE-LIMIT] source=%s id=%s pausing this site for %ss (quota reached on the site)",
+                    project.source,
+                    project.external_id,
+                    report.site_limit_seconds,
+                )
+            if (
+                self.live
+                and not (report.subscription_required or report.authentication_failed)
+                and not result.retry_after_seconds
+            ):
                 key = (self.user_chat_id or "", project.source, str(project.external_id))
                 count = _SUBMIT_FAILURES.get(key, (0, 0.0))[0] + 1
                 _SUBMIT_FAILURES[key] = (count, time.monotonic() + _FAILURE_COOLDOWN_SECONDS)
@@ -699,30 +789,45 @@ class BidPipeline:
         return plan
 
     # ------------------------------------------------------------- helpers
-    async def _attach_ai_analysis(self, result: SubmissionResult) -> None:
-        """Explain an *unrecognised* failure in plain Persian with the bot's own LLM.
+    async def _attach_ai_analysis(self, result: SubmissionResult, site: str = "") -> None:
+        """Explain a failed submission clearly — and notice site quotas the rules missed.
 
-        Known failures are explained instantly by the rule-based analyzer; the model is
-        only consulted for new kinds of errors, once per distinct message, within 15 s,
-        so a flaky provider can never slow the poll loop.
+        Certain situations (daily quota, expired subscription, login, layout change…) are
+        recognised instantly by rules. For anything else the user's **own** model reads the
+        evidence the page gave us (notices + a cleaned excerpt) and classifies it, once per
+        distinct message and within a short budget, so a flaky provider can never slow the
+        poll loop. The model only explains; the one thing it can change is pausing the site
+        until its quota resets, and only when the page text really contained a notice.
         """
         message = (result.message or "").strip()
-        if not message or analyze_error(message, status_code=result.http_status)["category"] != "unknown":
+        evidence = (result.payload_debug or {}).get("evidence")
+        try:
+            clients = self.generator._clients_ready()
+        except Exception:  # noqa: BLE001
+            clients = []
+        client = clients[0][1] if clients else None
+        outcome = await analyze_outcome(
+            message,
+            site=site,
+            evidence=evidence if isinstance(evidence, dict) else None,
+            http_status=result.http_status,
+            llm_client=client,
+        )
+        if outcome is None:
             return
-        signature = re.sub(r"\d+", "#", message)[:120]
-        analysis = _AI_ANALYSIS_CACHE.get(signature)
-        if analysis is None:
-            analysis = {}
-            try:
-                clients = self.generator._clients_ready()
-                if clients:
-                    found = await asyncio.wait_for(analyze_with_llm(message, clients[0][1]), timeout=15)
-                    analysis = found or {}
-            except Exception as exc:  # noqa: BLE001 - analysis is a nicety, never a failure source
-                log.debug("AI failure analysis skipped: %s", type(exc).__name__)
-            _AI_ANALYSIS_CACHE[signature] = analysis
-        if analysis:
-            result.payload_debug["analysis"] = analysis
+        if outcome.pauses_site and not result.retry_after_seconds and not result.subscription_required:
+            result.retry_after_seconds = clamp_wait(outcome.wait_seconds)
+        if outcome.source == "ai":
+            result.payload_debug["analysis"] = {
+                "category": outcome.kind,
+                "title": outcome.title,
+                "message": f"{outcome.title} {outcome.action}".strip(),
+                "action": outcome.action,
+                "explanation": outcome.explanation,
+                "retry": outcome.retry,
+                "source": "ai",
+                "raw": message[:300],
+            }
 
     async def _rollback_quietly(self) -> None:
         """Reset a DB session left in 'rolled back' state by a failed flush."""

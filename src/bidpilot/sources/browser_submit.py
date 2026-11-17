@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ..models import SubmissionResult, SubmissionStatus
+from ..outcome_analyst import evidence_from_html, evidence_from_notices, seconds_until_site_reset
 from ..priority_lock import PriorityLock, submit_priority
 from . import html_parser
 
@@ -430,6 +431,47 @@ def _failure(
         http_status=status,
         javascript_required=pause_source,
         payload_debug=debug or {},
+    )
+
+
+def limit_result(
+    source_name: str, snippet: str, daily: bool, http_status: int | None, debug: dict[str, Any]
+) -> SubmissionResult:
+    """A quota/subscription answer from the site, worded for *this* site and *this* account.
+
+    A daily quota is the site's own rule and resets by itself: the site is paused until
+    then (``retry_after_seconds``) and the account is *not* declared broken. Only a real
+    expiry / missing credit stops the site until the user fixes the account.
+    """
+    from ..error_analyzer import site_name_fa
+    from ..ratelimit import format_wait
+
+    label = site_name_fa(source_name)
+    shown = (snippet or "").strip()[:140]
+    if daily:
+        wait = seconds_until_site_reset()
+        return SubmissionResult(
+            status=SubmissionStatus.FAILED,
+            message=(
+                f"⛔ سقف ارسال روزانهٔ حساب شما در {label} پر شده است"
+                + (f" (پیام سایت: «{shown}»)" if shown else "")
+                + f". این محدودیت خود سایت است؛ ربات {label} را کنار می‌گذارد و حدود {format_wait(wait)} دیگر "
+                "(بعد از بازنشانی روزانه) خودکار ادامه می‌دهد."
+            ),
+            http_status=http_status,
+            retry_after_seconds=wait,
+            payload_debug=debug,
+        )
+    return SubmissionResult(
+        status=SubmissionStatus.FAILED,
+        message=(
+            f"⛔ اشتراک یا اعتبار حساب شما در {label} کافی نیست"
+            + (f" (پیام سایت: «{shown}»)" if shown else "")
+            + f". بعد از تمدید در خود {label}، دوباره /run بزن."
+        ),
+        http_status=http_status,
+        subscription_required=True,
+        payload_debug=debug,
     )
 
 
@@ -1013,17 +1055,12 @@ async def _submit_once(
                             invalid,
                         )
                         if new_notices and html_parser.requires_subscription(f"<div>{joined}</div>"):
-                            daily = html_parser.is_daily_limit_error(f"<div>{joined}</div>")
-                            return SubmissionResult(
-                                status=SubmissionStatus.FAILED,
-                                message=(
-                                    f"⛔ سقف ارسال روزانه پر شده است ({joined[:120]}). حساب رایگان روزی ۱ پیشنهاد اجازه می‌دهد. "
-                                    if daily
-                                    else f"⛔ اشتراک حساب به پایان رسیده یا محدود شده ({joined[:120]}). "
-                                )
-                                + "برای ادامه اشتراک تهیه کنید. جست‌وجو متوقف شد.",
-                                subscription_required=True,
-                                payload_debug=safe_debug,
+                            return limit_result(
+                                source_name,
+                                joined,
+                                html_parser.is_daily_limit_error(f"<div>{joined}</div>"),
+                                None,
+                                {**safe_debug, "evidence": evidence_from_notices(new_notices)},
                             )
                         reason = (
                             f"سایت پس از کلیک پیام داد: «{joined}»."
@@ -1038,7 +1075,7 @@ async def _submit_once(
                                 f"پیشنهاد ثبت نشد. {reason} اسکرین‌شات و فرم در data/browser_debug ذخیره شد؛ "
                                 "همین پروژه چند بار پشت‌سرهم تلاش نمی‌شود."
                             ),
-                            payload_debug=safe_debug,
+                            payload_debug={**safe_debug, "evidence": evidence_from_notices(new_notices)},
                         )
 
                     # A request left the browser but no answer came back: genuinely ambiguous.
@@ -1085,31 +1122,20 @@ async def _submit_once(
                     if html_parser.requires_subscription(response_text):
                         sub_snippet = html_parser.subscription_limit_snippet(response_text)
                         daily = html_parser.is_daily_limit_error(response_text)
-                        if daily:
-                            msg = (
-                                f"⛔ سقف ارسال روزانه پر شده است ({sub_snippet[:120]}). "
-                                "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
-                                "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
-                            )
-                        else:
-                            msg = (
-                                f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_snippet[:120]}). "
-                                "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
-                            )
                         log.warning(
-                            "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=subscription_required daily=%s snippet=%r",
+                            "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=%s snippet=%r",
                             source_name,
                             project_id,
                             response.status,
-                            daily,
+                            "daily_limit" if daily else "subscription_required",
                             sub_snippet,
                         )
-                        return SubmissionResult(
-                            status=SubmissionStatus.FAILED,
-                            message=msg,
-                            http_status=response.status,
-                            subscription_required=True,
-                            payload_debug=safe_debug,
+                        return limit_result(
+                            source_name,
+                            sub_snippet,
+                            daily,
+                            response.status,
+                            {**safe_debug, "evidence": evidence_from_html(response_text)},
                         )
                     pause = html_parser.requires_javascript(response_text)
                     log.warning(
@@ -1131,7 +1157,7 @@ async def _submit_once(
                         ),
                         http_status=response.status,
                         javascript_required=pause,
-                        payload_debug=safe_debug,
+                        payload_debug={**safe_debug, "evidence": evidence_from_html(response_text)},
                     )
 
                 log.info(

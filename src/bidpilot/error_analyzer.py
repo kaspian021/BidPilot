@@ -7,6 +7,14 @@ import re
 
 log = logging.getLogger(__name__)
 
+_SITE_NAMES = {"parscoders": "پارس‌کدرز", "karlancer": "کارلنسر", "ponisha": "پونیشا"}
+
+
+def site_name_fa(source: str) -> str:
+    """Persian site name for messages (falls back to the raw source id)."""
+    return _SITE_NAMES.get(str(source or "").strip().lower(), str(source or "سایت"))
+
+
 # Known patterns -> (category, user_message, action)
 _KNOWN: list[tuple[re.Pattern[str], str, str, str]] = [
     (

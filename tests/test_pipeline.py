@@ -128,9 +128,9 @@ async def test_rate_limit_caps_bids(tmp_path):
     report = (await application.cycle())[0]
 
     assert report.submitted == 1
-    # the second project hits the hourly cap and the run stops there: the rest of
-    # the batch is not even inspected (no wasted requests while nothing can be sent)
-    assert report.skipped == 1
+    # the second project hits the hourly cap and the run stops there. Preparation runs one
+    # bid ahead of the browser, so at most that one extra project was already looked at.
+    assert 1 <= report.skipped <= 2
     assert report.limit_code == "hour"
     assert "سقف ساعتی" in report.limit_reason
     assert report.limit_retry_after > 0
@@ -525,3 +525,34 @@ async def test_project_that_keeps_failing_is_put_on_cooldown(tmp_path, monkeypat
     finally:
         pipeline_module._SUBMIT_FAILURES.clear()
         await application.close()
+
+
+async def test_next_bid_is_prepared_while_the_previous_one_is_being_submitted(tmp_path):
+    """The browser (~1 min/bid) and the LLM (~20 s) must overlap, not alternate."""
+    import asyncio
+
+    application, _ = await build_app(make_config(tmp_path))
+    pipeline_source = application.sources["mock"]
+    events: list[str] = []
+    original_submit = pipeline_source.submit_bid
+
+    async def slow_submit(project, proposal, amount, delivery):
+        events.append(f"submit-start-{project.external_id}")
+        await asyncio.sleep(0.3)
+        result = await original_submit(project, proposal, amount, delivery)
+        events.append(f"submit-end-{project.external_id}")
+        return result
+
+    pipeline_source.submit_bid = slow_submit
+    real_generate = application.generator.generate
+
+    async def tracked_generate(project, amount, delivery):
+        events.append(f"write-{project.external_id}")
+        return await real_generate(project, amount, delivery)
+
+    application.generator.generate = tracked_generate
+    reports = await application.cycle()
+    assert reports[0].submitted == 2
+    # project 2's text was written before project 1's submit finished
+    assert events.index("write-2") < events.index("submit-end-1")
+    await application.close()

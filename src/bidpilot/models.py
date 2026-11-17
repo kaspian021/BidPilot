@@ -121,6 +121,9 @@ class SubmissionResult(BaseModel):
     javascript_required: bool = False
     #: Account subscription expired / daily limit exhausted — pipeline must stop.
     subscription_required: bool = False
+    #: The site's own daily/periodic quota is used up: leave *this site* alone for this long
+    #: (the account is fine; the scheduler resumes by itself afterwards).
+    retry_after_seconds: int = 0
     payload_debug: dict = Field(default_factory=dict)
 
 

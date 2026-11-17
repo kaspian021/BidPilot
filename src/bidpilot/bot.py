@@ -28,6 +28,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Admin helpers alias - bot.py historically used esc/hr as short names
+esc = escape
+def hr() -> str:
+    return "───────────────"
 
 import httpx
 
@@ -73,6 +80,7 @@ from .per_user import (
     is_profile_onboarding_done,
     is_user_llm_verified,
     onboarding_progress,
+    get_user,
     set_user,
     set_user_llm_verified,
     update_user,
@@ -210,6 +218,39 @@ class TelegramAPI:
         except BotAPIError as exc:  # pragma: no cover
             log.debug("answerCallbackQuery failed: %s", exc)
 
+    async def send_document(
+        self,
+        chat_id: str | int,
+        file_path: str | Path,
+        *,
+        caption: str = "",
+        filename: str | None = None,
+    ) -> None:
+        """Send a file as document (for log download)."""
+        from pathlib import Path as _P
+        fp = _P(file_path)
+        if not fp.exists():
+            raise BotAPIError(f"فایل یافت نشد: {file_path}")
+        client = await self._get_client()
+        url = f"{self.base_url}/bot{self.token}/sendDocument"
+        # Use httpx multipart upload
+        try:
+            with fp.open("rb") as f:
+                files = {"document": (filename or fp.name, f, "application/octet-stream")}
+                data = {"chat_id": str(chat_id)}
+                if caption:
+                    data["caption"] = caption[:1024]
+                # httpx requires separate call for multipart
+                resp = await client.post(url, data=data, files=files)
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    raise BotAPIError(f"پاسخ نامعتبر تلگرام (HTTP {resp.status_code})")
+                if resp.status_code >= 400 or not payload.get("ok", False):
+                    raise BotAPIError(str(payload.get("description") or f"HTTP {resp.status_code}"))
+        except httpx.HTTPError as exc:
+            raise BotAPIError(self._scrub(f"ارسال فایل ناموفق بود: {exc}")) from exc
+
     async def set_commands(self) -> None:
         commands = [
             {"command": "status", "description": "وضعیت و تنظیمات فعلی"},
@@ -272,6 +313,15 @@ HELP_TEXT = """<b>BidPilot — راهنمای حرفه‌ای</b>  <i>✦ دست
 هیچ .env لازم نیست؛ همه امن در data/settings.json ذخیره می‌شود."""
 
 
+def get_plan_title(plan_id: str | None) -> str:
+    try:
+        from .subscriptions.plans import get_plan
+
+        return get_plan(plan_id or 'free').title
+    except Exception:  # noqa: BLE001
+        return str(plan_id or '')
+
+
 class BotService:
     """Command/flow engine. Transport is injected, which makes it testable."""
 
@@ -295,6 +345,22 @@ class BotService:
         self.automation = automation or Automation(
             store=store, config_path=config_path, notify=self.notify_owner
         )
+        #: the first runner is ``self.automation``; each further user gets their own
+        self._runners: dict[str, Automation] = {}
+        self._default_runner_owner: str | None = None
+        self._refresh_payment_flags()
+        # Cleanup old temp uploads on startup (resume PDFs are ephemeral)
+        try:
+            self._cleanup_old_uploads(max_age_hours=1)
+        except Exception:
+            pass
+        # Setup professional file logging (admin toggle)
+        try:
+            from .logging_utils import setup_file_logging
+            setup_file_logging(self.store)
+            self._log_event("INFO", "system", "BotService initialized", chat_id="system")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- transport
     async def send(self, chat_id: str | int, text: str, reply_markup: dict | None = None) -> bool:
@@ -316,8 +382,11 @@ class BotService:
             log.warning("Telegram send failed for %s: %s", chat_id, exc)
             return False
 
-    async def notify_owner(self, text: str) -> None:
-        """Used by the scheduler/CLI to push a message to the configured chats."""
+    async def notify_owner(self, text: str, chat_id: str | int | None = None) -> None:
+        """Push a scheduler/CLI message: to ``chat_id`` alone when known, else to the configured chats."""
+        if chat_id is not None:
+            await self.send(str(chat_id), text)
+            return
         for chat_id in self.store.get_list("telegram.chat_ids"):
             try:
                 await self.send(str(chat_id), text)
@@ -403,6 +472,13 @@ class BotService:
         chat_id = chat.get("id")
         if chat_id is None:
             return
+        # ── Professional logging: every incoming update (DEBUG) ──
+        try:
+            update_type = "callback" if update.get("callback_query") else ("document" if (update.get("message") or {}).get("document") else "message")
+            txt_preview = str((update.get("message") or {}).get("text") or update.get("callback_query",{}).get("data") or "")[:200]
+            self._log_event("DEBUG", "update", f"incoming {update_type}", chat_id=str(chat_id), preview=txt_preview, raw_type=update_type)
+        except Exception:
+            pass
         # ── maintenance mode (admin only) ──
         try:
             if self.store.get_bool("admin.maintenance"):
@@ -423,6 +499,44 @@ class BotService:
         text = (message.get("text") or "").strip()
         if not text:
             return
+        # ── Admin pending input (price/period/limits) ──
+        try:
+            chat_str_tmp = str(chat_id)
+            in_flow_tmp = chat_str_tmp in self._flows and self._flows[chat_str_tmp].current is not None
+            if not in_flow_tmp:
+                pending_key = self.store.get(f"admin.pending_input:{chat_id}")
+                if pending_key and self._require_admin(str(chat_id)):
+                    low = text.lower().strip()
+                    if low.startswith("/cancel") or low == "cancel" or low == "لغو":
+                        self.store.delete(f"admin.pending_input:{chat_id}")
+                        await self.send(chat_id, "❌ لغو شد — مقدار قبلی حفظ شد.")
+                        return
+                    if not text.startswith("/"):
+                        # Validate and store pending admin value
+                        try:
+                            clean = text.replace(",", "").replace("٬", "").replace(" ", "").strip()
+                            # Numeric fields
+                            if any(k in str(pending_key) for k in ["price_toman", "period_days", "max_bids", "min_seconds", "max_projects", "max_active", "commission_percent", "discount_percent"]):
+                                val = int(clean)
+                                if val < 0:
+                                    raise ValueError("negative")
+                                self.store.set(str(pending_key), val)
+                                display_val = str(val)
+                            else:
+                                self.store.set(str(pending_key), text)
+                                display_val = text
+                            self._log_admin_action(chat_id, "pending_input", key=str(pending_key), value=display_val)
+                            self.store.delete(f"admin.pending_input:{chat_id}")
+                            await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(str(pending_key))} = {esc(display_val)}</code>")
+                            return
+                        except ValueError:
+                            await self.send(chat_id, f"❌ مقدار نامعتبر: <code>{esc(text)}</code> — فقط عدد بفرست (مثلا 350000).\\nلغو: /cancel")
+                            return
+                        except Exception as e:
+                            await self.send(chat_id, f"❌ خطا: {escape(str(e))}")
+                            return
+        except Exception:
+            pass
         if not self.is_allowed(chat_id):
             # Referral / public onboarding: let anyone join via /start (esp. /start ref_...)
             # Otherwise the invite link is useless. Auto-add them to allowed list.
@@ -485,6 +599,10 @@ class BotService:
         callback_id = str(callback.get("id") or "")
         if chat_id is None:
             return
+        try:
+            self._log_event("DEBUG", "callback", f"callback {data[:80]}", chat_id=str(chat_id), data=data[:200])
+        except Exception:
+            pass
         await self.api.answer_callback(callback_id)
         if not self.is_allowed(chat_id):
             # Allow callbacks from newly auto-added users (e.g. after /start ref_...)
@@ -617,6 +735,10 @@ class BotService:
 
     # -------------------------------------------------------------- commands
     async def handle_command(self, chat_id: str, command: str, rest: str = "") -> None:
+        try:
+            self._log_event("INFO", "command", f"command {command}", chat_id=str(chat_id), command=command, rest=rest[:200] if rest else "")
+        except Exception:
+            pass
         # ── Gate: block all ops until LLM verified (Step 1) ──
         try:
             if is_onboarding_blocked(self.store, chat_id):
@@ -787,7 +909,10 @@ class BotService:
             )
             return
 
-        target = self._uploads_dir() / name
+        # Use unique temp name per user to avoid collisions and mark as temp for cleanup
+        import time
+        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:60]
+        target = self._uploads_dir() / f"tmp_{chat_id}_{int(time.time()*1000)}_{safe_name}"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
@@ -856,6 +981,8 @@ class BotService:
             pending = pending_import(self.store)
         if not pending:
             return
+        # Keep path for cleanup before we clear pending
+        pending_path = pending.get("value") if pending.get("type") == "file" else None
         if pending["type"] == "file" and not await self._ensure_pdf_reader(chat_id):
             return
         await self.send(chat_id, "🤖 دارم متن را با هوش مصنوعی شخصی تو تحلیل می‌کنم…")
@@ -872,6 +999,7 @@ class BotService:
                 "اطلاعات قبلی پروفایل حفظ شد (چیزی پاک نشد).\n"
                 "می‌توانی دوباره با /profile فایل/لینک بدهی، یا «ورود دستی» را انتخاب کنی.",
             )
+            self._cleanup_upload_file(pending_path)
             return
         except Exception as exc:
             log.exception("Profile import failed")
@@ -881,9 +1009,11 @@ class BotService:
                 f"⚠️ تحلیل پروفایل انجام نشد: {escape(str(exc))}\n"
                 "اطلاعات فعلی حفظ شد؛ با /profile دوباره تلاش کن یا دستی وارد کن.",
             )
+            self._cleanup_upload_file(pending_path)
             return
 
         if result is None:
+            self._cleanup_upload_file(pending_path)
             return
         from .profile_import import clear_import_error
 
@@ -904,14 +1034,186 @@ class BotService:
             + (("\n" + warnings) if warnings else "")
             + "\n\nاگر چیزی درست نیست، /profile را بزن و دستی اصلاح کن.",
         )
+        # Cleanup: delete the uploaded PDF after successful extraction (privacy + disk)
+        self._cleanup_upload_file(pending_path)
+        # Also cleanup any legacy stored resume_path files if they exist
+        try:
+            old_path = self.store.get(f"users.{chat_id}.profile.resume_path") or self.store.get("profile.resume_path")
+            if old_path:
+                self._cleanup_upload_file(str(old_path))
+                try:
+                    from .per_user import delete_user
+                    delete_user(self.store, chat_id, "profile.resume_path")
+                except Exception:
+                    pass
+                try:
+                    self.store.delete("profile.resume_path")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Opportunistic cleanup of old tmp files older than 1 hour
+        try:
+            self._cleanup_old_uploads(max_age_hours=1)
+        except Exception:
+            pass
+
+    def _cleanup_upload_file(self, path: str | None) -> None:
+        """Securely delete a single uploaded PDF (ignore missing)."""
+        if not path:
+            return
+        try:
+            from pathlib import Path as _P
+            p = _P(str(path)).expanduser()
+            uploads = self._uploads_dir().resolve()
+            try:
+                target = p.resolve()
+                if uploads in target.parents or target == uploads or str(target).startswith(str(uploads)):
+                    if target.is_file():
+                        target.unlink(missing_ok=True)
+            except Exception:
+                if p.is_file():
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _cleanup_old_uploads(self, max_age_hours: int = 24) -> None:
+        """Delete tmp_* files older than max_age_hours in uploads."""
+        try:
+            from pathlib import Path as _P
+            import time as _time
+            uploads = self._uploads_dir()
+            if not uploads.is_dir():
+                return
+            now = _time.time()
+            for f in uploads.glob("tmp_*"):
+                try:
+                    if f.is_file() and now - f.stat().st_mtime > max_age_hours * 3600:
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            for f in uploads.glob("resume-*.pdf"):
+                try:
+                    if f.is_file() and now - f.stat().st_mtime > 7 * 24 * 3600:
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ── Professional logging helpers ─────────────────────────────────
+    def _log_event(self, level: str, category: str, message: str, **fields) -> None:
+        """Detailed, scrubbed logging for admin toggle — never breaks main flow."""
+        try:
+            from .logging_utils import log_event, scrub_sensitive
+            # Also scrub fields values that look like secrets
+            safe_fields = {}
+            for k, v in fields.items():
+                try:
+                    sv = str(v)
+                    # Truncate overly long
+                    if len(sv) > 500:
+                        sv = sv[:500] + "…"
+                    safe_fields[k] = scrub_sensitive(sv, self.store)
+                except Exception:
+                    safe_fields[k] = str(v)[:500]
+            safe_msg = scrub_sensitive(message, self.store)
+            log_event(log, level, category, safe_msg, store=self.store, **safe_fields)
+        except Exception:
+            pass
+
+    def _log_admin_action(self, chat_id: str | int, action: str, **details) -> None:
+        """Every admin change is logged at INFO — even minor ones."""
+        try:
+            old_vals = {}
+            # If details contain key/new_value, fetch old for audit
+            if "key" in details:
+                try:
+                    old_vals["old"] = str(self.store.get(details["key"]) or "—")[:300]
+                except Exception:
+                    pass
+            self._log_event("INFO", "admin", f"admin:{action} by {chat_id}", chat_id=str(chat_id), action=action, **details, **old_vals)
+        except Exception:
+            pass
+
+    def _refresh_logging(self) -> None:
+        """Re-apply file handler after toggle/level change (no restart needed)."""
+        try:
+            from .logging_utils import setup_file_logging
+            setup_file_logging(self.store)
+            self._log_event("INFO", "system", "logging reconfigured", enabled=str(self.store.get("admin.logging.enabled")), level=str(self.store.get("admin.logging.level") or "DEBUG"))
+        except Exception as e:
+            log.warning("Refresh logging failed: %s", e)
+
+    # ------------------------------------------------------------- runners
+    def _refresh_payment_flags(self) -> None:
+        from .subscriptions.manager import SubscriptionManager
+
+        SubscriptionManager.allow_simulated = bool(self.store.get("payments.allow_simulated"))
+
+    def _runner(self, chat_id: str | int) -> Automation:
+        """The bidder of ``chat_id``. Every user runs independently of the others.
+
+        There used to be one shared runner: while user A was running, user B's /run
+        answered with A's status and B could never start, stop or see anything of
+        their own. The first user reuses ``self.automation``; others get their own.
+        """
+        cid = str(chat_id)
+        found = self._runners.get(cid)
+        if found is not None:
+            return found
+        base = self.automation
+        if self._default_runner_owner is None and not base.running:
+            self._default_runner_owner = cid
+            self._runners[cid] = base
+            return base
+        runner = Automation(
+            store=self.store,
+            config_path=base.config_path,
+            notify=base.notify,
+            interval=base.interval,
+            sources=list(base.sources) if base.sources else None,
+        )
+        self._runners[cid] = runner
+        return runner
 
     # ------------------------------------------------------------ start/stop
+    async def _entitlements(self, chat_id: str | int):
+        from .subscriptions.entitlements import resolve_entitlements
+
+        db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
+        return await resolve_entitlements(str(db_url), chat_id)
+
+    def _site_lines(self, sp) -> list[str]:
+        """Which sites run / wait / lack an account — one clear line each."""
+        lines: list[str] = []
+        if sp.running:
+            lines.append("🌐 سایت‌های فعال: " + "، ".join(escape(site_label(n)) for n in sp.running))
+        for name in sp.missing_account:
+            lines.append(f"🔑 «{escape(site_label(name))}» هنوز حساب ندارد (از /market وصلش کن) — فعلاً رد می‌شود.")
+        for name in sp.paused_by_plan:
+            lines.append(f"⏸ «{escape(site_label(name))}» بیشتر از ظرفیت پلنت است و منتظر ارتقا می‌ماند (/plans).")
+        return lines
+
     async def _cmd_run(self, chat_id: str) -> None:
         """«شروع فعالیت» — confirm what will happen, then start the bidder."""
+        from .user_sites import plan_sites
+
         state = readiness(self.store)
         missing = missing_steps(self.store, include_recommended=False)
-        if not state["credentials"]:
-            await self.send(chat_id, "🔑 اول حساب سایت را وصل کن: /market")
+        ent = await self._entitlements(chat_id)
+        sp = plan_sites(self.store, chat_id, ent)
+        if not sp.any_runnable:
+            names = sp.missing_account or [state["marketplace"]]
+            await self.send(
+                chat_id,
+                "🔑 اول حساب سایت را وصل کن: /market\n"
+                + "سایت‌های منتظر حساب: "
+                + "، ".join(escape(site_label(n)) for n in names),
+            )
             return
         if missing:
             await self.send(
@@ -919,8 +1221,9 @@ class BotService:
                 "⚠️ هنوز این‌ها ناقص است:\n" + "\n".join(f"• {escape(m)}" for m in missing) + "\n\n/setup",
             )
             return
-        if self.automation.running:
-            await self.send(chat_id, self.automation.status_text(), self._run_keyboard())
+        runner = self._runner(chat_id)
+        if runner.running:
+            await self.send(chat_id, runner.status_text(), self._run_keyboard())
             return
 
         live = state["mode"] == "live"
@@ -933,14 +1236,17 @@ class BotService:
             else "🧪 <b>آزمایشی</b> — پیشنهادها ساخته می‌شوند ولی ارسال نمی‌شوند."
         )
         limits = self._limits()
+        month = "نامحدود" if ent.monthly_unlimited else str(ent.per_month)
+        site_block = "\n".join(self._site_lines(sp))
         await self.send(
             chat_id,
             "<b>آماده‌ی شروع</b>\n\n"
-            f"🌐 سایت: {escape(site_label(state['marketplace']))}\n"
+            f"{site_block}\n"
             f"💰 قیمت: {bid_percent(self.store)}٪ بودجه‌ی کارفرما\n"
             f"🎭 لحن: {escape(str(state['tone'] or 'پیش‌فرض'))}\n"
             f"⏱ فاصله‌ی بررسی: هر {limits['interval']} ثانیه\n"
-            f"📊 سقف: {limits['per_day']} پیشنهاد در روز، {limits['per_hour']} در ساعت\n\n"
+            f"{ent.plan_badge} پلن «{escape(ent.plan_title)}»: {ent.per_hour} پیشنهاد در ساعت، "
+            f"{ent.per_day} در روز، {month} در ماه\n\n"
             f"{mode_line}\n\n"
             "با «تأیید و شروع» رصد پروژه‌ها و ارسال پیشنهاد آغاز می‌شود.",
             {
@@ -951,7 +1257,7 @@ class BotService:
                         if live
                         else {"text": "🔴 حالت واقعی", "callback_data": "cmd:mode"}
                     ],
-                    [{"text": "لغو", "callback_data": "cmd:cancel"}],
+                    [{"text": "🌐 انتخاب سایت‌ها", "callback_data": "cmd:sites"}, {"text": "لغو", "callback_data": "cmd:cancel"}],
                 ]
             },
         )
@@ -992,25 +1298,40 @@ class BotService:
         }
 
     async def _start_work(self, chat_id: str) -> None:
-        if self.automation.running:
-            await self.send(chat_id, self.automation.status_text(), self._run_keyboard())
+        from .user_sites import plan_sites
+
+        runner = self._runner(chat_id)
+        if runner.running:
+            await self.send(chat_id, runner.status_text(), self._run_keyboard())
             return
         if self.store.get("runtime.submit_mode") == "live" and not preview_is_fresh(self.store):
             await self.send(chat_id, self._need_test_text(), self._need_test_keyboard())
             return
-        await self.send(chat_id, "🔐 یک‌بار ورود به حساب را بررسی می‌کنم…")
-        check = await check_site(self.store, config_path=self.config_path)
-        if not check.ok:
+        ent = await self._entitlements(chat_id)
+        sp = plan_sites(self.store, chat_id, ent)
+        sites = sp.running or [self.store.get("marketplace.name") or "parscoders"]
+        await self.send(
+            chat_id,
+            "🔐 ورود به حساب " + ("همهٔ سایت‌ها" if len(sites) > 1 else "سایت") + " را یک‌بار بررسی می‌کنم…",
+        )
+        checks = await asyncio.gather(
+            *(check_site(self.store, config_path=self.config_path, site=name, chat_id=chat_id) for name in sites)
+        )
+        good = [c for c in checks if c.ok]
+        for check in checks:
+            await self.send(chat_id, check.message())
+        if not good:
             await self.send(
                 chat_id,
-                check.message()
-                + "\n\n⛔ <b>ورود به حساب تأیید نشد؛ جست‌وجو و ارسال پیشنهاد شروع نمی‌شود.</b>\n"
+                "⛔ <b>ورود به حساب تأیید نشد؛ جست‌وجو و ارسال پیشنهاد شروع نمی‌شود.</b>\n"
                 "از /market کوکی/ورود را به‌روز کن، با /test دوباره بررسی کن و سپس /run را بزن.",
             )
             return
-        await self.send(chat_id, check.message())
-        # Per-user isolation: use this chat's own LLM key for search/proposals
-        ok, message = await self.automation.start(chat_id=chat_id)
+        if len(good) < len(checks):
+            bad = "، ".join(escape(c.label) for c in checks if not c.ok)
+            await self.send(chat_id, f"⚠️ فقط سایت‌های سالم شروع می‌شوند؛ «{bad}» بعد از درست‌شدن حسابش با /run اضافه می‌شود.")
+        # Per-user isolation: use this chat's own LLM key and accounts
+        ok, message = await runner.start(chat_id=chat_id)
         await self.send(
             chat_id,
             ("🚀 " if ok else "❌ ") + escape(message) + ("\n\nاولین نتیجه را همین‌جا می‌فرستم." if ok else ""),
@@ -1018,7 +1339,7 @@ class BotService:
         )
 
     async def _cmd_stop(self, chat_id: str) -> None:
-        ok, message = await self.automation.stop()
+        ok, message = await self._runner(chat_id).stop()
         await self.send(chat_id, ("⏸ " if ok else "ℹ️ ") + escape(message), self._run_keyboard())
 
     # ----------------------------------------------------------- dependencies
@@ -1179,21 +1500,40 @@ class BotService:
         }
 
     async def _cmd_sites(self, chat_id: str) -> None:
-        rows = sites_overview(self.store)
-        lines = ["<b>سایت‌های فریلنسری</b>", ""]
+        ent = await self._entitlements(chat_id)
+        rows = sites_overview(self.store, chat_id)
+        selected = [row for row in rows if row["active"]]
+        running = {row["site"] for row in selected[: ent.max_sites]}
+        lines = [
+            "<b>سایت‌های فریلنسری</b>",
+            f"{ent.plan_badge} پلن «{escape(ent.plan_title)}» — تا <b>{ent.max_sites}</b> سایت همزمان "
+            f"(الان {len(selected)} انتخاب شده)",
+            "",
+        ]
         for row in rows:
-            mark = "🟢" if row["active"] else ("✅" if row["ready"] else "⚪️")
-            lines.append(
-                f"{mark} <b>{escape(row['label'])}</b>\n"
-                f"     {escape(row['summary'])}" + ("\n     <i>سایت فعال</i>" if row["active"] else "")
-            )
+            if row["active"]:
+                mark = "🟢" if row["site"] in running else "⏸"
+            else:
+                mark = "✅" if row["ready"] else "⚪️"
+            note = ""
+            if row["active"] and row["site"] in running:
+                note = "\n     <i>در حال استفاده</i>" if row["ready"] else "\n     <i>انتخاب شده ولی حسابش وصل نیست — /market</i>"
+            elif row["active"]:
+                note = "\n     <i>منتظر ظرفیت پلن — /plans</i>"
+            lines.append(f"{mark} <b>{escape(row['label'])}</b>\n     {escape(row['summary'])}{note}")
         lines.append("")
-        lines.append("برای عوض کردن سایت فعال یکی را بزن (یا <code>/site ponisha</code>):")
+        if ent.max_sites > 1:
+            lines.append("روی هر سایت بزن تا فعال یا غیرفعال شود (یا <code>/site ponisha</code>). سایت‌های فعال هم‌زمان کار می‌کنند.")
+        else:
+            lines.append(
+                "پلن شما یک سایت فعال دارد؛ با زدن روی سایت دیگر، جایگزین می‌شود (یا <code>/site ponisha</code>). "
+                "برای کار روی چند سایت: /plans"
+            )
         keyboard = {
             "inline_keyboard": [
                 [
                     {
-                        "text": ("🔵 " if row["active"] else "") + row["label"].split(" (")[0],
+                        "text": ("🟢 " if row["active"] else "") + row["label"].split(" (")[0],
                         "callback_data": f"site:{row['site']}",
                     }
                 ]
@@ -1207,26 +1547,69 @@ class BotService:
         if not name:
             await self._cmd_sites(chat_id)
             return
-        try:
-            active = switch_site(self.store, name)
-        except QuestionError as exc:
-            await self.send(chat_id, f"⚠️ {escape(str(exc))}\n\n/sites")
+        from .sources import available_sources
+        from .user_sites import toggle_user_site
+
+        if name.lower() not in available_sources():
+            options = "، ".join(f"{site_label(item)} = {item}" for item in available_sources() if item != "mock")
+            await self.send(
+                chat_id,
+                f"⚠️ سایت «{escape(name)}» ثبت نشده است.\nسایت‌های موجود: {escape(options)}\n\n/sites",
+            )
+            return
+        ent = await self._entitlements(chat_id)
+        result = toggle_user_site(self.store, chat_id, name, ent)
+        from .config import reset_secret_cache
+
+        reset_secret_cache()
+        label = site_label(result.site)
+        if result.action == "refused_limit":
+            await self.send(
+                chat_id,
+                f"⚠️ پلن «{escape(ent.plan_title)}» حداکثر {ent.max_sites} سایت همزمان را اجازه می‌دهد و همه‌اش پر است.\n"
+                "یکی از سایت‌های فعال را غیرفعال کن (رویش بزن) تا «" + escape(label) + "» جایش بیاید، "
+                "یا پلن را ارتقا بده.",
+                {
+                    "inline_keyboard": [
+                        [{"text": "⬆️ ارتقای پلن", "callback_data": "cmd:plans"}],
+                        [{"text": "🏠 همه سایت‌ها", "callback_data": "cmd:sites"}],
+                    ]
+                },
+            )
+            return
+        if result.action == "refused_last":
+            await self.send(
+                chat_id,
+                f"ℹ️ «{escape(label)}» تنها سایت فعال شماست و نمی‌شود غیرفعالش کرد؛ اول سایت دیگری را فعال کن.",
+                {"inline_keyboard": [[{"text": "🏠 همه سایت‌ها", "callback_data": "cmd:sites"}]]},
+            )
+            return
+        self._log(f"sites of {chat_id}: {result.sites} ({result.action} {result.site})")
+        if result.action == "removed":
+            await self.send(
+                chat_id,
+                f"⏸ «{escape(label)}» غیرفعال شد. سایت‌های فعال: "
+                + "، ".join(escape(site_label(n)) for n in result.sites)
+                + "\n(اگر رصد در حال اجراست، از دور بعد اعمال می‌شود.)",
+                {"inline_keyboard": [[{"text": "🏠 همه سایت‌ها", "callback_data": "cmd:sites"}]]},
+            )
             return
 
-        # keep the running daemon in sync (scheduler reloads on the next cycle)
-        self._log(f"active site switched to {active}")
         from .credentials import site_credentials
 
-        creds = site_credentials(active, self.store)
-        token = self.store.get("telegram.bot_token")
+        creds = site_credentials(result.site, self.store, chat_id=chat_id)
         hint = "برای وارد کردن حساب: /market"
         if creds.ready:
             hint = "حساب این سایت ثبت شده ✅ — /test برای بررسی، /preview برای نمونه"
-        if not token:
+        if not self.store.get("telegram.bot_token"):
             hint += "\n(توکن تلگرام هنوز در پنل ذخیره نشده است.)"
+        head = "✅ سایت فعال شد" if result.action == "switched" or len(result.sites) == 1 else "✅ سایت به سایت‌های فعال اضافه شد"
         await self.send(
             chat_id,
-            f"✅ سایت فعال شد: <b>{escape(site_label(active))}</b>\n\n{escape(hint)}",
+            f"{head}: <b>{escape(label)}</b>\n"
+            f"سایت‌های فعال ({len(result.sites)} از {ent.max_sites}): "
+            + "، ".join(escape(site_label(n)) for n in result.sites)
+            + f"\n\n{escape(hint)}",
             {
                 "inline_keyboard": [
                     [
@@ -1419,13 +1802,14 @@ class BotService:
 
     async def _cmd_status(self, chat_id: str) -> None:
         text = status_text(self.store)
-        rows = sites_overview(self.store)
+        rows = sites_overview(self.store, chat_id)
         sites = "\n".join(
             f"{'🟢' if row['active'] else ('✅' if row['ready'] else '⚪️')} "
             f"{escape(row['label'])}" + (" (فعال)" if row["active"] else "")
             for row in rows
         )
         text += f"\n\n<b>سایت‌ها</b>\n{sites}"
+        text += "\n\n" + self._runner(chat_id).status_text()
         steps = missing_steps(self.store)
         if steps:
             text += "\n\n<b>باقی‌مانده:</b>\n" + "\n".join(f"• {escape(s)}" for s in steps)
@@ -1497,7 +1881,15 @@ class BotService:
         return stats
 
     async def _handle_admin_callback(self, chat_id: str, data: str) -> None:
+        try:
+            self._log_event("INFO", "admin", f"admin callback {data[:100]}", chat_id=str(chat_id), data=data[:300])
+        except Exception:
+            pass
         if not self._require_admin(chat_id):
+            try:
+                self._log_event("WARNING", "admin", "admin access denied", chat_id=str(chat_id), data=data[:100])
+            except Exception:
+                pass
             await self.send(chat_id, "⛔ این بخش فقط برای ادمین (7806301378) است.")
             return
         # Routing
@@ -1649,21 +2041,39 @@ class BotService:
             if len(parts)==3:
                 _, field, pid = parts
                 if field == "price":
-                    await self.send(chat_id, f"قیمت جدید برای <b>{esc(pid)}</b> را بفرست:\n<code>/admin_set plan:{pid} price 350000</code>")
+                    self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{pid}.price_toman")
+                    await self.send(chat_id, f"💰 قیمت جدید برای <b>{esc(pid)}</b> را بفرست (عدد به تومان):\nمثلا <code>350000</code>\nلغو: /cancel\nیا دستی: <code>/admin_set plan:{pid} price 350000</code>")
                     return
                 if field == "period":
-                    await self.send(chat_id, f"دوره جدید (روز): <code>/admin_set plan:{pid} period 30</code>")
+                    self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{pid}.period_days")
+                    await self.send(chat_id, f"📅 دوره جدید برای <b>{esc(pid)}</b> (روز) را بفرست:\nمثلا <code>30</code>\nلغو: /cancel\nیا دستی: <code>/admin_set plan:{pid} period 30</code>")
                     return
                 if field == "limits":
-                    await self.send(chat_id, f"سقف‌ها: <code>/admin_set plan:{pid} limits max_bids_per_hour 20</code>\nیا <code>/admin_set plan:{pid} limits max_bids_per_day 100</code>")
+                    await self.send(chat_id, f"سقف‌ها برای <b>{esc(pid)}</b> — یکی را انتخاب کن یا دستی بفرست:\\n<code>/admin_set plan:{pid} limits max_bids_per_hour 20</code>\\n<code>/admin_set plan:{pid} limits max_bids_per_day 100</code>\\nبرای تغییر سریع، فقط عدد را بفرست و من از تو می‌پرسم کدام سقف.",
+                        {"inline_keyboard": [[{"text": "⚡ در ساعت", "callback_data": f"admin:plan:limit:max_bids_per_hour:{pid}"}, {"text": "📅 در روز", "callback_data": f"admin:plan:limit:max_bids_per_day:{pid}"}], [{"text": "📆 در ماه", "callback_data": f"admin:plan:limit:max_bids_per_month:{pid}"}, {"text": "⏱ تاخیر", "callback_data": f"admin:plan:limit:min_seconds_between_bids:{pid}"}], [{"text": "◀️ بازگشت", "callback_data": f"admin:plan:{pid}"}]]})
                     return
+                if field == "limit":
+                    # 4-part: admin:plan:limit:max_bids_per_hour:starter -> handled here
+                    full_parts = cmd.split(":")
+                    if len(full_parts) == 4:
+                        _, _, limit_field, target_pid = full_parts
+                        self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
+                        await self.send(chat_id, f"مقدار جدید برای <b>{esc(limit_field)}</b> در پلن <b>{esc(target_pid)}</b> را بفرست (عدد):\\nلغو: /cancel")
+                        return
                 if field == "recommend":
                     cur = self.store.get(f"admin.plans.{pid}.recommended")
                     new = not bool(cur) if cur is not None else True
                     # simplified: store flag
                     self.store.set(f"admin.plans.{pid}.recommended", new)
+                    self._log_admin_action(chat_id, "plan:recommend", plan=pid, recommended=str(new))
                     await self.send(chat_id, f"{'⭐ پیشنهاد ویژه شد' if new else 'حذف از پیشنهاد ویژه'}: {esc(pid)}")
                     return
+            if len(parts)==4 and parts[1]=="limit":
+                # admin:plan:limit:max_bids_per_hour:starter
+                _, _, limit_field, target_pid = parts
+                self.store.set(f"admin.pending_input:{chat_id}", f"admin.plans.{target_pid}.limits.{limit_field}")
+                await self.send(chat_id, f"مقدار جدید برای <b>{esc(limit_field)}</b> در پلن <b>{esc(target_pid)}</b> را بفرست (عدد):\\nلغو: /cancel")
+                return
         if cmd == "revenue":
             await self.send(chat_id, admin_ui.revenue_text(self.store), admin_ui.revenue_keyboard())
             return
@@ -1755,6 +2165,7 @@ class BotService:
                 cur = self.store.get("runtime.submit_mode") or "dry_run"
                 nxt = "live" if cur == "dry_run" else "dry_run"
                 self.store.set("runtime.submit_mode", nxt)
+                self._log_admin_action(chat_id, "sys:mode", old=cur, new=nxt)
                 await self.send(chat_id, f"حالت ارسال → <b>{esc(nxt)}</b>")
                 return
             if sub == "llm":
@@ -1772,6 +2183,7 @@ class BotService:
             if sub == "maintenance":
                 cur = self.store.get_bool("admin.maintenance")
                 self.store.set("admin.maintenance", not cur)
+                self._log_admin_action(chat_id, "sys:maintenance", old=str(cur), new=str(not cur))
                 await self.send(chat_id, f"حالت نگهداری: {'🔴 روشن — کاربران عادی بلاک می‌شوند' if not cur else '🟢 خاموش'}")
                 return
         if cmd == "advanced":
@@ -1780,7 +2192,12 @@ class BotService:
         if cmd.startswith("adv:"):
             sub = cmd.split(":")[1]
             if sub == "logs":
-                await self.send(chat_id, "لاگ: روی سرور <code>tail -f data/bidpilot.log</code> یا <code>bidpilot doctor</code>")
+                # Redirect to new professional logs center
+                try:
+                    self._refresh_logging()
+                except Exception:
+                    pass
+                await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
                 return
             if sub == "cleanup":
                 await self.send(chat_id, "پاکسازی: <code>/admin_set admin.adv.cleanup yes</code> (فعلاً دستی روی سرور انجام می‌شود)")
@@ -1819,9 +2236,103 @@ class BotService:
                 self.store.delete("admin.pending_broadcast")
                 await self.send(chat_id, f"✅ پیام همگانی به {count} کاربر ارسال شد.")
                 return
+        if cmd == "logs" or cmd.startswith("logs:"):
+            # ── Professional logging center ──
+            if cmd == "logs":
+                try:
+                    self._refresh_logging()
+                except Exception:
+                    pass
+                await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+                return
+            if cmd == "logs:toggle":
+                try:
+                    from .logging_utils import is_logging_enabled, set_logging_enabled, get_logging_level
+                    cur = is_logging_enabled(self.store)
+                    set_logging_enabled(self.store, not cur)
+                    self._refresh_logging()
+                    await self.send(chat_id, f"{'🟢 لاگ فعال شد' if not cur else '🔴 لاگ غیرفعال شد'} — سطح: <code>{escape(get_logging_level(self.store))}</code>\\n<i>از این لحظه همه جزئیات {'ثبت می‌شود' if not cur else 'دیگر ثبت نمی‌شود'}.</i>")
+                    await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+                    self._log_admin_action(chat_id, "logs:toggle", enabled=str(not cur))
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+            if cmd.startswith("logs:level:"):
+                try:
+                    lvl = cmd.split(":")[2].upper()
+                    from .logging_utils import set_logging_level
+                    set_logging_level(self.store, lvl)
+                    self._refresh_logging()
+                    desc = {'DEBUG': 'همه جزئیات حتی ریزترین خطاها', 'INFO': 'رویدادهای مهم', 'WARNING': 'فقط هشدارها', 'ERROR': 'فقط خطاهای بحرانی'}.get(lvl, lvl)
+                    await self.send(chat_id, f"✅ سطح لاگ → <b>{escape(lvl)}</b>\\n<i>{escape(desc)}</i>")
+                    await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+                    self._log_admin_action(chat_id, "logs:level", level=lvl)
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+            if cmd == "logs:tail" or cmd.startswith("logs:tail:"):
+                try:
+                    from .logging_utils import tail_logs
+                    lvl = None
+                    if cmd.count(":") == 2:
+                        lvl = cmd.split(":")[2].upper()
+                    lines = tail_logs(n=50, level=lvl if lvl in ("ERROR","WARNING","INFO","DEBUG","CRITICAL") else None)
+                    if not lines:
+                        await self.send(chat_id, "📭 هنوز لاگی ثبت نشده — اول «فعال کردن لاگ» را بزن و چند دستور امتحان کن.", admin_ui.logs_keyboard(self.store))
+                    else:
+                        text = "\\n".join(lines)
+                        if len(text) > 3800:
+                            from pathlib import Path as _P
+                            import tempfile
+                            tmp = _P(tempfile.gettempdir()) / f"bidpilot-tail-{chat_id}.log"
+                            try:
+                                tmp.write_text(text, encoding="utf-8")
+                                await self.api.send_document(chat_id, tmp, caption=f"📜 {len(lines)} خط آخر" + (f" — سطح {lvl}" if lvl else ""))
+                                tmp.unlink(missing_ok=True)
+                            except Exception:
+                                await self.send(chat_id, f"<pre>{escape(text[:3800])}</pre>\\n<i>... ادامه دارد — {len(lines)} خط</i>", admin_ui.logs_keyboard(self.store))
+                        else:
+                            await self.send(chat_id, f"<b>📜 {len(lines)} خط آخر" + (f" — {escape(lvl)}" if lvl else "") + "</b>\\n<pre>" + escape(text) + "</pre>", admin_ui.logs_keyboard(self.store))
+                    self._log_event("DEBUG", "admin", f"view tail {lvl or 'all'}", chat_id=str(chat_id), lines=str(len(lines)))
+                except Exception as e:
+                    await self.send(chat_id, f"خطا در نمایش لاگ: {escape(str(e))}")
+                return
+            if cmd == "logs:clear:ask":
+                await self.send(chat_id, admin_ui.logs_clear_confirm_text(), admin_ui.logs_clear_confirm_keyboard())
+                return
+            if cmd == "logs:clear:yes":
+                try:
+                    from .logging_utils import clear_logs
+                    stats = clear_logs(self.store)
+                    await self.send(chat_id, f"🧹 لاگ‌ها پاک شد — {stats.get('lines',0)} خط ({stats.get('size',0)} بایت) حذف شد.\\n<i>لاگ‌نویسی ادامه دارد.</i>", admin_ui.logs_keyboard(self.store))
+                    self._log_admin_action(chat_id, "logs:clear", cleared_lines=str(stats.get('lines')), cleared_size=str(stats.get('size')))
+                except Exception as e:
+                    await self.send(chat_id, f"خطا: {escape(str(e))}")
+                return
+            if cmd == "logs:download":
+                try:
+                    from .logging_utils import get_log_stats
+                    from pathlib import Path as _P
+                    stats = get_log_stats(self.store)
+                    target = _P(stats["file"])
+                    if not target.exists():
+                        await self.send(chat_id, "📭 فایلی برای دانلود نیست — هنوز لاگی ثبت نشده.", admin_ui.logs_keyboard(self.store))
+                        return
+                    await self.api.send_document(chat_id, target, caption=f"📜 BidPilot logs — {stats['lines']} خط · {stats['size_mb']} MB · سطح {stats['level']}")
+                    self._log_event("INFO", "admin", "download logs", chat_id=str(chat_id), file=str(target), size=str(stats['size']))
+                except Exception as e:
+                    log.exception("log download failed")
+                    await self.send(chat_id, f"❌ دانلود ناموفق: {escape(str(e))}")
+                return
+            await self.send(chat_id, admin_ui.logs_text(self.store), admin_ui.logs_keyboard(self.store))
+            return
         await self.send(chat_id, "دستور ادمین نامعتبر.", admin_ui.admin_main_keyboard())
 
     async def _handle_admin_set(self, chat_id: str, rest: str) -> None:
+        try:
+            self._log_event("INFO", "admin", f"admin_set {rest[:150]}", chat_id=str(chat_id), rest=rest[:300])
+        except Exception:
+            pass
         if not rest or " " not in rest.strip():
             await self.send(chat_id, "<b>فرمت:</b> <code>/admin_set &lt;key&gt; &lt;value&gt;</code>\nنمونه‌ها:\n"
                                       "<code>/admin_set pricing.ratio 0.4</code>\n"
@@ -1860,6 +2371,7 @@ class BotService:
                             self.store.set(key, int(value))
                         except ValueError:
                             self.store.set(key, value)
+                        self._log_admin_action(chat_id, f"plan:{pid}:{field}", key=key, value=value)
                         await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(key)} = {esc(value)}</code>")
                         return
                 if rest.startswith("user:"):
@@ -1935,8 +2447,10 @@ class BotService:
                             self.store.set(key, val)
                 except Exception:
                     self.store.set(key, val)
+            self._log_admin_action(chat_id, "admin_set", key=key, value=val)
             await self.send(chat_id, f"✅ ذخیره شد: <code>{esc(key)} = {esc(val)}</code>")
         except Exception as e:
+            self._log_event("ERROR", "admin", f"admin_set failed {key}={val}", chat_id=str(chat_id), error=str(e))
             await self.send(chat_id, f"❌ ذخیره ناموفق: {escape(str(e))}")
 
     async def _handle_admin_search(self, chat_id: str, rest: str) -> None:
@@ -2864,25 +3378,53 @@ class BotService:
         return False
 
     async def _maybe_qualify_referral(self, chat_id: str) -> None:
-        """Call after setup/market complete — if invitee finishes, inviter gets milestone."""
+        """An invited user counts once they really set the bot up; then the inviter is told.
+
+        "Really" = own AI key verified + profile saved + marketplace account connected
+        (anti-abuse: empty throw-away accounts do not earn rewards).
+        """
         try:
+            from .per_user import (
+                is_llm_onboarding_done,
+                is_marketplace_onboarding_done,
+                is_profile_onboarding_done,
+            )
+
+            if not (
+                is_llm_onboarding_done(self.store, chat_id)
+                and is_profile_onboarding_done(self.store, chat_id)
+                and is_marketplace_onboarding_done(self.store, chat_id)
+            ):
+                return
             from .db import Database
             from .subscriptions.referrals import ReferralManager
 
             db_url = self.store.get("database_url") or "sqlite+aiosqlite:///data/bidpilot.sqlite3"
             db = Database(str(db_url))
             await db.init()
-            async with db.session_factory() as s:
-                rm = ReferralManager(s, bot_username=self._bot_username())
-                grants = await rm.mark_setup_complete(chat_id)
-                await s.commit()
-                # notify inviter if milestone hit (best-effort)
-                for g in grants:
-                    # we don't know inviter chat to push — log only; they will see on /invite
-                    pass
-            await db.dispose()
-        except Exception:
-            pass
+            try:
+                async with db.session_factory() as s:
+                    rm = ReferralManager(s, bot_username=self._bot_username())
+                    outcome = await rm.qualify_invitee(chat_id)
+                    await s.commit()
+            finally:
+                await db.dispose()
+            if outcome:
+                await self._tell_inviter(outcome)
+        except Exception as exc:  # noqa: BLE001 - rewards must never break onboarding
+            log.debug("referral qualify failed: %s", exc)
+
+    async def _tell_inviter(self, outcome: dict) -> None:
+        """Push a clear message to the inviter: friend counted, progress, reward earned."""
+        lines = ["🎉 <b>یکی از دوستانی که دعوت کردی تنظیمات را کامل کرد!</b>", f"👥 دعوت‌های موفق تو: <b>{outcome['total']}</b>"]
+        for grant in outcome.get("grants") or []:
+            plan = get_plan_title(grant.get("plan"))
+            lines.append(f"🎁 پاداش فعال شد: <b>{grant.get('days')} روز پلن {plan}</b> — همین الان قابل استفاده است (/account).")
+        nxt = outcome.get("next")
+        if nxt:
+            left = max(0, int(nxt["count"]) - int(outcome["total"]))
+            lines.append(f"🎯 تا پاداش بعدی ({nxt['title']}) {left} دعوت دیگر مانده — /invite")
+        await self.send(outcome["inviter"], "\n".join(lines))
 
     async def _cmd_start(self, chat_id: str, rest: str = "") -> None:
         await self._ensure_bot_username_cached()
@@ -3105,11 +3647,16 @@ class BotService:
                     from .subscriptions.referrals import ReferralManager
 
                     rm2 = ReferralManager(s, bot_username=self._bot_username())
+                    inviter = await rm2.inviter_of(chat_id)
                     bonus = await rm2.mark_purchase(chat_id, plan.id)
                     await s.commit()
-                    if bonus:
+                    if bonus and inviter:
                         days = bonus[0].get("days", 7)
-                        await self.send(chat_id, f"🎁 پاداش دعوت برای معرف شما ثبت شد: +{days} روز")
+                        await self.send(
+                            inviter,
+                            f"🎁 <b>دوستی که دعوت کرده بودی پلن «{escape(plan.title)}» خرید!</b>\n"
+                            f"برای تشکر، <b>{days} روز</b> به پلن تو اضافه شد — /account",
+                        )
                 except Exception:
                     pass
                 await self._cmd_account(chat_id)
@@ -3140,8 +3687,33 @@ class BotService:
                 pm = await repo.bids_per_month(user_chat_id=chat_id)
                 from .bot_ui import status_card, progress_bar
 
-                exp = user.plan_expires_at.strftime("%Y/%m/%d") if user and user.plan_expires_at else "—"
+                from datetime import datetime, timedelta, timezone
+
+                from .ratelimit import format_wait
+                from .user_sites import plan_sites, user_sites
+
+                now = datetime.now(timezone.utc)
+                if user and user.plan_expires_at:
+                    expires = user.plan_expires_at if user.plan_expires_at.tzinfo else user.plan_expires_at.replace(tzinfo=timezone.utc)
+                    days_left = max(0, (expires - now).days)
+                    exp = f"{expires.strftime('%Y/%m/%d')} ({days_left} روز مانده)" if plan.id != "free" else "—"
+                else:
+                    exp = "بدون انقضا" if plan.id == "free" else "—"
                 usage = {"per_hour": ph, "per_day": pd}
+                from .subscriptions.entitlements import entitlements_for_plan
+
+                ent = entitlements_for_plan(plan)
+                sp = plan_sites(self.store, chat_id, ent)
+                chosen = user_sites(self.store, chat_id)
+                waits: list[str] = []
+                if ph >= plan.limits.max_bids_per_hour:
+                    first = await repo.oldest_bid_since(now - timedelta(hours=1), user_chat_id=str(chat_id))
+                    if first:
+                        waits.append(f"⏳ ظرفیت ساعتی پر است؛ حدود {format_wait((first + timedelta(hours=1) - now).total_seconds())} دیگر آزاد می‌شود.")
+                if pd >= plan.limits.max_bids_per_day:
+                    first = await repo.oldest_bid_since(now - timedelta(days=1), user_chat_id=str(chat_id))
+                    if first:
+                        waits.append(f"⏳ ظرفیت روزانه پر است؛ حدود {format_wait((first + timedelta(days=1) - now).total_seconds())} دیگر آزاد می‌شود.")
                 card = (
                     f"<b>👤 حساب {escape(str(chat_id))}</b>\n"
                     f"{plan.badge} <b>{escape(plan.title)}</b> — {escape(plan.tagline)}\n"
@@ -3153,6 +3725,15 @@ class BotService:
                     f"روزانه: {pd}/{plan.limits.max_bids_per_day} {progress_bar(pd, plan.limits.max_bids_per_day)}\n"
                     f"ماهانه: {pm}/{plan.limits.max_bids_per_month if plan.limits.max_bids_per_month < 999999 else '∞'}\n"
                     f"فاصله ایمن: {plan.limits.min_seconds_between_bids}s\n"
+                    f"{'─'*28}\n"
+                    f"<b>قابلیت‌ها</b>\n"
+                    f"🌐 سایت همزمان: {min(len(chosen), plan.limits.max_active_sites)}/{plan.limits.max_active_sites} — "
+                    + "، ".join(escape(site_label(n)) for n in chosen[: plan.limits.max_active_sites])
+                    + "\n"
+                    f"🔎 بررسی تا {plan.limits.max_projects_per_poll} پروژه در هر دور\n"
+                    + (f"⏸ منتظر ارتقا: {'، '.join(escape(site_label(n)) for n in sp.paused_by_plan)}\n" if sp.paused_by_plan else "")
+                    + ("".join(w + "\n" for w in waits))
+                    + ("\n🎁 ارتقای رایگان با دعوت دوستان: /invite\n" if plan.id == "free" else "")
                 )
                 await self.send(chat_id, status_card(card, plan, usage), self._menu_keyboard())
             await db.dispose()

@@ -663,23 +663,33 @@ async def import_from_pdf(
     text = pdf_text(data)
     result = await import_from_text(text, kind="resume", store=store, chat_id=chat_id)
 
-    data_dir = Path(save_dir) if save_dir else Path("data") / "uploads"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    digest = hashlib.sha1(data).hexdigest()[:8]
-    target = data_dir / f"resume-{stamp}-{digest}.pdf"
-    target.write_bytes(data)
+    # Per privacy/storage policy: do NOT persist PDF on server.
+    # Process in-memory only, delete any temp file after extraction.
+    # We still record filename for UX but not the path.
+    # Old behavior wrote resume-{stamp}-{digest}.pdf to data/uploads - removed.
     if chat_id is not None:
-        from .per_user import update_user
-
-        update_user(store, chat_id, {"profile.resume_path": str(target), "profile.resume_filename": filename})
+        from .per_user import update_user, delete_user
+        # Clear any old stored path if exists (cleanup)
+        try:
+            delete_user(store, chat_id, "profile.resume_path")
+        except Exception:
+            pass
+        # Keep filename for display if needed, but not path
+        try:
+            update_user(store, chat_id, {"profile.resume_filename": filename})
+        except Exception:
+            pass
     else:
-        store.update(
-            {
-                "profile.resume_path": str(target),
-                "profile.resume_filename": filename,
-            }
-        )
+        # Global case - clear old path
+        try:
+            store.delete("profile.resume_path")
+            store.set("profile.resume_filename", filename)
+        except Exception:
+            pass
+        try:
+            store.delete("profile.resume_path")
+        except Exception:
+            pass
     return result
 
 

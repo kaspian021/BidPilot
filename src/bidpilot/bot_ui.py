@@ -207,7 +207,7 @@ def plan_detail_text(plan: Plan) -> str:
         f"{badge_for_plan(plan)} <b>{esc(plan.title)}</b> — <i>{esc(plan.tagline)}</i>\n"
         f"<b>{esc(plan.formatted_price)}</b> <i>· {plan.period_days} روزه · {esc(price_per_day_fa(plan))}</i>\n"
     )
-    site_label = "نامحدود" if plan.limits.max_active_sites > 3 else str(plan.limits.max_active_sites)
+    site_label = str(plan.limits.max_active_sites)
     limits = (
         f"{hr()}\n"
         f"<b>ظرفیت</b>\n"
@@ -284,7 +284,8 @@ def compare_table_text() -> str:
         ("در ساعت", [str(p.limits.max_bids_per_hour) for p in all_plans()]),
         ("در روز", [str(p.limits.max_bids_per_day) for p in all_plans()]),
         ("در ماه", [str(p.limits.max_bids_per_month if p.limits.max_bids_per_month < 999999 else "∞") for p in all_plans()]),
-        ("سایت فعال", [("نامحدود" if p.limits.max_active_sites > 3 else str(p.limits.max_active_sites)) for p in all_plans()]),
+        ("سایت همزمان", [str(p.limits.max_active_sites) for p in all_plans()]),
+        ("پروژه در هر دور", [str(p.limits.max_projects_per_poll) for p in all_plans()]),
         ("فاصله ایمن", [f"{p.limits.min_seconds_between_bids} ثانیه" for p in all_plans()]),
     ]
     for label, vals in rows:

@@ -141,6 +141,33 @@ class ReferralManager:
         # check milestones for inviter
         return await self.check_and_grant_milestones(row.inviter_chat_id)
 
+    async def inviter_of(self, chat_id: str | int) -> str | None:
+        stmt = select(ReferralRow).where(ReferralRow.invitee_chat_id == str(chat_id))
+        row = (await self.session.execute(stmt)).scalars().first()
+        return str(row.inviter_chat_id) if row else None
+
+    async def qualify_invitee(self, chat_id: str | int) -> dict | None:
+        """Like :meth:`mark_setup_complete` but says *who* to tell and where they stand.
+
+        Returns ``None`` when the user was not invited (or was already counted);
+        otherwise ``{"inviter", "total", "grants", "next"}`` so the bot can push a
+        clear "your friend finished setup" message to the inviter.
+        """
+        invitee = str(chat_id)
+        stmt = select(ReferralRow).where(ReferralRow.invitee_chat_id == invitee, ReferralRow.status == "pending")
+        row = (await self.session.execute(stmt)).scalars().first()
+        if not row:
+            return None
+        inviter = str(row.inviter_chat_id)
+        grants = await self.mark_setup_complete(invitee)
+        stats = await self.stats(inviter)
+        return {
+            "inviter": inviter,
+            "total": stats["total_qualified"],
+            "grants": grants,
+            "next": stats["next_milestone"],
+        }
+
     async def mark_purchase(self, chat_id: str | int, plan_id: str) -> list[dict]:
         """When invitee purchases paid plan, grant purchase bonus to inviter."""
         invitee = str(chat_id)

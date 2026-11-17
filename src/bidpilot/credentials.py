@@ -102,46 +102,80 @@ def _clean(value: Any) -> str | None:
     return text or None
 
 
+def is_owner_chat(store: SettingsStore, chat_id: str | int | None) -> bool:
+    """The operator's own chat: the first allowed chat (or a configured admin).
+
+    Only the owner may fall back to the machine-wide ``credentials.<site>.*`` keys.
+    Everybody else must use the account they connected themselves — otherwise a
+    second user without a cookie would silently bid from the owner's marketplace
+    account.
+    """
+    if chat_id is None or not str(chat_id).strip():
+        return True
+    cid = str(chat_id).strip()
+    try:
+        allowed = [str(c) for c in store.get_list("telegram.chat_ids")]
+    except Exception:  # noqa: BLE001
+        allowed = []
+    if not allowed or allowed[0] == cid:
+        return True
+    try:
+        from .admin import is_admin
+
+        return bool(is_admin(cid, store))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def site_credentials(
     site: str,
     store: SettingsStore | None = None,
     *,
     legacy: Mapping[str, Any] | None = None,
     method_default: str = "cookie",
+    chat_id: str | int | None = None,
 ) -> SiteCredentials:
-    """Resolve credentials for ``site`` from the store (+ optional legacy values)."""
+    """Resolve credentials for ``site`` from the store (+ optional legacy values).
+
+    ``chat_id`` (or, failing that, the ambient per-user context) selects the user's
+    own account stored under ``users.<chat>.credentials.<site>.*``.
+    """
     store = store or get_store()
     site = str(site).strip().lower()
-    # Per-user isolation: if current_chat_id is set, check per-user credentials first
-    try:
-        from .per_user import current_chat_id as _ctx_chat
-        _chat = _ctx_chat.get()
-        if _chat:
-            _per_prefix = f"users.{_chat}.credentials.{site}"
-            _pm = _clean(store.get(f"{_per_prefix}.method"))
-            if _pm:
-                method = _pm
-                cookie = _clean(store.get(f"{_per_prefix}.cookie"))
-                username = _clean(store.get(f"{_per_prefix}.username"))
-                password = _clean(store.get(f"{_per_prefix}.password"))
-                headers = store.get(f"{_per_prefix}.headers") or {}
-                cookie_name = _clean(store.get(f"{_per_prefix}.cookie_name")) or DEFAULT_COOKIE_NAME
-                # still allow legacy/env fallback below if not found
-                if method not in METHODS:
-                    method = method_default
-                if method == "cookie" and not cookie and username and password:
-                    method = "credentials"
-                return SiteCredentials(
-                    site=site,
-                    method=method,
-                    cookie=cookie,
-                    username=username,
-                    password=password,
-                    headers=dict(headers) if isinstance(headers, Mapping) else {},
-                    cookie_name=cookie_name,
-                )
-    except Exception:
-        pass
+    chat = str(chat_id).strip() if chat_id is not None and str(chat_id).strip() else None
+    if chat is None:
+        try:
+            from .per_user import current_chat_id as _ctx_chat
+
+            chat = _ctx_chat.get()
+        except Exception:  # noqa: BLE001
+            chat = None
+    if chat:
+        per_prefix = f"users.{chat}.credentials.{site}"
+        own_method = _clean(store.get(f"{per_prefix}.method"))
+        own_cookie = _clean(store.get(f"{per_prefix}.cookie"))
+        own_user = _clean(store.get(f"{per_prefix}.username"))
+        own_password = _clean(store.get(f"{per_prefix}.password"))
+        if own_method or own_cookie or own_user:
+            method = own_method or method_default
+            headers = store.get(f"{per_prefix}.headers") or {}
+            cookie_name = _clean(store.get(f"{per_prefix}.cookie_name")) or DEFAULT_COOKIE_NAME
+            if method not in METHODS:
+                method = method_default
+            if method == "cookie" and not own_cookie and own_user and own_password:
+                method = "credentials"
+            return SiteCredentials(
+                site=site,
+                method=method,
+                cookie=own_cookie,
+                username=own_user,
+                password=own_password,
+                headers=dict(headers) if isinstance(headers, Mapping) else {},
+                cookie_name=cookie_name,
+            )
+        if not is_owner_chat(store, chat):
+            # never borrow somebody else's login: report "no account yet"
+            return SiteCredentials(site=site, method=method_default if method_default in METHODS else "cookie")
     prefix = f"credentials.{site}"
 
     method = _clean(store.get(f"{prefix}.method")) or method_default
@@ -212,6 +246,7 @@ __all__ = [
     "METHODS",
     "SiteCredentials",
     "clear_site_credentials",
+    "is_owner_chat",
     "parse_cookie_header",
     "save_site_credentials",
     "site_credentials",

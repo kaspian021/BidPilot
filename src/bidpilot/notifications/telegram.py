@@ -68,7 +68,7 @@ class TelegramNotifier(Notifier):
                         },
                     )
                 except httpx.HTTPError as exc:
-                    log.error("Telegram send failed: %s", _scrub(exc, self.token))
+                    log.error("Telegram send failed: %s %s", type(exc).__name__, _scrub(exc, self.token))
                     all_ok = False
                     continue
                 if response.status_code >= 400:

@@ -10,6 +10,31 @@ log = logging.getLogger(__name__)
 # Known patterns -> (category, user_message, action)
 _KNOWN: list[tuple[re.Pattern[str], str, str, str]] = [
     (
+        re.compile(r"no column named|OperationalError|ذخیره.?ی محلی", re.IGNORECASE),
+        "local_db",
+        "پیشنهاد در سایت ثبت شد ولی ذخیره‌ی آن در دیتابیس محلی شکست خورد.",
+        "نیازی به ارسال دوباره نیست؛ ربات از روی صفحهٔ سایت تکراری‌ها را تشخیص می‌دهد. ربات را یک‌بار ری‌استارت کن تا دیتابیس خودکار ارتقا یابد.",
+    ),
+    (
+        re.compile(r"دکمه.*ارسال.*(?:پیدا|دیده)", re.IGNORECASE),
+        "submit_button_missing",
+        "فرم پر شد ولی دکمهٔ «ارسال پیشنهاد» در صفحه دیده نشد؛ هیچ پیشنهادی ثبت نشد.",
+        "ربات خودش دوباره تلاش می‌کند. اگر برای همهٔ پروژه‌ها تکرار شد، معمولاً صفحهٔ سایت کند باز می‌شود یا چیدمانش عوض شده؛ "
+        "اسکرین‌شات در data/browser_debug است و برای بررسی بفرستش.",
+    ),
+    (
+        re.compile(r"TargetClosed|browser has been closed|مرورگر.*بسته", re.IGNORECASE),
+        "browser_closed",
+        "مرورگر داخلی ربات وسط ارسال بسته شد؛ پیشنهادی ثبت نشد.",
+        "معمولاً با ری‌استارت ربات یا دور بعدی درست می‌شود. اگر پنجرهٔ Chromium را خودت بستی، دوباره /run بزن.",
+    ),
+    (
+        re.compile(r"پس از کلیک.*(?:هیچ درخواستی|پیام داد)|click_sent_no_request", re.IGNORECASE),
+        "form_rejected",
+        "سایت پس از کلیک روی «ارسال» درخواستی نپذیرفت و پیشنهاد ثبت نشد.",
+        "پیام خود سایت در همین گزارش آمده و اسکرین‌شات در data/browser_debug ذخیره شده است. تا ۴۵ دقیقه همین پروژه دوباره تلاش نمی‌شود.",
+    ),
+    (
         re.compile(r"اشتراک.*(?:پایان|اتمام|منقضی|تمام)", re.IGNORECASE),
         "subscription_expired",
         "اشتراک پارس‌کدرز شما به پایان رسیده است.",
@@ -52,7 +77,7 @@ _KNOWN: list[tuple[re.Pattern[str], str, str, str]] = [
         "در اجرای بعدی خودکار دوباره تلاش می‌شود.",
     ),
     (
-        re.compile(r"پاسخ.*دریافت نشد|timeout|زمان.*تمام", re.IGNORECASE),
+        re.compile(r"پاسخ.*(?:دریافت نشد|نداد|نفرستاد)|timeout|تایم.?اوت|زمان.*تمام", re.IGNORECASE),
         "timeout",
         "پاسخ سایت به موقع دریافت نشد (ممکن است درخواست ثبت شده باشد).",
         "وضعیت پروژه را دستی در سایت بررسی کنید؛ برای جلوگیری از تکرار، دوباره تلاش نشد.",
@@ -137,9 +162,9 @@ async def analyze_with_llm(raw_message: str, llm_client=None, *, system_prompt: 
         )
         system = system_prompt or "تو دستیار پشتیبانی فارسی BidPilot هستی."
         resp = await llm_client.complete(system, prompt, max_tokens=200)
-        import json
+        from .jsonparse import parse_json_object
 
-        data = json.loads(resp.text)
+        data = parse_json_object(resp.text)
         if isinstance(data, dict) and "title" in data:
             return {
                 "category": "llm_analyzed",

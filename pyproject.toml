@@ -28,6 +28,7 @@ dependencies = [
   "orjson>=3.10",
   "PyYAML>=6.0",
   "pypdf>=4.2",
+  "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

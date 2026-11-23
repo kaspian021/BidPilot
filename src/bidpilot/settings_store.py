@@ -5,6 +5,9 @@ a free LLM key, profile, tone of voice, submit mode…) is stored in a single
 JSON document inside ``data/``:
 
 * the directory is ``0700`` and the file is ``0600``;
+* secret leaves (passwords, cookies, tokens, API keys — see
+  :func:`is_secret_key`) are **encrypted at rest** with Fernet
+  (:mod:`bidpilot.vault`); the file alone no longer reveals any account;
 * writes are atomic (temp file + ``os.replace``), so a crash never corrupts it;
 * ``data/`` is already gitignored, so secrets never reach the repository;
 * environment variables remain supported as an *optional* fallback (Docker),
@@ -170,15 +173,38 @@ class SettingsStore:
         if not isinstance(raw, dict):
             raise SettingsError(f"ساختار فایل تنظیمات نامعتبر است: {self.path}")
         values = raw.get("values", raw)
-        self._cache = values if isinstance(values, dict) else {}
-        self._stamp = stamp
+        if not isinstance(values, dict):
+            values = {}
+        # Secrets are encrypted at rest (see bidpilot.vault); callers always
+        # see plain values. A legacy file with plain secrets is rewritten
+        # encrypted once, automatically, on this first read.
+        try:
+            from .vault import decrypt_secrets, has_plaintext_secret
+
+            plain = decrypt_secrets(values, self.path)
+            legacy_plain = has_plaintext_secret(values)
+        except Exception as exc:  # wrong/missing vault key must be loud, not silent
+            raise SettingsError(str(exc)) from exc
+        self._cache, self._stamp = plain, stamp
+        if legacy_plain:
+            try:
+                self._write(plain)
+            except Exception:  # a read-only disk must not break reading
+                self._cache, self._stamp = plain, stamp
         return self._cache
 
     def _write(self, values: dict[str, Any]) -> None:
+        plain_values = _prune_empty(values)
+        try:
+            from .vault import encrypt_secrets
+
+            at_rest = encrypt_secrets(plain_values, self.path)
+        except Exception as exc:
+            raise SettingsError(str(exc)) from exc
         payload: dict[str, Any] = {
             "version": SCHEMA_VERSION,
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "values": _prune_empty(values),
+            "values": at_rest,
         }
         directory = self.path.parent
         try:
@@ -208,7 +234,7 @@ class SettingsStore:
                 pass
         except OSError as exc:
             raise SettingsError(f"ذخیره تنظیمات ناموفق بود ({self.path}): {exc}") from exc
-        self._cache, self._stamp = payload["values"], self._stat()
+        self._cache, self._stamp = plain_values, self._stat()
 
     # ------------------------------------------------------------------- api
     @property

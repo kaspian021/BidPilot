@@ -786,7 +786,14 @@ class BotService:
 
             await self._start_flow(chat_id, "proxy", proxy_questions(self.store))
         elif command == "/market":
-            await self._start_flow(chat_id, "market", marketplace_questions(self.store))
+            from .credentials import is_owner_chat
+
+            if is_owner_chat(self.store, chat_id):
+                await self._start_flow(chat_id, "market", marketplace_questions(self.store))
+            else:
+                from .onboarding import user_marketplace_questions
+
+                await self._start_flow(chat_id, "market", user_marketplace_questions(self.store, chat_id))
         elif command == "/sites":
             await self._cmd_sites(chat_id)
         elif command == "/site":
@@ -1486,7 +1493,7 @@ class BotService:
 
     async def _cmd_check(self, chat_id: str) -> None:
         await self.send(chat_id, "🔐 دارم ورود به حساب سایت را بررسی می‌کنم…")
-        check = await check_site(self.store, config_path=self.config_path)
+        check = await check_site(self.store, config_path=self.config_path, chat_id=chat_id)
         await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
 
     @staticmethod
@@ -2670,7 +2677,7 @@ class BotService:
                     ]
                 },
             )
-        check = await check_site(self.store, config_path=self.config_path)
+        check = await check_site(self.store, config_path=self.config_path, chat_id=chat_id)
         await self.send(chat_id, check.message(), self._run_keyboard() if check.ok else None)
 
     async def _cmd_preview(self, chat_id: str) -> None:
@@ -3224,7 +3231,11 @@ class BotService:
             return
         if flow.name == "user_market_style_pricing":
             await self.send(chat_id, "✅ تنظیمات تکمیلی ذخیره شد.")
-            await self._show_dashboard(chat_id)
+            # this flow also collected the marketplace account, so it owes the
+            # same proof as /market: test the login, keep the password only
+            # when the test passes (verified + encrypted), discard it otherwise
+            if not await self._post_setup(chat_id):
+                await self._show_dashboard(chat_id)
             return
         if flow.mark_complete:
             mark_setup_complete(self.store, complete=not missing_steps(self.store, include_recommended=False))
@@ -3287,16 +3298,68 @@ class BotService:
             return
         await self.send(chat_id, "✅ ذخیره شد.\n\n" + status_text(self.store))
 
-    async def _post_setup(self, chat_id: str) -> None:
-        """Right after setup: prove the login works, then offer «شروع فعالیت»."""
+    async def _post_setup(self, chat_id: str) -> bool:
+        """Right after setup: prove the login works, then offer «شروع فعالیت».
+
+        Only a *successful* test keeps a username/password credential: it is
+        stored encrypted (settings-store vault) and marked verified, so later
+        runs reuse it and never ask for the login method again.  A password
+        whose test fails is discarded instead of being kept on disk.
+
+        Returns True when a login check was actually performed (so callers do
+        not fall through to a generic "all good" dashboard in that case).
+        """
         state = readiness(self.store)
-        if not state["credentials"]:
-            return
+        creds_ready = bool(state["credentials"])
+        if not creds_ready:
+            try:
+                from .credentials import site_credentials as _sc
+                from .per_user import get_user as _gu
+
+                # the site *this chat* picked in its own onboarding, not the
+                # machine-wide default (they can differ for non-owner users)
+                site_name = str(
+                    _gu(self.store, chat_id, "marketplace.name")
+                    or state.get("marketplace")
+                    or "parscoders"
+                )
+                if site_name == "mock":
+                    return False
+                creds_ready = _sc(site_name, self.store, chat_id=chat_id).ready
+            except Exception:  # noqa: BLE001
+                creds_ready = False
+        if not creds_ready:
+            return False
         await self.send(chat_id, "🔐 حالا ورود به حساب سایت را بررسی می‌کنم…")
-        check = await check_site(self.store, config_path=self.config_path)
+        check = await check_site(self.store, config_path=self.config_path, chat_id=chat_id)
         await self.send(chat_id, check.message())
         if not check.ok:
-            return
+            try:
+                from .credentials import discard_unverified_password
+
+                if check.method == "credentials" and discard_unverified_password(
+                    self.store, check.site, chat_id=chat_id
+                ):
+                    await self.send(
+                        chat_id,
+                        "🔐 رمزی که تست ورودش موفق نبود نگه داشته نشد؛ از /market دوباره واردش کن. "
+                        "فقط رمزی ذخیره می‌شود که ورودش همین‌جا تأیید شود.",
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        try:
+            from .credentials import mark_credentials_verified
+
+            mark_credentials_verified(self.store, check.site, chat_id=chat_id, method=check.method)
+        except Exception:  # noqa: BLE001
+            pass
+        if check.method == "credentials":
+            await self.send(
+                chat_id,
+                "🔐 نام کاربری و رمزت با ورود موفق تست شد و به‌صورت <b>رمزنگاری‌شده</b> ذخیره شد؛ "
+                "از این به بعد با زدن «شروع فعالیت» دیگر روش ورود از تو پرسیده نمی‌شود.",
+            )
         await self.send(
             chat_id,
             "همه‌چیز آماده است. با زدن دکمه‌ی زیر، رصد پروژه‌ها و ارسال پیشنهاد شروع می‌شود.",
@@ -3310,6 +3373,7 @@ class BotService:
                 ]
             },
         )
+        return True
 
 
     # ── referral & start with deep link ──────────────────────────

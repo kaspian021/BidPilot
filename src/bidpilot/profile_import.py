@@ -380,7 +380,10 @@ SYSTEM_PROMPT = """تو یک استخراج‌کننده‌ی دقیق اطلا�
   "highlights": ["۲ تا ۴ دستاورد یا نمونه‌کار واقعی، هر کدام یک جمله‌ی کوتاه"],
   "portfolio_url": "لینک گیت‌هاب یا سایت شخصی اگر در متن بود، وگرنه رشته خالی"
 }
-قواعد: حداکثر ۱۲ مورد در stack و ۴ مورد در highlights. هیچ متن اضافه‌ای بیرون JSON ننویس."""
+قواعد: حداکثر ۱۲ مورد در stack و ۴ مورد در highlights. هیچ متن اضافه‌ای بیرون JSON ننویس.
+قاعده‌ی نام (بسیار مهم): نام و نام خانوادگی را دقیقاً با همان رسم‌الخط و همان زبانِ متن اصلی کپی کن؛
+نام فارسی را انگلیسی آوانویسی نکن و نام انگلیسی را فارسی ننویس، املا را اصلاح یا حدس نزن.
+اگر نام را عیناً در متن نمی‌بینی، هر دو فیلد نام را خالی بگذار."""
 
 
 async def analyse_text(
@@ -411,7 +414,10 @@ async def analyse_text(
             payload = None
         if payload:
             result.used_llm = True
-            result.fields = clean_fields(payload, hints=hints)
+            from .identity import lock_extracted_name
+
+            # the resume is the ground truth for the name's spelling/script
+            result.fields = lock_extracted_name(clean_fields(payload, hints=hints), text)
             if result.fields:
                 return result
 
@@ -786,6 +792,13 @@ def save_profile_fields(store: SettingsStore, fields: dict[str, Any], *, source:
                 continue
             updates[f"profile.{key}"] = value
             written[key] = value
+        # a signature carrying another (older) name must not survive a new name
+        new_full = str(updates.get("profile.full_name") or "")
+        if new_full:
+            from .per_user import get_user as _gu
+            old_sig = str(_gu(store, chat_id, "profile.signature") or "")
+            if old_sig and new_full not in old_sig:
+                updates["profile.signature"] = None
         updates["profile.source"] = source
         updates["profile.imported_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         updates["profile.import_error"] = None
@@ -802,6 +815,11 @@ def save_profile_fields(store: SettingsStore, fields: dict[str, Any], *, source:
                 continue
             updates[f"profile.{key}"] = value
             written[key] = value
+        new_full = str(updates.get("profile.full_name") or "")
+        if new_full:
+            old_sig = str(store.get("profile.signature") or "")
+            if old_sig and new_full not in old_sig:
+                updates["profile.signature"] = None
         updates["profile.source"] = source
         updates["profile.imported_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         updates["profile.import_error"] = None  # a good import clears the last failure

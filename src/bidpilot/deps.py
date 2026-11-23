@@ -28,7 +28,12 @@ class Dependency:
 
 
 #: packages that are declared as dependencies but are easy to end up without
-DEPENDENCIES: tuple[Dependency, ...] = (Dependency("pypdf", "pypdf", "خواندن فایل PDF رزومه"),)
+DEPENDENCIES: tuple[Dependency, ...] = (
+    Dependency("pypdf", "pypdf", "خواندن فایل PDF رزومه"),
+    # settings.json secrets are Fernet-encrypted at rest (vault) — a venv
+    # without cryptography can no longer read stored logins at all
+    Dependency("cryptography", "cryptography", "رمزنگاری امن اطلاعات ورود سایت‌ها"),
+)
 
 
 def has(module: str) -> bool:

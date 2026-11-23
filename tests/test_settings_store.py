@@ -37,8 +37,11 @@ def test_roundtrip_and_persistence(tmp_path):
 
     reopened = SettingsStore(path)
     assert reopened.get("telegram.bot_token") == "123:abc"
+    # secrets are encrypted at rest; only non-secret values stay readable
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["values"]["telegram"]["bot_token"] == "123:abc"
+    assert payload["values"]["telegram"]["bot_token"] != "123:abc"
+    assert payload["values"]["telegram"]["bot_token"].startswith("enc:v1:")
+    assert payload["values"]["proposal"]["tone"] == "رسمی"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")

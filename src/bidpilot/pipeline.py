@@ -218,7 +218,9 @@ class BidPipeline:
                     log.exception("Project %s failed", project.uid)
                     await self._rollback_quietly()
                     report.errors.append(f"{project.uid}: {str(exc).strip() or type(exc).__name__}")
-                if report.limit_code in ("hour", "day", "month"):
+                if report.limit_code in ("hour", "day", "month", "gap"):
+                    # gap included: trying the rest of the list now would only
+                    # skip every project against the same safety interval
                     log.info("[PIPELINE][LIMIT] source=%s code=%s stopping the current project batch", source.name, report.limit_code)
                     break
                 if report.authentication_failed or report.javascript_required or report.subscription_required:

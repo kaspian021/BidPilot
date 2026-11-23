@@ -17,11 +17,14 @@ def test_install_command_targets_the_running_interpreter():
 
 
 def test_missing_reports_only_uninstalled_packages(monkeypatch):
-    monkeypatch.setattr(deps, "has", lambda module: module == "pypdf")
+    monkeypatch.setattr(deps, "has", lambda module: True)
     assert deps.missing() == []
 
+    monkeypatch.setattr(deps, "has", lambda module: module == "pypdf")
+    assert [dep.module for dep in deps.missing()] == ["cryptography"]
+
     monkeypatch.setattr(deps, "has", lambda module: False)
-    assert [dep.module for dep in deps.missing()] == ["pypdf"]
+    assert [dep.module for dep in deps.missing()] == ["pypdf", "cryptography"]
 
 
 def test_install_reports_success(monkeypatch):

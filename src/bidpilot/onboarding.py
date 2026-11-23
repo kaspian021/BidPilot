@@ -1238,6 +1238,20 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
             store.set(f"{prefix}.llm.verified", False)
     else:
         store.set(key, value)
+    # changing any login material invalidates its previous live-login proof:
+    # the new password/cookie is only kept as *verified* after a fresh test
+    if ".credentials." in key and key.rsplit(".", 1)[-1] in {"method", "username", "password", "cookie"}:
+        prefix = key.rsplit(".", 1)[0]
+        try:
+            store.update(
+                {
+                    f"{prefix}.verified": None,
+                    f"{prefix}.verified_at": None,
+                    f"{prefix}.verified_method": None,
+                }
+            )
+        except Exception:
+            pass
     reset_secret_cache()
 
 

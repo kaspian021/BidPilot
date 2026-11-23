@@ -9,6 +9,15 @@ own login material, stored under a stable, dotted key:
     credentials.<site>.username
     credentials.<site>.password
     credentials.<site>.headers    extra HTTP headers (dict)
+    credentials.<site>.verified   login was live-tested successfully
+    credentials.<site>.verified_at / .verified_method
+
+All secret values are encrypted at rest by the settings store
+(:mod:`bidpilot.vault`); this module only ever sees plain values in memory.
+A stored password is only *kept* as a verified credential after a real login
+test succeeds — see :func:`mark_credentials_verified` and the bot flow that
+discards an unverified password when the test fails.  Once verified, the
+runner reuses the credential and never asks for the login method again.
 
 Nothing here is site-specific: adding a marketplace never means touching this
 module. Legacy ``.env`` values (``PARSOCODERS_COOKIE`` …) are still honoured as
@@ -58,6 +67,10 @@ class SiteCredentials:
     password: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     cookie_name: str = DEFAULT_COOKIE_NAME
+    #: a real login test (verify_session / check_site) proved these work
+    verified: bool = False
+    verified_at: str | None = None
+    verified_method: str | None = None
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -73,16 +86,22 @@ class SiteCredentials:
         return bool(self.cookie)
 
     @property
+    def verified_ready(self) -> bool:
+        """Stored *and* proven by a live login test — safe to start without asking."""
+        return self.ready and self.verified
+
+    @property
     def summary(self) -> str:
         """Short, secret-free description for /sites and /status."""
         if self.method == "none":
             return "بدون نیاز به ورود"
+        mark = " (ورود تأییدشده 🔐)" if self.verified else ""
         if self.method == "credentials":
             if self.username and self.password:
-                return f"نام کاربری: {self.username} ✅"
+                return f"نام کاربری: {self.username} ✅{mark}"
             return "نام کاربری/رمز ثبت نشده ❌"
         if self.cookie:
-            return "کوکی ثبت شده ✅"
+            return f"کوکی ثبت شده ✅{mark}"
         return "کوکی ثبت نشده ❌"
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -92,6 +111,7 @@ class SiteCredentials:
             "ready": self.ready,
             "username": self.username,
             "has_cookie": bool(self.cookie),
+            "verified": self.verified,
         }
 
 
@@ -172,6 +192,9 @@ def site_credentials(
                 password=own_password,
                 headers=dict(headers) if isinstance(headers, Mapping) else {},
                 cookie_name=cookie_name,
+                verified=bool(store.get(f"{per_prefix}.verified")),
+                verified_at=_clean(store.get(f"{per_prefix}.verified_at")),
+                verified_method=_clean(store.get(f"{per_prefix}.verified_method")),
             )
         if not is_owner_chat(store, chat):
             # never borrow somebody else's login: report "no account yet"
@@ -210,6 +233,9 @@ def site_credentials(
         password=password,
         headers=dict(headers) if isinstance(headers, Mapping) else {},
         cookie_name=cookie_name,
+        verified=bool(store.get(f"{prefix}.verified")),
+        verified_at=_clean(store.get(f"{prefix}.verified_at")),
+        verified_method=_clean(store.get(f"{prefix}.verified_method")),
     )
 
 
@@ -233,12 +259,123 @@ def save_site_credentials(
         if key in values:
             updates[f"credentials.{site}.{key}"] = values[key]
     if updates:
+        # any change to login material invalidates the previous live test
+        for stale in ("verified", "verified_at", "verified_method"):
+            updates[f"credentials.{site}.{stale}"] = None
         store.update(updates)
 
 
 def clear_site_credentials(store: SettingsStore, site: str, fields: tuple[str, ...] = ("cookie",)) -> None:
     for key in fields:
         store.delete(f"credentials.{site}.{key}")
+    for stale in ("verified", "verified_at", "verified_method"):
+        store.delete(f"credentials.{site}.{stale}")
+
+
+# --------------------------------------------------------------- verification
+def _verified_prefixes(store: SettingsStore, site: str, chat_id: str | int | None) -> list[str]:
+    """Store prefixes that may hold this chat's account for ``site`` (own first)."""
+    site = str(site).strip().lower()
+    prefixes: list[str] = []
+    if chat_id is not None and str(chat_id).strip():
+        per = f"users.{str(chat_id).strip()}.credentials.{site}"
+        if any(store.get(f"{per}.{f}") for f in ("method", "cookie", "username", "password")):
+            prefixes.append(per)
+        if not is_owner_chat(store, chat_id):
+            return prefixes
+    prefixes.append(f"credentials.{site}")
+    return prefixes
+
+
+def mark_credentials_verified(
+    store: SettingsStore, site: str, *, chat_id: str | int | None = None, method: str | None = None
+) -> None:
+    """Record that a live login test just succeeded for the stored credential.
+
+    From this point the runner reuses the (encrypted) credential and the user
+    is never asked for the login method / password again, until the material
+    itself changes (which invalidates the mark) or the session really dies.
+    """
+    from datetime import datetime, timezone
+
+    prefixes = _verified_prefixes(store, site, chat_id)
+    if not prefixes:
+        return
+    prefix = prefixes[0]
+    creds = site_credentials(site, store, chat_id=chat_id)
+    updates = {
+        f"{prefix}.verified": True,
+        f"{prefix}.verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        f"{prefix}.verified_method": method or creds.method,
+    }
+    store.update(updates)
+
+
+def invalidate_credentials_verification(
+    store: SettingsStore, site: str, *, chat_id: str | int | None = None
+) -> None:
+    for prefix in _verified_prefixes(store, site, chat_id):
+        store.update(
+            {
+                f"{prefix}.verified": None,
+                f"{prefix}.verified_at": None,
+                f"{prefix}.verified_method": None,
+            }
+        )
+
+
+def discard_unverified_password(
+    store: SettingsStore, site: str, *, chat_id: str | int | None = None
+) -> bool:
+    """Drop a password whose login test failed (username is kept for a retry).
+
+    Implements "we only *store* the password once we have proved it works":
+    an unproven password never stays on disk after its failed test.
+    """
+    removed = False
+    for prefix in _verified_prefixes(store, site, chat_id):
+        if store.get(f"{prefix}.verified"):
+            continue
+        if store.get(f"{prefix}.password"):
+            store.delete(f"{prefix}.password")
+            removed = True
+    return removed
+
+
+def save_verified_site_credentials(
+    store: SettingsStore,
+    site: str,
+    *,
+    chat_id: str | int | None = None,
+    method: str | None = None,
+    **values: Any,
+) -> None:
+    """Persist login material *together with* its successful live-test mark.
+
+    Values land encrypted at rest through the settings store; callers use this
+    only after ``verify_session``/``check_site`` has proved the login works.
+    """
+    from datetime import datetime, timezone
+
+    site = str(site).strip().lower()
+    if chat_id is not None and str(chat_id).strip() and not is_owner_chat(store, chat_id):
+        prefix = f"users.{str(chat_id).strip()}.credentials.{site}"
+    elif chat_id is not None and str(chat_id).strip():
+        # owner: keep the per-user copy when one exists, else the global account
+        per = f"users.{str(chat_id).strip()}.credentials.{site}"
+        prefix = per if any(store.get(f"{per}.{f}") for f in ("method", "cookie", "username")) else f"credentials.{site}"
+    else:
+        prefix = f"credentials.{site}"
+    updates: dict[str, Any] = {}
+    if method:
+        updates[f"{prefix}.method"] = method
+    for key in ("cookie", "username", "password", "headers", "cookie_name"):
+        if key in values:
+            updates[f"{prefix}.{key}"] = values[key]
+    updates[f"{prefix}.verified"] = True
+    updates[f"{prefix}.verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    updates[f"{prefix}.verified_method"] = method or values.get("method") or store.get(f"{prefix}.method") or "credentials"
+    store.update(updates)
 
 
 __all__ = [
@@ -246,8 +383,12 @@ __all__ = [
     "METHODS",
     "SiteCredentials",
     "clear_site_credentials",
+    "discard_unverified_password",
+    "invalidate_credentials_verification",
     "is_owner_chat",
+    "mark_credentials_verified",
     "parse_cookie_header",
     "save_site_credentials",
+    "save_verified_site_credentials",
     "site_credentials",
 ]

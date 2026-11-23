@@ -32,3 +32,6 @@ htmlcov/
 # --- logs ------------------------------------------------------------------
 *.log
 logs/
+
+# --- credential vault key (never commit; back it up with settings.json) ---
+.vault.key

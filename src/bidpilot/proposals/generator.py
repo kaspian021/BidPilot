@@ -12,6 +12,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 from ..config import AppConfig, LLMConfig, Profile, ProposalConfig
+from ..identity import canonical_signature, enforce_identity, identity_issues
 from ..llm_providers import LLMProvider, build_client, resolve_chain
 from ..models import Project, Proposal
 from ..pricing.budget import format_toman
@@ -126,6 +127,7 @@ def validate_proposal(
     *,
     strict_length: bool = True,
     hide_price: bool = False,
+    profile: Profile | None = None,
 ) -> ValidationReport:
     issues: list[str] = []
     stripped = (text or "").strip()
@@ -136,6 +138,9 @@ def validate_proposal(
         return ValidationReport(["خروجی مدل ردّ همکاری (refusal) است، نه متن پیشنهاد؛ نباید ارسال شود."])
     if not stripped.startswith(_SALAM):
         issues.append("متن باید با سلام/وقت بخیر شروع شود.")
+    if profile is not None:
+        # identity lock: the name must be the stored one, character for character
+        issues.extend(identity_issues(stripped, profile))
     if strict_length and len(stripped) < config.min_chars:
         issues.append(f"متن خیلی کوتاه است ({len(stripped)} < {config.min_chars}).")
     if len(stripped) > config.max_chars:
@@ -288,6 +293,9 @@ class ProposalGenerator:
                 continue
 
             text = sanitize_llm_text(response.text)
+            # The name is never the model's to write: force the introduction
+            # and signature to the exact stored name before judging the text.
+            text = enforce_identity(text, self.profile)
             if looks_like_refusal(text):
                 # A refusal means the model refused the *project* itself
                 # (e.g. game cheats). Never repair it — a repaired refusal
@@ -319,7 +327,7 @@ class ProposalGenerator:
                         report_trimmed = validate_proposal(text, self.settings, amount)
                         if not any("خیلی بلند" in i for i in report_trimmed.issues):
                             pass
-            report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
+            report = validate_proposal(text, self.settings, amount, hide_price=hide_price, profile=self.profile)
             if not report.ok and len(text) < 60:
                 # Garbage (a stray word, leaked reasoning): a repair call on a slow free model
                 # costs a minute and rarely works. Go straight to the next provider.
@@ -335,14 +343,14 @@ class ProposalGenerator:
                 try:
                     repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
                     fixed = await self._complete_proposal(client, system, repair)
-                    fixed_text = sanitize_llm_text(fixed.text)
-                    if validate_proposal(fixed_text, self.settings, amount, hide_price=hide_price).ok:
+                    fixed_text = enforce_identity(sanitize_llm_text(fixed.text), self.profile)
+                    if validate_proposal(fixed_text, self.settings, amount, hide_price=hide_price, profile=self.profile).ok:
                         text = fixed_text
                         response = fixed
                 except LLMError as exc:
                     log.warning("Repair pass failed (%s): %s", provider.id, exc)
 
-            final_report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
+            final_report = validate_proposal(text, self.settings, amount, hide_price=hide_price, profile=self.profile)
             if final_report.ok:
                 return Proposal(
                     text=text,
@@ -422,9 +430,7 @@ class ProposalGenerator:
             "amount_fa": to_persian_digits(f"{amount:,}"),
             "delivery_fa": to_persian_digits(f"{delivery_days} روز") if delivery_days else "توافقی",
             "budget_fa": to_persian_digits(project.budget.as_text()) if project.budget else "توافقی",
-            "signature": self.profile.signature
-            or f"با احترام، {self.profile.full_name}"
-            + (f"\n{self.profile.portfolio_url}" if self.profile.portfolio_url else ""),
+            "signature": canonical_signature(self.profile),
         }
 
         limit = int(self.settings.max_chars)
@@ -436,10 +442,10 @@ class ProposalGenerator:
         for candidate in (full_text, *self._bullet_trimmed(full_text, limit), compact_text):
             if not candidate or len(candidate) > limit:
                 continue
-            if validate_proposal(candidate, self.settings, amount, strict_length=False, hide_price=hide_price).ok:
+            if validate_proposal(candidate, self.settings, amount, strict_length=False, hide_price=hide_price, profile=self.profile).ok:
                 return Proposal(text=candidate, generated_by="template", latency_ms=0)
 
-        report = validate_proposal(compact_text, self.settings, amount, strict_length=False, hide_price=hide_price)
+        report = validate_proposal(compact_text, self.settings, amount, strict_length=False, hide_price=hide_price, profile=self.profile)
         if not report.ok:
             raise ProposalError("قالب پیشنهاد معتبر نیست: " + "؛ ".join(report.issues))
         raise ProposalError(

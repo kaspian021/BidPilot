@@ -20,7 +20,12 @@ from .ratelimit import RateLimiter, format_wait, gate_for
 from .repositories import Repository
 from .sources import Source, create_source
 from .sources.base import SourceError
-from .subscriptions.entitlements import Entitlements, describe_change, entitlements_from_session
+from .subscriptions.entitlements import (
+    Entitlements,
+    describe_change,
+    entitlements_from_session,
+    free_entitlements,
+)
 
 log = logging.getLogger(__name__)
 
@@ -114,8 +119,10 @@ class Application:
             await session.commit()
             return found
         except Exception as exc:  # noqa: BLE001 - a broken accounts table must not stop bidding
-            log.warning("could not read the plan of %s (%s); using config limits", user, type(exc).__name__)
-            return None
+            # fail *closed*: a broken plan lookup means free-tier limits and a
+            # single site, never the (higher) machine-wide YAML defaults
+            log.warning("could not read the plan of %s (%s); using free limits", user, type(exc).__name__)
+            return free_entitlements(degraded=True)
         finally:
             await session.close()
 

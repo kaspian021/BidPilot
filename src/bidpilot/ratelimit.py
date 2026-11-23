@@ -143,7 +143,18 @@ class RateLimiter:
                     from_plan=True,
                 )
             except Exception:  # noqa: BLE001 - a broken accounts table must not stop bidding
-                pass
+                from .subscriptions.plans import get_plan
+
+                free = get_plan("free").limits
+                return Limits(
+                    free.max_bids_per_hour,
+                    free.max_bids_per_day,
+                    free.max_bids_per_month,
+                    free.min_seconds_between_bids,
+                    plan_title=get_plan("free").title,
+                    plan_id="free",
+                    from_plan=True,
+                )
         return found
 
     async def _effective_limits(self) -> tuple[int, int, int, int]:
@@ -198,15 +209,20 @@ class RateLimiter:
                 )
 
         if limits.gap > 0:
-            if extra_source:
+            # The plan's gap is per *user*, not per marketplace: with three
+            # sites running at once, "۶۰ ثانیه فاصله بین پیشنهادها" must mean
+            # 60 s between any two bids of this user — otherwise a Pro user
+            # could fire three bids in the same second (one per site) and the
+            # paid limit would exist only on paper.
+            if extra:
                 return RateDecision(
                     False,
-                    f"پیشنهاد دیگری روی همین سایت در حال ارسال است؛ فاصلهٔ ایمن {limits.gap} ثانیه رعایت می‌شود.",
+                    f"پیشنهاد دیگری از همین کاربر در حال ارسال است؛ فاصلهٔ ایمن {limits.gap} ثانیه رعایت می‌شود.",
                     "gap",
                     limits.gap,
                     limits.gap,
                 )
-            last = await self.repo.last_bid_at(user_chat_id=user, source=source)
+            last = await self.repo.last_bid_at(user_chat_id=user)
             if last is not None:
                 elapsed = time.time() - last.timestamp()
                 if elapsed < limits.gap:

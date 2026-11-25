@@ -198,4 +198,134 @@ def build_browser_debug_archive(
         raise
 
 
-__all__ = ["browser_debug_stats", "build_browser_debug_archive"]
+def build_browser_debug_archives(
+    root: str | Path = _DEFAULT_ROOT,
+    *,
+    max_files: int = _MAX_FILES,
+    max_total_bytes: int = _MAX_TOTAL_BYTES,
+) -> tuple[list[tuple[Path, dict[str, Any]]], dict[str, Any]]:
+    """Split the complete diagnostic directory into Telegram-safe ZIP volumes.
+
+    Every supported file is placed in one volume unless it individually exceeds
+    the per-volume byte budget or cannot be read. This avoids silently omitting
+    older screenshots when the diagnostics folder grows over time.
+    """
+    directory = Path(root)
+    stats = browser_debug_stats(directory)
+    if stats["count"] == 0:
+        return [], stats
+
+    file_limit = max(1, min(int(max_files), 250))
+    byte_limit = max(1, int(max_total_bytes))
+    candidates: list[tuple[Path, int]] = []
+    skipped_oversize = 0
+    for item in directory.iterdir():
+        try:
+            if item.is_symlink() or not item.is_file() or item.suffix.lower() not in _ALLOWED_SUFFIXES:
+                continue
+            size = item.stat().st_size
+            if size > byte_limit:
+                skipped_oversize += 1
+                continue
+            candidates.append((item, size))
+        except OSError:
+            skipped_oversize += 1
+    candidates.sort(key=lambda pair: pair[0].stat().st_mtime, reverse=True)
+
+    batches: list[list[Path]] = []
+    current: list[Path] = []
+    current_bytes = 0
+    for item, size in candidates:
+        if current and (len(current) >= file_limit or current_bytes + size > byte_limit):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(item)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    if not batches:
+        return [], {**stats, "skipped": skipped_oversize}
+
+    archives: list[tuple[Path, dict[str, Any]]] = []
+    total_parts = len(batches)
+    failed_reads = 0
+    try:
+        for part_number, batch in enumerate(batches, start=1):
+            handle = tempfile.NamedTemporaryFile(
+                prefix=f"bidpilot-browser-debug-{part_number:02d}-",
+                suffix=".zip",
+                delete=False,
+            )
+            archive_path = Path(handle.name)
+            handle.close()
+            included: list[str] = []
+            included_bytes = 0
+            try:
+                with zipfile.ZipFile(
+                    archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+                ) as archive:
+                    for item in batch:
+                        try:
+                            suffix = item.suffix.lower()
+                            if suffix in {".html", ".htm"}:
+                                data = _safe_html(
+                                    item.read_text(encoding="utf-8", errors="replace")
+                                ).encode("utf-8")
+                                archive.writestr(item.name, data)
+                            elif suffix == ".json":
+                                data = _safe_json(
+                                    item.read_text(encoding="utf-8", errors="replace")
+                                ).encode("utf-8")
+                                archive.writestr(item.name, data)
+                            else:
+                                archive.write(item, arcname=item.name)
+                            included.append(item.name)
+                            included_bytes += item.stat().st_size
+                        except OSError:
+                            failed_reads += 1
+                    manifest = {
+                        "product": "BidPilot",
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "part": part_number,
+                        "total_parts": total_parts,
+                        "redaction": (
+                            "HTML input values, textarea/editor contents, scripts, query strings "
+                            "and secret-like JSON keys are redacted."
+                        ),
+                        "files": included,
+                        "included_source_bytes": included_bytes,
+                        "skipped_files": skipped_oversize + failed_reads,
+                    }
+                    archive.writestr(
+                        "manifest.json",
+                        json.dumps(manifest, ensure_ascii=False, indent=2),
+                    )
+                if not included:
+                    archive_path.unlink(missing_ok=True)
+                    continue
+                archives.append((
+                    archive_path,
+                    {
+                        **stats,
+                        "part": part_number,
+                        "total_parts": total_parts,
+                        "included": len(included),
+                        "included_files": included,
+                        "included_bytes": included_bytes,
+                        "skipped": skipped_oversize + failed_reads,
+                        "archive_bytes": archive_path.stat().st_size,
+                        "archive": str(archive_path),
+                    },
+                ))
+            except Exception:
+                archive_path.unlink(missing_ok=True)
+                raise
+    except Exception:
+        for archive_path, _ in archives:
+            archive_path.unlink(missing_ok=True)
+        raise
+    return archives, {**stats, "parts": len(archives), "skipped": skipped_oversize + failed_reads}
+
+
+__all__ = ["browser_debug_stats", "build_browser_debug_archive", "build_browser_debug_archives"]

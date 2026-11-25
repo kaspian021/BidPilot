@@ -617,13 +617,13 @@ async def _find_submitter(
                     seen[label] = "پنهان"
                     continue
                 if require_association:
-                    associated = await loc.evaluate(
-                        """(el, formId) => {
+                    associated_form_id = await loc.evaluate(
+                        """(el) => {
                           const owner = el.form || el.closest("form");
-                          return Boolean(owner && owner.id === formId);
-                        }""",
-                        form_id,
+                          return owner ? String(owner.id || "") : "";
+                        }"""
                     )
+                    associated = bool(form_id) and associated_form_id == form_id
                     if not associated:
                         seen[label] = "به فرم متصل نیست"
                         continue

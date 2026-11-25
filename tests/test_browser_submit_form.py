@@ -50,6 +50,20 @@ f.addEventListener('input', refresh); f.addEventListener('change', refresh);
 function refresh(){ document.getElementById('msg_submit_btn').disabled = !f.checkValidity(); }
 const mode = new URLSearchParams(location.search).get('mode') || 'plain';
 if (mode === 'no-open') document.getElementById('open').removeAttribute('onclick');
+if (mode === 'anchor-open') {
+  const opener = document.getElementById('open');
+  const link = document.createElement('a');
+  link.id = 'open-anchor';
+  link.className = 'bid-send--button';
+  link.href = '#panel';
+  link.textContent = 'ارسال پیشنهاد';
+  link.addEventListener('click', event => {
+    event.preventDefault();
+    document.getElementById('panel').style.display = 'block';
+    setTimeout(() => document.getElementById('panel').style.transform = 'none', 20);
+  });
+  opener.replaceWith(link);
+}
 if (mode === 'external-submit') {
   const submit = document.getElementById('msg_submit_btn');
   f.after(submit);
@@ -262,6 +276,19 @@ async def test_images_and_trackers_are_not_downloaded(site, tmp_path):
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.SUBMITTED, result.message
     assert "/pixel.png" not in HITS
+
+
+@pytest.mark.asyncio
+async def test_anchor_based_bid_opener_with_same_page_href_is_supported(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=anchor-open")
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    assert RECEIVED[0]["path"] == "/conversation/ajax/bid-send/777"
 
 
 @pytest.mark.asyncio

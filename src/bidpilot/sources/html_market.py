@@ -899,7 +899,11 @@ class HtmlMarketSource(Source):
         project: Project,
     ) -> tuple[Any, dict[str, Any], str] | None:
         """GET the «ارسال پیشنهاد» target once and look for the real form there."""
-        cta_url = parser.find_proposal_cta_url(html, page_url, str(project.external_id))
+        cta_url = parser.find_proposal_cta_url(
+            html,
+            page_url,
+            str(project.external_id) if self.name.casefold() == "parscoders" else None,
+        )
         if not cta_url or urlsplit(cta_url).path == urlsplit(page_url).path:
             return None
         log.info(

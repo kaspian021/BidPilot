@@ -508,11 +508,15 @@ async def _find_open_form_cta(
             f'button.bid-send--button[data-project-id="{project_id}"]:visible',
             f'a.bid-send--button[data-project-id="{project_id}"]:visible',
             f'[role="button"][data-project-id="{project_id}"]:visible',
+            f'[data-project-id="{project_id}"]:visible',
             "button.bid-send--button:visible",
             "a.bid-send--button:visible",
             f'button[data-href$="{endpoint}"]:visible',
+            f'a[data-href$="{endpoint}"]:visible',
             f'button[data-url$="{endpoint}"]:visible',
+            f'a[data-url$="{endpoint}"]:visible',
             f'button[data-action$="{endpoint}"]:visible',
+            f'a[data-action$="{endpoint}"]:visible',
         ]
     for selector in selectors:
         try:

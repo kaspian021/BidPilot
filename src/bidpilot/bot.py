@@ -2214,34 +2214,49 @@ class BotService:
                 )
                 return
             if action == "download":
-                from .debug_bundle import build_browser_debug_archive
-                archive_path = None
+                from .debug_bundle import build_browser_debug_archives
+
+                archives = []
                 try:
                     root = self.store.get("admin.browser_debug_dir") or "data/browser_debug"
-                    archive_path, stats = build_browser_debug_archive(root)
-                    if archive_path is None:
+                    archives, stats = build_browser_debug_archives(root)
+                    if not archives:
                         await self.send(
                             chat_id,
-                            "📭 هنوز فایل عیب‌یابی وجود ندارد. ثبت عیب‌یابی را روشن نگه دار، یک بار اجرای ارسال را انجام بده و پس از بروز خطا دوباره این دکمه را بزن.",
+                            "📭 هنوز فایل عیب‌یابی قابل دریافت وجود ندارد. ثبت عیب‌یابی را روشن نگه دار، یک بار اجرای ارسال را انجام بده و پس از بروز خطا دوباره این دکمه را بزن.",
                             admin_ui.debug_keyboard(self.store),
                         )
                         return
-                    await self.api.send_document(
-                        chat_id,
-                        archive_path,
-                        caption=(
-                            f"🧪 BidPilot browser diagnostics · {stats['included']} فایل · "
-                            f"{stats['size_mb']} MB منبع · خروجی ZIP پاک‌سازی‌شده"
-                        ),
-                        filename="bidpilot-browser-debug.zip",
-                    )
-                    self._log_admin_action(
-                        chat_id, "debug:download", files=str(stats["included"]),
-                        archive_bytes=str(stats["archive_bytes"]),
-                    )
+                    total_files = 0
+                    for index, (archive_path, part_stats) in enumerate(archives, start=1):
+                        part_count = len(archives)
+                        filename = (
+                            "bidpilot-browser-debug.zip"
+                            if part_count == 1
+                            else f"bidpilot-browser-debug-{index:02d}-of-{part_count:02d}.zip"
+                        )
+                        await self.api.send_document(
+                            chat_id,
+                            archive_path,
+                            caption=(
+                                f"🧪 BidPilot browser diagnostics · بخش {index}/{part_count} · "
+                                f"{part_stats['included']} فایل · ZIP پاک‌سازی‌شده"
+                            ),
+                            filename=filename,
+                        )
+                        total_files += int(part_stats["included"])
+                        self._log_admin_action(
+                            chat_id,
+                            "debug:download",
+                            part=f"{index}/{part_count}",
+                            files=str(part_stats["included"]),
+                            archive_bytes=str(part_stats["archive_bytes"]),
+                        )
+                    skipped = int(stats.get("skipped") or 0)
+                    suffix = f" {skipped} فایل به‌دلیل عبور از سقف حجم یا خطای خواندن جا ماند." if skipped else ""
                     await self.send(
                         chat_id,
-                        f"✅ بسته عیب‌یابی ارسال شد؛ {stats['included']} فایل در ZIP قرار گرفت.",
+                        f"✅ {len(archives)} بسته عیب‌یابی شامل {total_files} فایل ارسال شد.{suffix}",
                         admin_ui.debug_keyboard(self.store),
                     )
                 except Exception as exc:
@@ -2252,10 +2267,9 @@ class BotService:
                         admin_ui.debug_keyboard(self.store),
                     )
                 finally:
-                    if archive_path is not None:
+                    for archive_path, _part_stats in archives:
                         archive_path.unlink(missing_ok=True)
                 return
-            await self.send(chat_id, admin_ui.debug_text(self.store), admin_ui.debug_keyboard(self.store))
             return
         if cmd.startswith("adv:"):
             sub = cmd.split(":")[1]

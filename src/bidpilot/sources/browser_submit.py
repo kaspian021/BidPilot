@@ -548,7 +548,7 @@ async def _find_open_form_cta(
         # Text-only fallback is allowed only on the matching project-detail
         # page and only when there is exactly one visible button. Links in
         # recommendation cards are deliberately not clicked.
-        page_id_match = re.fullmatch(r"/project/(\\d+)(?:/[^/]+)?/?", urlsplit(current_url).path)
+        page_id_match = re.fullmatch(r"/project/(\d+)(?:/[^/]+)?/?", urlsplit(current_url).path)
         if page_id_match and page_id_match.group(1) == str(project_id):
             try:
                 buttons = page.locator("button:visible").filter(has_text=re.compile("ارسال پیشنهاد"))
@@ -691,51 +691,6 @@ def _failure(
     )
 
 
-async def _find_submitter(
-    page: Any, form: Any, submitter_id: str, endpoint_attribute: str, endpoint_url: str
-) -> tuple[Any | None, str]:
-    """Locate the visible submit button, waiting for slow pages and trying fallbacks.
-
-    Returns ``(locator, "")`` or ``(None, short diagnosis)``. The old code looked once,
-    right after filling, and gave up if the button was momentarily hidden (layout still
-    settling, offcanvas animation, validator re-rendering); on slow connections that
-    discarded a fully filled form.
-    """
-    candidates: list[tuple[str, Any]] = []
-    if submitter_id:
-        candidates.append(("id", form.locator(_attr_selector("id", submitter_id)).first))
-    else:
-        candidates.append(
-            ("endpoint", form.locator(_attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)).first)
-        )
-    candidates.append(("type=submit", form.locator("button[type=submit], input[type=submit]").first))
-    candidates.append(("text", form.locator("button, input[type=button]").filter(has_text="ارسال").first))
-
-    seen: dict[str, str] = {}
-    for _ in range(8):  # ~6s in total
-        for label, loc in candidates:
-            try:
-                count = await loc.count()
-                if not count:
-                    seen[label] = "پیدا نشد"
-                    continue
-                try:
-                    await loc.scroll_into_view_if_needed(timeout=1500)
-                except Exception:  # noqa: BLE001
-                    pass
-                if await loc.is_visible():
-                    return loc, ""
-                seen[label] = "پنهان"
-            except Exception as exc:  # noqa: BLE001
-                seen[label] = type(exc).__name__
-        await page.wait_for_timeout(750)
-    try:
-        form_visible = await form.is_visible()
-    except Exception:  # noqa: BLE001
-        form_visible = None
-    detail = "، ".join(f"{k}: {v}" for k, v in seen.items())
-    return None, f"{detail}؛ فرم {'نمایان' if form_visible else 'پنهان'}"
-
 
 async def _submit_once(
     *,
@@ -781,7 +736,7 @@ async def _submit_once(
     if not endpoint_parts.path.strip("/"):
         return _failure("مسیر ارسال فرم خالی است؛ هیچ درخواستی فرستاده نشد.", debug=safe_debug)
     if source_name.casefold() == "parscoders":
-        page_match = re.fullmatch(r"/project/(\\d+)(?:/[^/]+)?/?", page_parts.path)
+        page_match = re.fullmatch(r"/project/(\d+)(?:/[^/]+)?/?", page_parts.path)
         if not str(project_id).isdigit() or not page_match or page_match.group(1) != str(project_id):
             return _failure(
                 "آدرس مرورگر، شناسه پروژه و مقصد ارسال با هم تطابق ندارند؛ هیچ درخواستی انجام نشد.",

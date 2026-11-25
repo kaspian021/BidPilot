@@ -147,7 +147,7 @@ def test_parscoders_card_ignores_bookmark_link_and_skips_action_only_cards():
     """
     settings = {
         "card_selectors": [".project-list-item"],
-        "id_regex": r"/project/(\\d+)",
+        "id_regex": r"/project/(\d+)",
         "fields": {"title": [".missing-title"], "link": [".missing-link"]},
     }
     projects = parser.parse_list_page(html, settings, "parscoders", "https://parscoders.com")

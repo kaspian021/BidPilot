@@ -508,6 +508,8 @@ async def _find_open_form_cta(
             f'button.bid-send--button[data-project-id="{project_id}"]:visible',
             f'a.bid-send--button[data-project-id="{project_id}"]:visible',
             f'[role="button"][data-project-id="{project_id}"]:visible',
+            "button.bid-send--button:visible",
+            "a.bid-send--button:visible",
             f'button[data-href$="{endpoint}"]:visible',
             f'button[data-url$="{endpoint}"]:visible',
             f'button[data-action$="{endpoint}"]:visible',
@@ -535,8 +537,20 @@ async def _find_open_form_cta(
                         continue
                     target = attrs["href"] or attrs["dataHref"]
                     if target:
-                        path = urlsplit(urljoin(current_url, target)).path.rstrip("/")
-                        if path not in {f"/project/{project_id}", f"/conversation/ajax/bid-send/{project_id}"}:
+                        target_path = urlsplit(urljoin(current_url, target)).path.rstrip("/")
+                        current_path = urlsplit(current_url).path.rstrip("/")
+                        allowed_paths = {
+                            f"/project/{project_id}",
+                            current_path,
+                            f"/conversation/ajax/bid-send/{project_id}",
+                        }
+                        if target_path not in allowed_paths:
+                            continue
+                    elif not attrs["projectId"]:
+                        # An ID-less class-based opener is safe only when it is
+                        # the sole visible CTA of this class on this validated
+                        # project-detail page.
+                        if "bid-send--button" not in selector or await group.count() != 1:
                             continue
                     if not attrs["clickable"]:
                         continue

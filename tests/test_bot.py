@@ -1,4 +1,6 @@
+import io
 import shutil
+import zipfile
 from pathlib import Path
 
 from bidpilot.bot import BotService
@@ -14,12 +16,16 @@ class FakeAPI:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, dict | None]] = []
         self.answered: list[str] = []
+        self.documents: list[tuple[str, str, bytes, str]] = []
 
     async def send_message(self, chat_id, text, *, reply_markup=None, parse_mode="HTML"):
         self.sent.append((str(chat_id), text, reply_markup))
 
     async def answer_callback(self, callback_id, text=""):
         self.answered.append(callback_id)
+
+    async def send_document(self, chat_id, file_path, *, caption="", filename=None):
+        self.documents.append((str(chat_id), caption, Path(file_path).read_bytes(), filename or Path(file_path).name))
 
     @property
     def last_text(self) -> str:
@@ -583,3 +589,52 @@ def test_a_telegram_outage_does_not_kill_the_command(tmp_path, monkeypatch):
 
     asyncio.run(service.handle_command("777", "/status", ""))  # must not raise
     assert "All connection attempts failed" in service._last_send_error
+
+
+async def test_admin_browser_debug_menu_can_toggle_and_download_safe_zip(tmp_path, monkeypatch):
+    service, api, store = make_service(tmp_path, monkeypatch)
+    debug_dir = tmp_path / "browser_debug"
+    debug_dir.mkdir()
+    (debug_dir / "failure.html").write_text(
+        '<form><input name="_token" value="csrf-secret">'
+        '<textarea>private proposal text</textarea>'
+        '<button id="msg_submit_btn">ارسال پیشنهاد</button></form>',
+        encoding="utf-8",
+    )
+    (debug_dir / "failure.json").write_text(
+        '{"project_id":"123","cookie":"session-secret"}',
+        encoding="utf-8",
+    )
+    (debug_dir / "failure.png").write_bytes(b"png-data")
+    store.set("admin.browser_debug_dir", str(debug_dir))
+
+    admin_id = "7806301378"
+    await service._handle_admin_callback(admin_id, "admin:debug")
+    assert "عیب‌یابی ارسال پیشنهاد" in api.last_text
+    assert api.sent[-1][2]["inline_keyboard"][0][0]["callback_data"] == "admin:debug:download"
+
+    await service._handle_admin_callback(admin_id, "admin:debug:toggle")
+    assert store.get_bool("admin.browser_debug_enabled") is False
+    await service._handle_admin_callback(admin_id, "admin:debug:toggle")
+    assert store.get_bool("admin.browser_debug_enabled") is True
+
+    await service._handle_admin_callback(admin_id, "admin:debug:download")
+    assert len(api.documents) == 1
+    sent_chat, caption, raw_zip, filename = api.documents[0]
+    assert sent_chat == admin_id
+    assert filename == "bidpilot-browser-debug.zip"
+    assert "پاک‌سازی‌شده" in caption
+    with zipfile.ZipFile(io.BytesIO(raw_zip)) as archive:
+        html = archive.read("failure.html").decode("utf-8")
+        data = archive.read("failure.json").decode("utf-8")
+        assert "csrf-secret" not in html
+        assert "private proposal text" not in html
+        assert "session-secret" not in data
+        assert "failure.png" in archive.namelist()
+
+
+async def test_non_admin_cannot_open_browser_debug_menu(tmp_path, monkeypatch):
+    service, api, store = make_service(tmp_path, monkeypatch)
+    await service._handle_admin_callback("999", "admin:debug")
+    assert "فقط برای ادمین" in api.last_text
+    assert not api.documents

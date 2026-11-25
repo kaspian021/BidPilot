@@ -27,27 +27,27 @@ _MAX_SINGLE_FILE_BYTES = 10 * 1024 * 1024
 def _safe_html(source: str) -> str:
     """Redact values from old as well as newly-created browser snapshots."""
     text = str(source or "")
-    text = re.sub(r"(?is)<script\\b[^>]*>.*?</script\\s*>", "<script>/* omitted */</script>", text)
-    text = re.sub(r"(?is)<noscript\\b[^>]*>.*?</noscript\\s*>", "", text)
+    text = re.sub(r"(?is)<script\b[^>]*>.*?</script\s*>", "<script>/* omitted */</script>", text)
+    text = re.sub(r"(?is)<noscript\b[^>]*>.*?</noscript\s*>", "", text)
     text = re.sub(
-        r"(?is)(<textarea\\b[^>]*>).*?(</textarea\\s*>)",
-        r"\\1[REDACTED]\\2",
+        r"(?is)(<textarea\b[^>]*>).*?(</textarea\s*>)",
+        r"\1[REDACTED]\2",
         text,
     )
 
     def redact_input(match: re.Match[str]) -> str:
         tag = match.group(0)
         tag = re.sub(
-            r"""(?i)(\\bvalue\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s>]+)""",
-            r'\\1"[REDACTED]"',
+            r"""(?i)(\bvalue\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+            r'\1"[REDACTED]"',
             tag,
         )
         return tag
 
-    text = re.sub(r"(?is)<input\\b[^>]*>", redact_input, text)
+    text = re.sub(r"(?is)<input\b[^>]*>", redact_input, text)
     text = re.sub(
-        r"""(?i)(<meta\\b[^>]*(?:csrf|token)[^>]*\\bcontent\\s*=\\s*)(["']).*?\\2""",
-        r'\\1"[REDACTED]"',
+        r"""(?i)(<meta\b[^>]*(?:csrf|token)[^>]*\bcontent\s*=\s*)(["']).*?\2""",
+        r'\1"[REDACTED]"',
         text,
     )
 
@@ -61,7 +61,7 @@ def _safe_html(source: str) -> str:
         return prefix + quote + safe + quote
 
     text = re.sub(
-        r"""(?i)(\\b(?:href|action|data-href|data-url|data-action)\\s*=\\s*)(["'])(.*?)\\2""",
+        r"""(?i)(\b(?:href|action|data-href|data-url|data-action)\s*=\s*)(["'])(.*?)\2""",
         strip_url,
         text,
         flags=re.DOTALL,

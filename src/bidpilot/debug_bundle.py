@@ -52,6 +52,15 @@ def _safe_html(source: str) -> str:
 
     text = re.sub(r"(?is)<input\b[^>]*>", redact_input, text)
     text = re.sub(
+        r"""(?is)<option\\b[^>]*>""",
+        lambda match: re.sub(
+            r"""(?i)(\\bvalue\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s>]+)""",
+            r'\\1"[REDACTED]"',
+            match.group(0),
+        ),
+        text,
+    )
+    text = re.sub(
         r"""(?i)(<meta\b[^>]*(?:csrf|token)[^>]*\bcontent\s*=\s*)(["']).*?\2""",
         r'\1"[REDACTED]"',
         text,
@@ -67,7 +76,7 @@ def _safe_html(source: str) -> str:
         return prefix + quote + safe + quote
 
     text = re.sub(
-        r"""(?i)(\b(?:href|action|data-href|data-url|data-action)\s*=\s*)(["'])(.*?)\2""",
+        r"""(?i)(\b(?:href|action|src|data-href|data-url|data-action)\s*=\s*)(["'])(.*?)\2""",
         strip_url,
         text,
         flags=re.DOTALL,

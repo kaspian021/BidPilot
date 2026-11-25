@@ -2196,6 +2196,81 @@ class BotService:
         if cmd == "advanced":
             await self.send(chat_id, admin_ui.advanced_text(self.store), admin_ui.advanced_keyboard())
             return
+        if cmd == "debug":
+            await self.send(chat_id, admin_ui.debug_text(self.store), admin_ui.debug_keyboard(self.store))
+            return
+        if cmd.startswith("debug:"):
+            action = cmd.split(":")[1]
+            if action == "toggle":
+                current_value = self.store.get("admin.browser_debug_enabled")
+                current = True if current_value is None else self.store.get_bool("admin.browser_debug_enabled")
+                enabled = not current
+                self.store.set("admin.browser_debug_enabled", enabled)
+                self._log_admin_action(chat_id, "debug:toggle", enabled=str(enabled))
+                await self.send(
+                    chat_id,
+                    f"{'🟢 ثبت عیب‌یابی مرورگر فعال شد' if enabled else '🔴 ثبت عیب‌یابی مرورگر خاموش شد'}",
+                    admin_ui.debug_keyboard(self.store),
+                )
+                return
+            if action == "download":
+                from .debug_bundle import build_browser_debug_archives
+
+                archives = []
+                try:
+                    root = self.store.get("admin.browser_debug_dir") or "data/browser_debug"
+                    archives, stats = build_browser_debug_archives(root)
+                    if not archives:
+                        await self.send(
+                            chat_id,
+                            "📭 هنوز فایل عیب‌یابی قابل دریافت وجود ندارد. ثبت عیب‌یابی را روشن نگه دار، یک بار اجرای ارسال را انجام بده و پس از بروز خطا دوباره این دکمه را بزن.",
+                            admin_ui.debug_keyboard(self.store),
+                        )
+                        return
+                    total_files = 0
+                    for index, (archive_path, part_stats) in enumerate(archives, start=1):
+                        part_count = len(archives)
+                        filename = (
+                            "bidpilot-browser-debug.zip"
+                            if part_count == 1
+                            else f"bidpilot-browser-debug-{index:02d}-of-{part_count:02d}.zip"
+                        )
+                        await self.api.send_document(
+                            chat_id,
+                            archive_path,
+                            caption=(
+                                f"🧪 BidPilot browser diagnostics · بخش {index}/{part_count} · "
+                                f"{part_stats['included']} فایل · ZIP پاک‌سازی‌شده"
+                            ),
+                            filename=filename,
+                        )
+                        total_files += int(part_stats["included"])
+                        self._log_admin_action(
+                            chat_id,
+                            "debug:download",
+                            part=f"{index}/{part_count}",
+                            files=str(part_stats["included"]),
+                            archive_bytes=str(part_stats["archive_bytes"]),
+                        )
+                    skipped = int(stats.get("skipped") or 0)
+                    suffix = f" {skipped} فایل به‌دلیل عبور از سقف حجم یا خطای خواندن جا ماند." if skipped else ""
+                    await self.send(
+                        chat_id,
+                        f"✅ {len(archives)} بسته عیب‌یابی شامل {total_files} فایل ارسال شد.{suffix}",
+                        admin_ui.debug_keyboard(self.store),
+                    )
+                except Exception as exc:
+                    log.exception("browser diagnostic archive download failed")
+                    await self.send(
+                        chat_id,
+                        f"❌ ساخت یا ارسال بسته عیب‌یابی ناموفق بود: {escape(str(exc)[:250])}",
+                        admin_ui.debug_keyboard(self.store),
+                    )
+                finally:
+                    for archive_path, _part_stats in archives:
+                        archive_path.unlink(missing_ok=True)
+                return
+            return
         if cmd.startswith("adv:"):
             sub = cmd.split(":")[1]
             if sub == "logs":

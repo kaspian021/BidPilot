@@ -899,7 +899,7 @@ class HtmlMarketSource(Source):
         project: Project,
     ) -> tuple[Any, dict[str, Any], str] | None:
         """GET the «ارسال پیشنهاد» target once and look for the real form there."""
-        cta_url = parser.find_proposal_cta_url(html, page_url)
+        cta_url = parser.find_proposal_cta_url(html, page_url, str(project.external_id))
         if not cta_url or urlsplit(cta_url).path == urlsplit(page_url).path:
             return None
         log.info(
@@ -949,6 +949,21 @@ class HtmlMarketSource(Source):
                 f"اعتبارنامه {self.name} تنظیم نشده است؛ در تلگرام «/market» را بزن "
                 "و کوکی یا نام کاربری/رمز را وارد کن."
             )
+
+        if self.name.casefold() == "parscoders":
+            project_id = str(project.external_id or "")
+            if not project_id.isdigit():
+                return self.fail(
+                    "شناسه پروژه پارس‌کدرز معتبر نیست؛ لینک‌های عملیاتی مثل نشان‌کردن یا شناسه ساختگی "
+                    "اجازه ورود به صف ارسال ندارند."
+                )
+            if project.url:
+                url_project_id = parser.parscoders_project_id(project.url)
+                if url_project_id != project_id:
+                    return self.fail(
+                        "لینک پروژه و شناسه آن با هم تطابق ندارند؛ برای جلوگیری از پیشنهاد روی پروژه اشتباه "
+                        "ارسال متوقف شد."
+                    )
 
         bid_cfg = self.settings.get("bid") or {}
         detail_path = (self.settings.get("detail") or {}).get("path", "{external_id}")

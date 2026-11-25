@@ -457,7 +457,7 @@ async def _dump_debug(
                 for (const attr of [...el.attributes]) {
                   if (/(token|csrf|password|secret|cookie|api.?key)/i.test(attr.name)) {
                     el.setAttribute(attr.name, "[REDACTED]");
-                  } else if (["href","action","data-href","data-url","data-action"].includes(attr.name.toLowerCase())) {
+                  } else if (["href","action","src","data-href","data-url","data-action"].includes(attr.name.toLowerCase())) {
                     try {
                       const u = new URL(attr.value, location.href);
                       el.setAttribute(attr.name, u.pathname);

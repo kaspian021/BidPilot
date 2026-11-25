@@ -1454,7 +1454,7 @@ def find_proposal_cta_url(
         if login_path.search(path):
             continue
         if project_id:
-            path_ids = re.findall(r"(?:^|/)(\\d+)(?:/|$)", path)
+            path_ids = re.findall(r"(?:^|/)(\d+)(?:/|$)", path)
             if str(project_id) not in path_ids:
                 continue
         score = 0

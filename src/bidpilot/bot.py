@@ -2196,6 +2196,67 @@ class BotService:
         if cmd == "advanced":
             await self.send(chat_id, admin_ui.advanced_text(self.store), admin_ui.advanced_keyboard())
             return
+        if cmd == "debug":
+            await self.send(chat_id, admin_ui.debug_text(self.store), admin_ui.debug_keyboard(self.store))
+            return
+        if cmd.startswith("debug:"):
+            action = cmd.split(":")[1]
+            if action == "toggle":
+                current_value = self.store.get("admin.browser_debug_enabled")
+                current = True if current_value is None else self.store.get_bool("admin.browser_debug_enabled")
+                enabled = not current
+                self.store.set("admin.browser_debug_enabled", enabled)
+                self._log_admin_action(chat_id, "debug:toggle", enabled=str(enabled))
+                await self.send(
+                    chat_id,
+                    f"{'🟢 ثبت عیب‌یابی مرورگر فعال شد' if enabled else '🔴 ثبت عیب‌یابی مرورگر خاموش شد'}",
+                    admin_ui.debug_keyboard(self.store),
+                )
+                return
+            if action == "download":
+                from .debug_bundle import build_browser_debug_archive
+                archive_path = None
+                try:
+                    root = self.store.get("admin.browser_debug_dir") or "data/browser_debug"
+                    archive_path, stats = build_browser_debug_archive(root)
+                    if archive_path is None:
+                        await self.send(
+                            chat_id,
+                            "📭 هنوز فایل عیب‌یابی وجود ندارد. ثبت عیب‌یابی را روشن نگه دار، یک بار اجرای ارسال را انجام بده و پس از بروز خطا دوباره این دکمه را بزن.",
+                            admin_ui.debug_keyboard(self.store),
+                        )
+                        return
+                    await self.api.send_document(
+                        chat_id,
+                        archive_path,
+                        caption=(
+                            f"🧪 BidPilot browser diagnostics · {stats['included']} فایل · "
+                            f"{stats['size_mb']} MB منبع · خروجی ZIP پاک‌سازی‌شده"
+                        ),
+                        filename="bidpilot-browser-debug.zip",
+                    )
+                    self._log_admin_action(
+                        chat_id, "debug:download", files=str(stats["included"]),
+                        archive_bytes=str(stats["archive_bytes"]),
+                    )
+                    await self.send(
+                        chat_id,
+                        f"✅ بسته عیب‌یابی ارسال شد؛ {stats['included']} فایل در ZIP قرار گرفت.",
+                        admin_ui.debug_keyboard(self.store),
+                    )
+                except Exception as exc:
+                    log.exception("browser diagnostic archive download failed")
+                    await self.send(
+                        chat_id,
+                        f"❌ ساخت یا ارسال بسته عیب‌یابی ناموفق بود: {escape(str(exc)[:250])}",
+                        admin_ui.debug_keyboard(self.store),
+                    )
+                finally:
+                    if archive_path is not None:
+                        archive_path.unlink(missing_ok=True)
+                return
+            await self.send(chat_id, admin_ui.debug_text(self.store), admin_ui.debug_keyboard(self.store))
+            return
         if cmd.startswith("adv:"):
             sub = cmd.split(":")[1]
             if sub == "logs":

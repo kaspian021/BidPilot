@@ -49,6 +49,12 @@ document.getElementById('editor').addEventListener('input', e => { f.message.val
 f.addEventListener('input', refresh); f.addEventListener('change', refresh);
 function refresh(){ document.getElementById('msg_submit_btn').disabled = !f.checkValidity(); }
 const mode = new URLSearchParams(location.search).get('mode') || 'plain';
+if (mode === 'no-open') document.getElementById('open').removeAttribute('onclick');
+if (mode === 'external-submit') {
+  const submit = document.getElementById('msg_submit_btn');
+  f.after(submit);
+  submit.setAttribute('form', f.id);
+}
 let ifr = null;
 if (mode === 'iframe') {
   // TinyMCE-like: the real editor lives in an iframe and is copied to the textarea on submit only.
@@ -256,6 +262,52 @@ async def test_images_and_trackers_are_not_downloaded(site, tmp_path):
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.SUBMITTED, result.message
     assert "/pixel.png" not in HITS
+
+
+@pytest.mark.asyncio
+async def test_submit_button_associated_with_form_outside_form_is_supported(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=external-submit")
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    assert RECEIVED[0]["path"] == "/conversation/ajax/bid-send/777"
+
+
+@pytest.mark.asyncio
+async def test_hidden_form_that_does_not_open_is_not_filled_and_is_fully_diagnosed(site, tmp_path):
+    _require_chromium()
+    bid_cfg = {
+        "valid_days": 7,
+        "form_open_timeout_ms": 250,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+    }
+    result = await submit_js_managed_form(
+        **_args(
+            site,
+            tmp_path,
+            page_url=f"{site}/project/777?mode=no-open",
+            bid_cfg=bid_cfg,
+        )
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert "پنل ارسال واقعاً باز نشد" in result.message
+    assert RECEIVED == []
+    assert result.payload_debug["request_sent"] is False
+    debug = tmp_path / "dbg"
+    assert list(debug.glob("*form-did-not-open.png"))
+    assert list(debug.glob("*form-did-not-open-viewport.png"))
+    html = next(debug.glob("*form-did-not-open.html")).read_text(encoding="utf-8")
+    snapshot = next(debug.glob("*form-did-not-open.json")).read_text(encoding="utf-8")
+    assert "SECRET" not in html
+    assert "SECRET" not in snapshot
+    assert "init_message_form" in html
+    assert "msg_submit_btn" in snapshot
 
 
 @pytest.mark.asyncio

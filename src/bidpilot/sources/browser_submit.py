@@ -342,35 +342,293 @@ async def _visible_notices(page: Any) -> list[str]:
         return []
 
 
+def _debug_capture_enabled(bid_cfg: dict[str, Any]) -> bool:
+    """Admin can override browser diagnostics at runtime from Telegram."""
+    try:
+        from ..settings_store import get_store
+
+        override = get_store().get("admin.browser_debug_enabled")
+        if override is not None:
+            if isinstance(override, bool):
+                return override
+            return str(override).strip().lower() in {"1", "true", "yes", "on", "بله"}
+    except Exception:  # noqa: BLE001 - diagnostics must not depend on the settings store
+        pass
+    return bid_cfg.get("browser_debug", True) is not False
+
+
+_DEBUG_SNAPSHOT_JS = """
+() => {
+  const pathOnly = (raw) => {
+    if (!raw) return "";
+    try { return new URL(raw, location.href).pathname; } catch (_) { return String(raw).split(/[?#]/)[0]; }
+  };
+  const visible = (el) => {
+    const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+    return st.display !== "none" && st.visibility !== "hidden" && Number(st.opacity || 1) > 0 &&
+      r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 &&
+      r.left < innerWidth && r.top < innerHeight;
+  };
+  const describe = (el) => ({
+    tag: el.tagName.toLowerCase(),
+    id: el.id || "",
+    class: typeof el.className === "string" ? el.className.slice(0, 180) : "",
+    name: el.getAttribute("name") || "",
+    type: el.getAttribute("type") || "",
+    text: (el.innerText || el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim().slice(0, 180),
+    role: el.getAttribute("role") || "",
+    form: (el.form && (el.form.id || el.form.getAttribute("name"))) || (el.closest("form")?.id || ""),
+    href_path: pathOnly(el.getAttribute("href")),
+    action_path: pathOnly(el.getAttribute("action")),
+    data_href_path: pathOnly(el.getAttribute("data-href")),
+    data_url_path: pathOnly(el.getAttribute("data-url")),
+    data_action_path: pathOnly(el.getAttribute("data-action")),
+    disabled: Boolean(el.disabled),
+    required: Boolean(el.required),
+    visible: visible(el),
+    rect: (() => { const r=el.getBoundingClientRect(); return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}; })()
+  });
+  const forms = [...document.querySelectorAll("form")].slice(0, 30).map(form => ({
+    ...describe(form),
+    method: (form.getAttribute("method") || "get").toLowerCase(),
+    fields: [...form.querySelectorAll("input,textarea,select,button")].slice(0, 100).map(describe)
+  }));
+  const controls = [...document.querySelectorAll("button,input[type=submit],input[type=button],[role=button],a[href]")]
+    .slice(0, 250).map(describe);
+  return {
+    title: document.title || "",
+    path: location.pathname,
+    readyState: document.readyState,
+    viewport: {width: innerWidth, height: innerHeight},
+    counts: {forms: document.forms.length, buttons: document.querySelectorAll("button").length,
+      inputs: document.querySelectorAll("input").length, textareas: document.querySelectorAll("textarea").length},
+    forms, controls
+  };
+}
+"""
+
+
 async def _dump_debug(
     page: Any, form: Any, bid_cfg: dict[str, Any], source: str, project_id: str, reason: str
 ) -> None:
-    """Best-effort screenshot + sanitized form HTML so a failure can be diagnosed from real data."""
-    if bid_cfg.get("browser_debug", True) is False:
+    """Save full-page, value-redacted HTML + DOM inventory + screenshots."""
+    if not _debug_capture_enabled(bid_cfg):
         return
     try:
         target = Path(str(bid_cfg.get("browser_debug_dir") or "data/browser_debug"))
         target.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = target / f"{stamp}-{re.sub(r'[^A-Za-z0-9_.-]', '_', source)}-{project_id}-{reason}"
-        await page.screenshot(path=str(base.with_suffix(".png")), full_page=False, timeout=5_000)
-        html = ""
+
+        # The full page image shows the CTA and panel context. A viewport image
+        # is also saved because it is the most useful view for off-canvas bugs.
         try:
-            if form is None:
-                raise ValueError("no form")
-            html = await form.evaluate(
-                "(el) => { const c = el.cloneNode(true);"
-                " c.querySelectorAll('input[type=hidden]').forEach(i => i.setAttribute('value', '<redacted>'));"
-                " return c.outerHTML; }"
+            await page.screenshot(path=str(base.with_suffix(".png")), full_page=True, timeout=8_000)
+        except Exception:
+            await page.screenshot(path=str(base.with_suffix(".png")), full_page=False, timeout=5_000)
+        try:
+            await page.screenshot(
+                path=str(base.with_name(base.name + "-viewport.png")), full_page=False, timeout=5_000
             )
-        except Exception:  # noqa: BLE001
-            html = await page.content()
-        base.with_suffix(".html").write_text(str(html)[:200_000], encoding="utf-8")
+        except Exception:
+            pass
+
+        # Keep the whole DOM (including CTA siblings), but strip every field
+        # value, textarea/editor contents, inline script and CSRF-like attribute.
+        safe_html = await page.evaluate(
+            """() => {
+              const root = document.documentElement.cloneNode(true);
+              root.querySelectorAll("script,noscript").forEach(el => {
+                if (el.tagName === "SCRIPT") el.textContent = "/* script content omitted from diagnostics */";
+                else el.remove();
+              });
+              root.querySelectorAll("input").forEach(el => {
+                el.setAttribute("value", "[REDACTED]");
+                if (el.hasAttribute("value")) el.value = "[REDACTED]";
+              });
+              root.querySelectorAll("textarea").forEach(el => { el.textContent = "[REDACTED]"; el.value = "[REDACTED]"; });
+              root.querySelectorAll("select option").forEach(el => {
+                if (el.hasAttribute("value")) el.setAttribute("value", "[REDACTED]");
+              });
+              root.querySelectorAll("[contenteditable=true],[contenteditable='']").forEach(el => {
+                el.textContent = "[EDITOR CONTENT REDACTED]";
+              });
+              root.querySelectorAll("*").forEach(el => {
+                for (const attr of [...el.attributes]) {
+                  if (/(token|csrf|password|secret|cookie|api.?key)/i.test(attr.name)) {
+                    el.setAttribute(attr.name, "[REDACTED]");
+                  } else if (["href","action","data-href","data-url","data-action"].includes(attr.name.toLowerCase())) {
+                    try {
+                      const u = new URL(attr.value, location.href);
+                      el.setAttribute(attr.name, u.pathname);
+                    } catch (_) { el.setAttribute(attr.name, String(attr.value).split(/[?#]/)[0]); }
+                  }
+                }
+              });
+              return "<!doctype html>\\n" + root.outerHTML;
+            }"""
+        )
+        base.with_suffix(".html").write_text(str(safe_html)[:500_000], encoding="utf-8")
+        try:
+            snapshot = await page.evaluate(_DEBUG_SNAPSHOT_JS)
+            snapshot.update({
+                "source": source,
+                "project_id": str(project_id),
+                "reason": reason,
+                "page_url_path": urlsplit(str(page.url)).path,
+                "form_selector_id": str(bid_cfg.get("_debug_form_id") or ""),
+            })
+            base.with_suffix(".json").write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("[BID][BROWSER-DEBUG] DOM inventory failed error_type=%s", type(exc).__name__)
         log.warning(
-            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s", source, project_id, reason, base
+            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s",
+            source, project_id, reason, base
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
         log.info("[BID][BROWSER-DEBUG] capture failed error_type=%s", type(exc).__name__)
+
+
+async def _find_open_form_cta(
+    page: Any, source_name: str, project_id: str, current_url: str
+) -> Any | None:
+    """Find the opener for this exact project, never a related-project CTA."""
+    if source_name.casefold() != "parscoders":
+        selectors = [
+            "button.bid-send--button:visible",
+            "a.bid-send--button:visible",
+            "button:has-text('ارسال پیشنهاد'):visible",
+            "a:has-text('ارسال پیشنهاد'):visible",
+        ]
+    else:
+        endpoint = f"/conversation/ajax/bid-send/{project_id}"
+        selectors = [
+            f'button.bid-send--button[data-project-id="{project_id}"]:visible',
+            f'a.bid-send--button[data-project-id="{project_id}"]:visible',
+            f'[role="button"][data-project-id="{project_id}"]:visible',
+            f'button[data-href$="{endpoint}"]:visible',
+            f'button[data-url$="{endpoint}"]:visible',
+            f'button[data-action$="{endpoint}"]:visible',
+        ]
+    for selector in selectors:
+        try:
+            group = page.locator(selector)
+            count = min(await group.count(), 10)
+            for index in range(count):
+                candidate = group.nth(index)
+                if not await candidate.is_visible():
+                    continue
+                if source_name.casefold() == "parscoders":
+                    attrs = await candidate.evaluate(
+                        """el => ({
+                          tag: el.tagName.toLowerCase(),
+                          projectId: el.getAttribute("data-project-id") || "",
+                          href: el.getAttribute("href") || "",
+                          dataHref: el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("data-action") || "",
+                          clickable: ["button","a"].includes(el.tagName.toLowerCase()) ||
+                            el.getAttribute("role") === "button" || Boolean(el.getAttribute("onclick"))
+                        })"""
+                    )
+                    if attrs["projectId"] and attrs["projectId"] != str(project_id):
+                        continue
+                    target = attrs["href"] or attrs["dataHref"]
+                    if target:
+                        path = urlsplit(urljoin(current_url, target)).path.rstrip("/")
+                        if path not in {f"/project/{project_id}", f"/conversation/ajax/bid-send/{project_id}"}:
+                            continue
+                    if not attrs["clickable"]:
+                        continue
+                return candidate
+        except Exception:
+            continue
+
+    if source_name.casefold() == "parscoders":
+        # Text-only fallback is allowed only on the matching project-detail
+        # page and only when there is exactly one visible button. Links in
+        # recommendation cards are deliberately not clicked.
+        page_id_match = re.fullmatch(r"/project/(\\d+)(?:/[^/]+)?/?", urlsplit(current_url).path)
+        if page_id_match and page_id_match.group(1) == str(project_id):
+            try:
+                buttons = page.locator("button:visible").filter(has_text=re.compile("ارسال پیشنهاد"))
+                if await buttons.count() == 1:
+                    candidate = buttons.first
+                    attrs = await candidate.evaluate(
+                        "el => ({projectId:el.getAttribute('data-project-id')||'', target:el.getAttribute('data-href')||el.getAttribute('data-url')||el.getAttribute('data-action')||''})"
+                    )
+                    if attrs["projectId"] in {"", str(project_id)}:
+                        if not attrs["target"] or urlsplit(urljoin(current_url, attrs["target"])).path.rstrip("/") == f"/conversation/ajax/bid-send/{project_id}":
+                            return candidate
+            except Exception:
+                pass
+    return None
+
+
+async def _find_submitter(
+    page: Any, form: Any, submitter_id: str, endpoint_attribute: str, endpoint_url: str
+) -> tuple[Any | None, str]:
+    """Find a visible submitter associated with this form.
+
+    The exact ID is searched in the whole document (some sites place a
+    form-associated button beside/outside the <form>), then scoped fallbacks
+    are checked inside the real bid form. No unrelated page button is clicked.
+    """
+    form_id = str(await form.get_attribute("id") or "")
+    expected_path = urlsplit(endpoint_url).path.rstrip("/")
+    candidates: list[tuple[str, Any, bool]] = []
+    if submitter_id:
+        candidates.append(("id", page.locator(_attr_selector("id", submitter_id)).first, True))
+    if endpoint_attribute and expected_path:
+        candidates.append(("endpoint", form.locator(f"[{endpoint_attribute}]").first, False))
+    candidates.extend([
+        ("type=submit", form.locator("button[type=submit], input[type=submit]").first, False),
+        ("text", form.locator("button").filter(has_text=re.compile("ارسال|ثبت پیشنهاد")).first, False),
+        ("input-button", form.locator("input[type=button][value*='ارسال']").first, False),
+        ("button", form.locator("button").first, False),
+    ])
+
+    seen: dict[str, str] = {}
+    for _ in range(8):
+        for label, loc, require_association in candidates:
+            try:
+                if not await loc.count():
+                    seen[label] = "پیدا نشد"
+                    continue
+                if not await loc.is_visible():
+                    seen[label] = "پنهان"
+                    continue
+                if require_association:
+                    associated = await loc.evaluate(
+                        """(el, formId) => {
+                          const owner = el.form || el.closest("form");
+                          return Boolean(owner && ((formId && owner.id === formId) ||
+                            owner === document.querySelector("form#" + CSS.escape(formId)));
+                        }""",
+                        form_id,
+                    )
+                    if not associated:
+                        seen[label] = "به فرم متصل نیست"
+                        continue
+                attr_value = await loc.get_attribute(endpoint_attribute) if endpoint_attribute else None
+                if attr_value:
+                    actual_path = urlsplit(urljoin(str(page.url), attr_value)).path.rstrip("/")
+                    if actual_path != expected_path:
+                        seen[label] = "مسیر متفاوت"
+                        continue
+                await loc.scroll_into_view_if_needed(timeout=1_500)
+                if await loc.is_visible():
+                    return loc, ""
+                seen[label] = "پس از اسکرول پنهان"
+            except Exception as exc:  # noqa: BLE001
+                seen[label] = type(exc).__name__
+        await page.wait_for_timeout(500)
+    try:
+        form_visible = await form.is_visible()
+    except Exception:
+        form_visible = None
+    detail = "، ".join(f"{key}: {value}" for key, value in seen.items())
+    return None, f"{detail}؛ فرم {'نمایان' if form_visible else 'پنهان'}"
 
 
 _STAGE_FA = {
@@ -523,6 +781,13 @@ async def _submit_once(
     if not endpoint_parts.path.strip("/"):
         return _failure("مسیر ارسال فرم خالی است؛ هیچ درخواستی فرستاده نشد.", debug=safe_debug)
     if source_name.casefold() == "parscoders":
+        page_match = re.fullmatch(r"/project/(\\d+)(?:/[^/]+)?/?", page_parts.path)
+        if not str(project_id).isdigit() or not page_match or page_match.group(1) != str(project_id):
+            return _failure(
+                "آدرس مرورگر، شناسه پروژه و مقصد ارسال با هم تطابق ندارند؛ هیچ درخواستی انجام نشد.",
+                debug=safe_debug,
+            )
+    if source_name.casefold() == "parscoders":
         expected_path = f"/conversation/ajax/bid-send/{project_id}"
         if endpoint_parts.path.rstrip("/") != expected_path:
             return _failure(
@@ -668,6 +933,7 @@ async def _submit_once(
                     text_selector = _attr_selector("name", field_mapping["description"])
                     form_selector = f"form:has({amount_selector}):has({text_selector})"
                 stage = "find_form"
+                bid_cfg["_debug_form_id"] = form_id
                 form = page.locator(form_selector).first
                 form_ref = form
                 if await form.count() != 1:
@@ -684,64 +950,48 @@ async def _submit_once(
                         debug=safe_debug,
                     )
 
-                # Parscoders keeps the proposal form inside a hidden off-canvas.
-                # Open it via the visible site's own CTA before filling it.
-                # The exact trigger markup has changed a few times (button vs a,
-                # class bid-send--button vs generic), so try several selectors.
+                # The form may live in a hidden off-canvas. Open it only via
+                # a CTA tied to this project's numeric ID, then require visibility.
                 stage = "open_form"
                 if not await form.is_visible():
-                    cta_candidates = [
-                        "button.bid-send--button"
-                        + _attr_selector("data-project-id", str(project_id))
-                        + ":visible",
-                        "button.bid-send--button:visible",
-                        "a.bid-send--button:visible",
-                        "[data-project-id=" + json.dumps(str(project_id)) + "]:visible",
-                        "button:has-text('ارسال پیشنهاد'):visible",
-                        "a:has-text('ارسال پیشنهاد'):visible",
-                        "[data-href*='/conversation/ajax/bid-send/']:visible",
-                        "button[data-href]:visible",
-                    ]
-                    cta = None
-                    for sel in cta_candidates:
-                        try:
-                            cand = page.locator(sel).first
-                            if await cand.count() and await cand.is_visible():
-                                cta = cand
-                                log.debug(
-                                    "[BID][BROWSER-CTA] source=%s id=%s cta_selector=%r",
-                                    source_name,
-                                    project_id,
-                                    sel,
-                                )
-                                break
-                        except Exception:
-                            continue
+                    cta = await _find_open_form_cta(page, source_name, str(project_id), current_url)
                     if cta is None:
+                        await _dump_debug(page, form, bid_cfg, source_name, project_id, "project-cta-not-found")
                         return _failure(
-                            "فرم پنهان است اما دکمه اصلی «ارسال پیشنهاد» برای بازکردنش پیدا نشد؛ "
-                            "هیچ پیشنهادی ارسال نشد.",
+                            "دکمه بازکردن فرم برای همین پروژه پیدا نشد؛ لینک‌های پروژه‌های مرتبط نادیده گرفته شدند.",
                             debug=safe_debug,
                         )
-                    await cta.click()
-                    # Off-canvas animation takes ~400ms; wait for form to be visible and stable
+                    await cta.scroll_into_view_if_needed(timeout=3_000)
+                    await cta.click(timeout=8_000)
+                    open_timeout = max(250, min(30_000, int(bid_cfg.get("form_open_timeout_ms") or 12_000)))
                     try:
-                        await form.wait_for(state="visible", timeout=12_000)
+                        await form.wait_for(state="visible", timeout=open_timeout)
                     except Exception:
-                        # Fallback: wait a bit and re-check
-                        try:
-                            await page.wait_for_timeout(800)
-                        except Exception:
-                            pass
-                    try:
-                        await page.wait_for_timeout(600)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        await page.wait_for_timeout(400)
-                    except Exception:
-                        pass
+                        safe_debug["form_open_timeout_ms"] = open_timeout
+                        await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-did-not-open")
+                        return _failure(
+                            "پس از کلیک روی دکمه مخصوص پروژه، پنل ارسال واقعاً باز نشد؛ "
+                            "هیچ فیلدی تغییر نکرد و پیشنهادی ارسال نشد.",
+                            debug=safe_debug,
+                        )
+                    await page.wait_for_timeout(500)
+                if not await form.is_visible():
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-still-hidden")
+                    return _failure(
+                        "پنل ارسال هنوز مخفی است؛ برای جلوگیری از تغییر فرم نامرئی، ارسال متوقف شد.",
+                        debug=safe_debug,
+                    )
+                try:
+                    await form.scroll_into_view_if_needed(timeout=3_000)
+                except Exception:
+                    pass
+
+                if not await form.is_visible():
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-hidden-before-fill")
+                    return _failure(
+                        "فرم پیشنهاد پیش از تکمیل دوباره مخفی شد؛ هیچ فیلدی تغییر نکرد.",
+                        debug=safe_debug,
+                    )
 
                 async def fill_field(logical_name: str, value: str) -> None:
                     field_name = field_mapping.get(logical_name)

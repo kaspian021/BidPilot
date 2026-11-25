@@ -354,6 +354,18 @@ def advanced_text(store: SettingsStore) -> str:
         lines.append(f"نسخه: {esc(store.get('app.version') or '0.9.x')}")
         lines.append(f"ادمین‌های اضافه: {esc(', '.join(store.get_list('admin.extra_ids')) or '—')}")
         lines.append(f"بان لیست: {len(store.get_list('admin.banned_ids'))} نفر")
+    try:
+        from .debug_bundle import browser_debug_stats
+        debug_root = store.get("admin.browser_debug_dir") or "data/browser_debug"
+        debug_stats = browser_debug_stats(debug_root)
+        debug_enabled = store.get("admin.browser_debug_enabled")
+        debug_enabled = True if debug_enabled is None else store.get_bool("admin.browser_debug_enabled")
+        lines.append(
+            f"🧪 عیب‌یابی مرورگر: <b>{'🟢 روشن' if debug_enabled else '🔴 خاموش'}</b> · "
+            f"{debug_stats['count']} فایل · {debug_stats['size_mb']} MB"
+        )
+    except Exception:
+        pass
     lines.append(hr())
     lines.append("<i>این بخش فقط برای شماست — هر تغییری لاگ می‌شود. برای کنترل کامل لاگ‌ها به «مرکز لاگ‌ها» بروید.</i>")
     return "\n".join(lines)
@@ -364,9 +376,45 @@ def advanced_keyboard() -> dict:
             [{"text": "📢 پیام همگانی", "callback_data": "admin:broadcast"},
              {"text": "🚧 نگهداری روشن/خاموش", "callback_data": "admin:sys:maintenance"}],
             [{"text": "📜 مرکز لاگ‌ها (حرفه‌ای)", "callback_data": "admin:logs"},
-             {"text": "🗑️ پاکسازی دیتابیس قدیمی", "callback_data": "admin:adv:cleanup"}],
-            [{"text": "👥 افزودن ادمین دوم", "callback_data": "admin:adv:addadmin"}],
+             {"text": "🧪 عیب‌یابی ارسال", "callback_data": "admin:debug"}],
+            [{"text": "🗑️ پاکسازی دیتابیس قدیمی", "callback_data": "admin:adv:cleanup"},
+             {"text": "👥 افزودن ادمین دوم", "callback_data": "admin:adv:addadmin"}],
             [{"text": "↩️ پنل ادمین", "callback_data": "admin:main"}],
+        ]
+    }
+
+
+def debug_text(store: SettingsStore) -> str:
+    """Admin overview for the browser's sanitized diagnostic artifacts."""
+    from .debug_bundle import browser_debug_stats
+
+    enabled_value = store.get("admin.browser_debug_enabled")
+    enabled = True if enabled_value is None else store.get_bool("admin.browser_debug_enabled")
+    root = store.get("admin.browser_debug_dir") or "data/browser_debug"
+    stats = browser_debug_stats(root)
+    lines = [
+        h2("🧪 عیب‌یابی ارسال پیشنهاد", "HTML + DOM + اسکرین‌شات مرورگر"),
+        f"ثبت عیب‌یابی: <b>{'🟢 روشن' if enabled else '🔴 خاموش'}</b>",
+        f"فایل‌های ذخیره‌شده: <b>{stats['count']}</b> · حجم: <b>{stats['size_mb']} MB</b>",
+        f"آخرین فایل: <code>{esc(stats['latest'] or '—')}</code>",
+        f"انواع فایل: <code>{esc(', '.join(f'{k}:{v}' for k, v in sorted(stats['files'].items())) or '—')}</code>",
+        hr(),
+        "<i>خروجی ZIP شامل HTML کاملِ پاک‌سازی‌شده، فهرست فرم‌ها/دکمه‌ها و تصاویر است. مقدار فیلدها، متن پیشنهاد، اسکریپت‌ها و توکن‌های حساس حذف می‌شوند.</i>",
+        "<i>پس از اجرای دوباره ربات، هر خطای ارسال یک بسته عیب‌یابی جدید به این پوشه اضافه می‌کند.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def debug_keyboard(store: SettingsStore) -> dict:
+    enabled_value = store.get("admin.browser_debug_enabled")
+    enabled = True if enabled_value is None else store.get_bool("admin.browser_debug_enabled")
+    return {
+        "inline_keyboard": [
+            [{"text": "📥 دریافت همه فایل‌های HTML و تصاویر (ZIP)", "callback_data": "admin:debug:download"}],
+            [{"text": "🔴 خاموش‌کردن ثبت عیب‌یابی" if enabled else "🟢 روشن‌کردن ثبت عیب‌یابی",
+              "callback_data": "admin:debug:toggle"}],
+            [{"text": "📜 مرکز لاگ‌ها", "callback_data": "admin:logs"},
+             {"text": "↩️ پیشرفته", "callback_data": "admin:advanced"}],
         ]
     }
 

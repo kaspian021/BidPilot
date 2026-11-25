@@ -620,8 +620,7 @@ async def _find_submitter(
                     associated = await loc.evaluate(
                         """(el, formId) => {
                           const owner = el.form || el.closest("form");
-                          return Boolean(owner && ((formId && owner.id === formId) ||
-                            owner === document.querySelector("form#" + CSS.escape(formId)));
+                          return Boolean(owner && owner.id === formId);
                         }""",
                         form_id,
                     )

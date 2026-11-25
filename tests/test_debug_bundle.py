@@ -4,7 +4,13 @@ import json
 import zipfile
 from pathlib import Path
 
-from bidpilot.debug_bundle import _safe_html, _safe_json, browser_debug_stats, build_browser_debug_archive
+from bidpilot.debug_bundle import (
+    _safe_html,
+    _safe_json,
+    browser_debug_stats,
+    build_browser_debug_archive,
+    build_browser_debug_archives,
+)
 
 
 def test_safe_html_redacts_form_values_editors_scripts_and_query_strings():
@@ -82,3 +88,29 @@ def test_empty_archive_returns_no_file(tmp_path: Path):
     archive, stats = build_browser_debug_archive(tmp_path / "empty")
     assert archive is None
     assert stats["count"] == 0
+
+
+def test_all_debug_files_are_split_into_multiple_archives_when_needed(tmp_path: Path):
+    root = tmp_path / "many_debug_files"
+    root.mkdir()
+    expected = set()
+    for index in range(5):
+        name = f"failure-{index}.json"
+        (root / name).write_text('{"id": 1}', encoding="utf-8")
+        expected.add(name)
+
+    archives, stats = build_browser_debug_archives(root, max_files=2, max_total_bytes=20)
+    assert len(archives) == 3
+    assert stats["parts"] == 3
+    try:
+        received = set()
+        for archive_path, part_stats in archives:
+            assert archive_path.exists()
+            assert part_stats["total_parts"] == 3
+            with zipfile.ZipFile(archive_path) as archive:
+                manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+                received.update(manifest["files"])
+        assert received == expected
+    finally:
+        for archive_path, _part_stats in archives:
+            archive_path.unlink(missing_ok=True)

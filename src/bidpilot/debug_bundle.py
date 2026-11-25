@@ -37,7 +37,7 @@ def _safe_html(source: str) -> str:
 
     text = re.sub(
         r"""(?is)(<[^>]*contenteditable[^>]*>).*?(</[^>]+>)""",
-        r"\\1[EDITOR CONTENT REDACTED]\\2",
+        r"\1[EDITOR CONTENT REDACTED]\2",
         text,
     )
 
@@ -52,10 +52,10 @@ def _safe_html(source: str) -> str:
 
     text = re.sub(r"(?is)<input\b[^>]*>", redact_input, text)
     text = re.sub(
-        r"""(?is)<option\\b[^>]*>""",
+        r"""(?is)<option\b[^>]*>""",
         lambda match: re.sub(
-            r"""(?i)(\\bvalue\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s>]+)""",
-            r'\\1"[REDACTED]"',
+            r"""(?i)(\bvalue\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+            r'\1"[REDACTED]"',
             match.group(0),
         ),
         text,

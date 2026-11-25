@@ -71,7 +71,7 @@ list:
       - "h2 a"
       - ".project-title a"
       - "a.project-title"
-      - "a[href*='/project/']"
+      # Generic /project/ actions are intentionally not used for project identity.
     description:
       - ".project-description"
       - "div.description"

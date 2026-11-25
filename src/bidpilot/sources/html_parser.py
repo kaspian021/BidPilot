@@ -630,6 +630,13 @@ def extract_external_id(url: str, id_regex: str = DEFAULT_ID_REGEX) -> str | Non
     return match.group(1) if match else None
 
 
+def parscoders_project_id(url: str) -> str | None:
+    """Return an ID only for a real ParsCoders project-detail URL."""
+    path = urlsplit(str(url or "")).path
+    match = re.fullmatch(r"/?project/(\d+)(?:/[^/]+)?/?", path, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def fallback_id(*parts: str) -> str:
     return "h" + hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
@@ -799,25 +806,48 @@ def parse_project_card(
     anchor = _first(card, fields.get("link")) or _first(card, fields.get("title"))
     link = _attr(card, fields.get("link") or fields.get("title"), "href")
     title = _text(card, fields.get("title")) or _attr(card, fields.get("link"), "title")
-    if not title and isinstance(anchor, Tag):
-        # no selector matched: the anchor/heading text is the card's title
-        title = clean_text(anchor.get_text(" ", strip=True))
-    if isinstance(card, Tag):
-        generic_anchor = card.find("a", href=True)
-        if generic_anchor is not None:
-            if not link:
-                link = str(generic_anchor.get("href") or "")
-            if not title:
-                title = clean_text(generic_anchor.get_text(" ", strip=True))
-        if not title:
-            heading = card.find(["h1", "h2", "h3", "h4"])
-            title = clean_text(heading.get_text(" ", strip=True)) if heading else ""
+
+    is_parscoders = source_name.casefold() == "parscoders"
+    if is_parscoders:
+        # A card can contain a bookmark/toggle link before its real project URL.
+        valid_anchors = [
+            node for node in card.find_all("a", href=True)
+            if parscoders_project_id(str(node.get("href") or "")) is not None
+        ] if isinstance(card, Tag) else []
+        if not valid_anchors:
+            log.debug("[PARSER][CARD-SKIP] source=parscoders reason=no_real_project_url")
+            return None
+        selected_anchor = (
+            anchor
+            if isinstance(anchor, Tag) and parscoders_project_id(str(anchor.get("href") or "")) is not None
+            else valid_anchors[0]
+        )
+        if selected_anchor is not anchor:
+            title = clean_text(selected_anchor.get_text(" ", strip=True))
+        anchor = selected_anchor
+        link = str(selected_anchor.get("href") or "")
+    else:
+        if not title and isinstance(anchor, Tag):
+            title = clean_text(anchor.get_text(" ", strip=True))
+        if isinstance(card, Tag):
+            generic_anchor = card.find("a", href=True)
+            if generic_anchor is not None:
+                if not link:
+                    link = str(generic_anchor.get("href") or "")
+                if not title:
+                    title = clean_text(generic_anchor.get_text(" ", strip=True))
+
+    if not title and isinstance(card, Tag):
+        heading = card.find(["h1", "h2", "h3", "h4"])
+        title = clean_text(heading.get_text(" ", strip=True)) if heading else ""
     link = urljoin(base_url + "/", link)
 
-    external_id = extract_external_id(link, settings.get("id_regex", DEFAULT_ID_REGEX)) or fallback_id(
-        link, title
+    external_id = (
+        parscoders_project_id(link)
+        if is_parscoders
+        else extract_external_id(link, settings.get("id_regex", DEFAULT_ID_REGEX)) or fallback_id(link, title)
     )
-    if not title and not link:
+    if not external_id or (not title and not link):
         return None
 
     budget_selector_text = _text(card, fields.get("budget"))
@@ -1396,13 +1426,13 @@ def score_bid_form(form: Tag, settings: dict[str, Any]) -> int:
     return score
 
 
-def find_proposal_cta_url(html: str, base_url: str = "") -> str | None:
-    """URL behind an «ارسال پیشنهاد» call-to-action, when the form lives elsewhere.
+def find_proposal_cta_url(
+    html: str, base_url: str = "", project_id: str | None = None
+) -> str | None:
+    """Find a proposal CTA belonging to the current project only.
 
-    Many marketplaces keep only a button on the project page; the real form
-    is behind that link (a dedicated page or an AJAX-loaded modal). Returns
-    None for login links (see :func:`find_proposal_login_link`), bare ``#``
-    anchors and pure-JS toggles with no URL to follow.
+    Listing pages can contain many identically-labelled CTAs. If an ID is
+    supplied, the target URL must contain that exact ID as a path segment.
     """
     soup = BeautifulSoup(html or "", "lxml")
     login_path = re.compile(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", re.IGNORECASE)
@@ -1423,6 +1453,10 @@ def find_proposal_cta_url(html: str, base_url: str = "") -> str | None:
         path = urlsplit(url).path
         if login_path.search(path):
             continue
+        if project_id:
+            path_ids = re.findall(r"(?:^|/)(\\d+)(?:/|$)", path)
+            if str(project_id) not in path_ids:
+                continue
         score = 0
         if any(term in label for term in _PROPOSAL_CTA_LABELS):
             score += 30

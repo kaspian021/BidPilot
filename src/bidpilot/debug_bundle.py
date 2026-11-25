@@ -35,6 +35,12 @@ def _safe_html(source: str) -> str:
         text,
     )
 
+    text = re.sub(
+        r"""(?is)(<[^>]*contenteditable[^>]*>).*?(</[^>]+>)""",
+        r"\\1[EDITOR CONTENT REDACTED]\\2",
+        text,
+    )
+
     def redact_input(match: re.Match[str]) -> str:
         tag = match.group(0)
         tag = re.sub(

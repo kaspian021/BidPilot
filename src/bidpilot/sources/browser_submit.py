@@ -830,6 +830,9 @@ async def _submit_once(
         "submitter_id": submitter_id,
         "endpoint_path": endpoint_parts.path,
         "request_sent": False,
+        "response_received": False,
+        "site_confirmed": False,
+        "stage": "preflight",
     }
 
     if not page_parts.scheme or _origin(page_url) != _origin(base_url):
@@ -879,6 +882,7 @@ async def _submit_once(
     context = None
     action_clicked = False
     stage = "launch"
+    safe_debug["stage"] = stage
     page = None
     form_ref = None
     try:
@@ -962,6 +966,7 @@ async def _submit_once(
             page.on("requestfailed", _on_request_failed)
             try:
                 stage = "page_load"
+                safe_debug["stage"] = stage
                 load_timeout_ms = int(float(bid_cfg.get("page_load_timeout_seconds") or 30) * 1000)
                 # "commit" = the server answered; do not wait for every sub-resource. A slow
                 # third-party file must not turn a usable page into a 25 s timeout.
@@ -1018,6 +1023,7 @@ async def _submit_once(
                     )
 
                 stage = "page_check"
+                safe_debug["stage"] = stage
                 body_text = await page.locator("body").inner_text(timeout=12_000)
                 lowered = body_text.casefold()
                 logged_markers = [
@@ -1050,6 +1056,7 @@ async def _submit_once(
                     text_selector = _attr_selector("name", field_mapping["description"])
                     form_selector = f"form:has({amount_selector}):has({text_selector})"
                 stage = "find_form"
+                safe_debug["stage"] = stage
                 bid_cfg["_debug_form_id"] = form_id
                 form = page.locator(form_selector).first
                 form_ref = form
@@ -1070,6 +1077,7 @@ async def _submit_once(
                 # The form may live in a hidden off-canvas. Open it only via
                 # a CTA tied to this project's numeric ID, then require visibility.
                 stage = "open_form"
+                safe_debug["stage"] = stage
                 if not await form.is_visible():
                     cta_diagnostics: dict[str, Any] = {}
                     cta = await _find_open_form_cta(
@@ -1175,6 +1183,7 @@ async def _submit_once(
                     valid_days_value = None
 
                 stage = "fill"
+                safe_debug["stage"] = stage
                 current_field = "amount"
                 try:
                     await fill_field("amount", str(int(amount)))
@@ -1209,6 +1218,7 @@ async def _submit_once(
                     )
 
                 stage = "validate"
+                safe_debug["stage"] = stage
                 form_valid = await form.evaluate("(el) => el.checkValidity()")
                 if not form_valid:
                     try:
@@ -1312,11 +1322,14 @@ async def _submit_once(
                 def on_request(request: Any) -> None:
                     if _is_bid_request(request.url, request.method):
                         request_seen["value"] = True
+                        safe_debug["request_sent"] = True
 
                 def on_response(resp: Any) -> None:
                     if not response_future.done() and _is_bid_request(resp.url, resp.request.method):
                         response_future.set_result(resp)
 
+                stage = "submit"
+                safe_debug["stage"] = stage
                 try:
                     editor_check = await control_message_state(form, field_mapping.get("description", ""))
                 except Exception:  # noqa: BLE001
@@ -1336,6 +1349,7 @@ async def _submit_once(
                     # Exactly one real click. Never replay the endpoint directly if
                     # the site does not issue the request.
                     action_clicked = True
+                    safe_debug["request_sent"] = "unknown"
                     await submitter.click()
                     clicked_at = time.monotonic()
                     while not response_future.done():
@@ -1365,6 +1379,9 @@ async def _submit_once(
                             timeout=2_000,
                         )
                         status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
+                        safe_debug["request_sent"] = True if request_seen["value"] else "unknown"
+                        safe_debug["site_confirmed"] = True
+                        safe_debug["confirmation"] = "site_ui_state"
                         log.info(
                             "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=ui_confirmed_without_response status_text=%r",
                             source_name,
@@ -1384,6 +1401,9 @@ async def _submit_once(
                     if not request_seen["value"]:
                         # Definite: no request left the browser, so nothing was registered.
                         safe_debug["request_sent"] = False
+                        safe_debug["response_received"] = False
+                        safe_debug["site_confirmed"] = False
+                        safe_debug["confirmation"] = "browser_did_not_send_request"
                         try:
                             invalid = await form.evaluate(
                                 "(el) => [...el.querySelectorAll(':invalid, .is-invalid')]"
@@ -1430,6 +1450,9 @@ async def _submit_once(
 
                     # A request left the browser but no answer came back: genuinely ambiguous.
                     safe_debug["request_sent"] = "unknown"
+                    safe_debug["response_received"] = False
+                    safe_debug["site_confirmed"] = False
+                    safe_debug["confirmation"] = "request_sent_response_missing"
                     log.warning(
                         "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=request_sent_no_response waited=%.0fs",
                         source_name,
@@ -1447,6 +1470,7 @@ async def _submit_once(
                 response = response_future.result()
 
                 safe_debug["request_sent"] = True
+                safe_debug["response_received"] = True
                 response_text = await response.text()
                 ok, message = html_parser.detect_success(response.status, response_text, bid_cfg)
                 if not ok and response.status < 400:
@@ -1468,6 +1492,8 @@ async def _submit_once(
                         pass
 
                 if not ok:
+                    safe_debug["site_confirmed"] = False
+                    safe_debug["confirmation"] = "server_response_not_successful"
                     # Subscription / daily-limit outranks everything
                     if html_parser.requires_subscription(response_text):
                         sub_snippet = html_parser.subscription_limit_snippet(response_text)
@@ -1521,6 +1547,8 @@ async def _submit_once(
                         payload_debug=safe_debug,
                     )
 
+                safe_debug["site_confirmed"] = True
+                safe_debug["confirmation"] = "server_response_success"
                 log.info(
                     "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s outcome=confirmed_success",
                     source_name,
@@ -1539,6 +1567,7 @@ async def _submit_once(
                     await _dump_debug(page, form_ref, bid_cfg, source_name, project_id, f"timeout-{stage}")
                 raise
     except PlaywrightTimeoutError:
+        safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
         safe_debug["stage"] = stage
         retryable = (not action_clicked) and stage in _RETRYABLE_STAGES
@@ -1565,8 +1594,12 @@ async def _submit_once(
             debug=safe_debug,
         )
     except Exception as exc:
+        safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
         # A browser/page that died before any click is safe to retry once on a fresh browser.
+        safe_debug["response_received"] = False
+        safe_debug["site_confirmed"] = False
+        safe_debug["confirmation"] = "unknown_after_click" if action_clicked else "not_submitted"
         safe_debug["retryable"] = (not action_clicked) and type(exc).__name__ == "TargetClosedError"
         if safe_debug["retryable"]:
             safe_debug["retry_reason"] = f"browser_closed_before_submit:{stage}"

@@ -311,18 +311,11 @@ class ProposalGenerator:
                 )
             # Auto-trim if only problem is length (saves a repair-pass roundtrip and TPM)
             if len(text.strip()) > self.settings.max_chars:
+                # Do not truncate the prefix yet: first separate the protected
+                # price paragraph and signature, then trim only the body.
                 trimmed = text.strip()
                 limit = int(self.settings.max_chars)
-                if len(trimmed) > limit:
-                    cut = trimmed[:limit]
-                    for sep in ("\n\n", "\n", "۔", ".", "!", "؟", "?"):
-                        idx = cut.rfind(sep)
-                        if idx > limit * 0.6:
-                            trimmed = cut[: idx + len(sep)].strip()
-                            break
-                    else:
-                        trimmed = cut.rstrip()
-                    if len(trimmed) >= self.settings.min_chars:
+                if len(trimmed) > limit and len(trimmed) >= self.settings.min_chars:
                         # Reserve the deterministic signature before cutting the
                         # body; a naive prefix slice removed the price/signature
                         # block and made otherwise usable model output fail.

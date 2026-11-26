@@ -529,9 +529,13 @@ async def _find_open_form_cta(
             diagnostics.update({"page_matches_project": False, "reason": "detail_page_id_mismatch"})
         return None
 
+    # Include common delegated-action containers too. Some marketplace themes
+    # attach one document-level click handler to a generic .btn/.button div,
+    # without role=button or an inline onclick attribute.
     selector = (
         "button, a, [role='button'], [onclick], [data-bs-toggle], [data-toggle], "
-        "[class*='bid-send'], [data-project-id]"
+        "[class*='bid-send'], [class*='btn'], [class*='button'], "
+        "[class*='proposal'], [class*='bid'], [data-project-id], [data-action]"
     )
     try:
         result = await page.evaluate(
@@ -539,8 +543,11 @@ async def _find_open_form_cta(
               const nodes = [...document.querySelectorAll(selector)];
               const endpoint = '/conversation/ajax/bid-send/' + projectId;
               const currentPath = location.pathname.replace(/\\/+$/, '') || '/';
-              const pagePattern = new RegExp('^/project/' + projectId + '(?:/[^/]+)?$');
               const form = formId ? document.getElementById(formId) : null;
+              const isSameProjectDetailPath = targetPath => (
+                targetPath === '/project/' + projectId ||
+                targetPath.startsWith('/project/' + projectId + '/')
+              );
               const isVisible = el => {
                 const r = el.getBoundingClientRect(), s = getComputedStyle(el);
                 return s.display !== 'none' && s.visibility !== 'hidden' &&
@@ -548,7 +555,7 @@ async def _find_open_form_cta(
                   r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
               };
               const normalize = value => String(value || '').replace(/[\\u200c\\u200f\\s]+/g, '').toLowerCase();
-              const strong = [], weak = [];
+              const strong = [], weak = [], candidates = [];
               let visibleCount = 0;
               nodes.forEach((el, index) => {
                 if (!isVisible(el) || el.disabled) return;
@@ -583,7 +590,7 @@ async def _find_open_form_cta(
                 const ids = [...targetPath.matchAll(/(?:^|\\/)(\\d+)(?=\\/|$)/g)].map(m => m[1]);
                 if (ids.some(value => value !== String(projectId))) unsafe = true;
                 const allowedPath = !targetPath || targetPath === currentPath ||
-                  targetPath === endpoint || pagePattern.test(targetPath);
+                  targetPath === endpoint || isSameProjectDetailPath(targetPath);
                 if (!allowedPath) unsafe = true;
 
                 const controls = (el.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean);
@@ -604,14 +611,37 @@ async def _find_open_form_cta(
                     }
                   }
                 }
-                const exactPath = targetPath === endpoint || pagePattern.test(targetPath);
-                const projectBound = owner === String(projectId) || linkedToForm || exactPath;
-                const clickable = ['button', 'a'].includes(tag) ||
+                // A link back to /project/<id> is just a project/detail link,
+                // not proof that it opens the bid panel. Only an explicit
+                // data-project-id, form relationship, or exact bid endpoint
+                // is a strong project binding.
+                const exactEndpoint = targetPath === endpoint;
+                const projectBound = owner === String(projectId) || linkedToForm || exactEndpoint;
+                const nativeOrInteractive = ['button', 'a'].includes(tag) ||
                   el.getAttribute('role') === 'button' || el.hasAttribute('onclick') ||
                   el.hasAttribute('data-bs-toggle') || el.hasAttribute('data-toggle') ||
                   /bid-send/i.test(identity);
+                // ParsCoders sometimes uses a generic .btn <div> with a
+                // delegated listener. A unique, explicit «ارسال پیشنهاد»
+                // label is an acceptable weak candidate on this validated
+                // project detail page; multiple matches remain an abort.
+                const clickable = nativeOrInteractive || labelMatch;
                 if (!clickable || unsafe || (!labelMatch && !identityMatch && !projectBound)) return;
-                const item = {index, tag, label: label.slice(0, 90), project_bound: projectBound, linked_to_form: linkedToForm};
+                const item = {
+                  index,
+                  tag,
+                  id: String(el.id || '').slice(0, 80),
+                  class_name: String(typeof el.className === 'string' ? el.className : '').slice(0, 120),
+                  label: label.slice(0, 90),
+                  href_path: targetPath.slice(0, 140),
+                  owner_project_id: owner,
+                  project_bound: projectBound,
+                  linked_to_form: linkedToForm,
+                  exact_endpoint: exactEndpoint,
+                  label_match: labelMatch,
+                  identity_match: identityMatch
+                };
+                candidates.push(item);
                 if (projectBound) strong.push(item);
                 else if (labelMatch || identityMatch) weak.push(item);
               });
@@ -636,7 +666,8 @@ async def _find_open_form_cta(
                 page_matches_project: true,
                 visible_actionables: visibleCount,
                 strong_matches: strong.length,
-                weak_matches: weak.length
+                weak_matches: weak.length,
+                candidates: candidates.slice(0, 12)
               };
             }""",
             {"selector": selector, "projectId": str(project_id), "formId": str(form_id or "")},
@@ -657,12 +688,13 @@ async def _find_open_form_cta(
     selected_index = result.get("selected_index")
     if selected_index is None:
         log.warning(
-            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=ambiguous_or_missing visible=%s strong=%s weak=%s",
+            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=ambiguous_or_missing visible=%s strong=%s weak=%s candidates=%s",
             source_name,
             project_id,
             result.get("visible_actionables", 0),
             result.get("strong_matches", 0),
             result.get("weak_matches", 0),
+            result.get("candidates", []),
         )
         return None
     log.info(
@@ -751,7 +783,7 @@ _STAGE_FA = {
     "submit_button": "آماده‌شدن دکمهٔ ارسال",
 }
 #: stages after which nothing was clicked, so a fresh browser can safely try again
-_RETRYABLE_STAGES = {"launch", "page_load"}
+_RETRYABLE_STAGES = {"launch", "page_load", "page_check"}
 _NOISE_RESOURCE_TYPES = {"image", "media", "font"}
 _TRACKER_HOSTS = (
     "google-analytics.com",
@@ -832,6 +864,7 @@ async def _submit_once(
         "request_sent": False,
         "response_received": False,
         "site_confirmed": False,
+        "confirmation": "not_submitted",
         "stage": "preflight",
     }
 
@@ -1569,7 +1602,9 @@ async def _submit_once(
     except PlaywrightTimeoutError:
         safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
-        safe_debug["stage"] = stage
+        safe_debug["response_received"] = False
+        safe_debug["site_confirmed"] = False
+        safe_debug["confirmation"] = "unknown_after_click" if action_clicked else "not_submitted"
         retryable = (not action_clicked) and stage in _RETRYABLE_STAGES
         safe_debug["retryable"] = retryable
         if retryable:
@@ -1586,9 +1621,13 @@ async def _submit_once(
         return _failure(
             f"مرورگر در مرحلهٔ «{where}» زمان کافی نداشت (شبکه کند یا سایت دیر پاسخ می‌دهد)؛ "
             + (
-                "پیشنهادی ثبت نشد و یک‌بار با مرورگر تازه دوباره تلاش می‌شود."
+                "هنوز هیچ کلیک یا درخواستی برای ثبت پیشنهاد انجام نشده و یک‌بار با مرورگر تازه دوباره تلاش می‌شود."
                 if retryable
-                else "کلیک ارسال انجام شده و نتیجه قطعی نیست؛ وضعیت پروژه را از صفحهٔ سایت بررسی کن."
+                else (
+                    "کلیک ارسال انجام شده و نتیجه قطعی نیست؛ وضعیت پروژه را از صفحهٔ سایت بررسی کن."
+                    if action_clicked
+                    else "هیچ کلیکی برای ثبت پیشنهاد انجام نشد و هیچ درخواست ارسالی در کار نیست."
+                )
             ),
             pause_source=action_clicked,
             debug=safe_debug,

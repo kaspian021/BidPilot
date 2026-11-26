@@ -377,12 +377,18 @@ _DEBUG_SNAPSHOT_JS = """
     type: el.getAttribute("type") || "",
     text: (el.innerText || el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim().slice(0, 180),
     role: el.getAttribute("role") || "",
+    aria_controls: el.getAttribute("aria-controls") || "",
+    aria_expanded: el.getAttribute("aria-expanded") || "",
     form: (el.form && (el.form.id || el.form.getAttribute("name"))) || (el.closest("form")?.id || ""),
+    ancestor_project_id: el.getAttribute("data-project-id") || el.closest("[data-project-id]")?.getAttribute("data-project-id") || "",
     href_path: pathOnly(el.getAttribute("href")),
     action_path: pathOnly(el.getAttribute("action")),
     data_href_path: pathOnly(el.getAttribute("data-href")),
     data_url_path: pathOnly(el.getAttribute("data-url")),
     data_action_path: pathOnly(el.getAttribute("data-action")),
+    data_target: el.getAttribute("data-target") || "",
+    data_bs_target: el.getAttribute("data-bs-target") || "",
+    onclick_present: el.hasAttribute("onclick"),
     disabled: Boolean(el.disabled),
     required: Boolean(el.required),
     visible: visible(el),
@@ -393,8 +399,8 @@ _DEBUG_SNAPSHOT_JS = """
     method: (form.getAttribute("method") || "get").toLowerCase(),
     fields: [...form.querySelectorAll("input,textarea,select,button")].slice(0, 100).map(describe)
   }));
-  const controls = [...document.querySelectorAll("button,input[type=submit],input[type=button],[role=button],a[href]")]
-    .slice(0, 250).map(describe);
+  const controls = [...document.querySelectorAll("button,input[type=submit],input[type=button],[role=button],a[href],[onclick],[data-bs-toggle],[data-toggle],[class*='bid-send'],[data-project-id]")]
+    .slice(0, 400).map(describe);
   return {
     title: document.title || "",
     path: location.pathname,
@@ -492,9 +498,15 @@ async def _dump_debug(
 
 
 async def _find_open_form_cta(
-    page: Any, source_name: str, project_id: str, current_url: str
+    page: Any,
+    source_name: str,
+    project_id: str,
+    current_url: str,
+    *,
+    form_id: str = "",
+    diagnostics: dict[str, Any] | None = None,
 ) -> Any | None:
-    """Find the opener for this exact project, never a related-project CTA."""
+    """Find this project's proposal opener, including custom/off-canvas controls."""
     if source_name.casefold() != "parscoders":
         selectors = [
             "button.bid-send--button:visible",
@@ -502,85 +514,165 @@ async def _find_open_form_cta(
             "button:has-text('ارسال پیشنهاد'):visible",
             "a:has-text('ارسال پیشنهاد'):visible",
         ]
-    else:
-        endpoint = f"/conversation/ajax/bid-send/{project_id}"
-        selectors = [
-            f'button.bid-send--button[data-project-id="{project_id}"]:visible',
-            f'a.bid-send--button[data-project-id="{project_id}"]:visible',
-            f'[role="button"][data-project-id="{project_id}"]:visible',
-            f'[data-project-id="{project_id}"]:visible',
-            "button.bid-send--button:visible",
-            "a.bid-send--button:visible",
-            f'button[data-href$="{endpoint}"]:visible',
-            f'a[data-href$="{endpoint}"]:visible',
-            f'button[data-url$="{endpoint}"]:visible',
-            f'a[data-url$="{endpoint}"]:visible',
-            f'button[data-action$="{endpoint}"]:visible',
-            f'a[data-action$="{endpoint}"]:visible',
-        ]
-    for selector in selectors:
-        try:
-            group = page.locator(selector)
-            count = min(await group.count(), 10)
-            for index in range(count):
-                candidate = group.nth(index)
-                if not await candidate.is_visible():
-                    continue
-                if source_name.casefold() == "parscoders":
-                    attrs = await candidate.evaluate(
-                        """el => ({
-                          tag: el.tagName.toLowerCase(),
-                          projectId: el.getAttribute("data-project-id") || "",
-                          href: el.getAttribute("href") || "",
-                          dataHref: el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("data-action") || "",
-                          clickable: ["button","a"].includes(el.tagName.toLowerCase()) ||
-                            el.getAttribute("role") === "button" || Boolean(el.getAttribute("onclick"))
-                        })"""
-                    )
-                    if attrs["projectId"] and attrs["projectId"] != str(project_id):
-                        continue
-                    target = attrs["href"] or attrs["dataHref"]
-                    if target:
-                        target_path = urlsplit(urljoin(current_url, target)).path.rstrip("/")
-                        current_path = urlsplit(current_url).path.rstrip("/")
-                        allowed_paths = {
-                            f"/project/{project_id}",
-                            current_path,
-                            f"/conversation/ajax/bid-send/{project_id}",
-                        }
-                        if target_path not in allowed_paths:
-                            continue
-                    elif not attrs["projectId"]:
-                        # An ID-less class-based opener is safe only when it is
-                        # the sole visible CTA of this class on this validated
-                        # project-detail page.
-                        if "bid-send--button" not in selector or await group.count() != 1:
-                            continue
-                    if not attrs["clickable"]:
-                        continue
-                return candidate
-        except Exception:
-            continue
-
-    if source_name.casefold() == "parscoders":
-        # Text-only fallback is allowed only on the matching project-detail
-        # page and only when there is exactly one visible button. Links in
-        # recommendation cards are deliberately not clicked.
-        page_id_match = re.fullmatch(r"/project/(\d+)(?:/[^/]+)?/?", urlsplit(current_url).path)
-        if page_id_match and page_id_match.group(1) == str(project_id):
+        for selector in selectors:
             try:
-                buttons = page.locator("button:visible").filter(has_text=re.compile("ارسال پیشنهاد"))
-                if await buttons.count() == 1:
-                    candidate = buttons.first
-                    attrs = await candidate.evaluate(
-                        "el => ({projectId:el.getAttribute('data-project-id')||'', target:el.getAttribute('data-href')||el.getAttribute('data-url')||el.getAttribute('data-action')||''})"
-                    )
-                    if attrs["projectId"] in {"", str(project_id)}:
-                        if not attrs["target"] or urlsplit(urljoin(current_url, attrs["target"])).path.rstrip("/") == f"/conversation/ajax/bid-send/{project_id}":
-                            return candidate
-            except Exception:
-                pass
-    return None
+                group = page.locator(selector)
+                if await group.count() == 1 and await group.first.is_visible():
+                    return group.first
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    page_match = re.fullmatch(r"/project/(\d+)(?:/[^/]+)?/?", urlsplit(current_url).path)
+    if not str(project_id).isdigit() or not page_match or page_match.group(1) != str(project_id):
+        if diagnostics is not None:
+            diagnostics.update({"page_matches_project": False, "reason": "detail_page_id_mismatch"})
+        return None
+
+    selector = (
+        "button, a, [role='button'], [onclick], [data-bs-toggle], [data-toggle], "
+        "[class*='bid-send'], [data-project-id]"
+    )
+    try:
+        result = await page.evaluate(
+            """({selector, projectId, formId}) => {
+              const nodes = [...document.querySelectorAll(selector)];
+              const endpoint = '/conversation/ajax/bid-send/' + projectId;
+              const currentPath = location.pathname.replace(/\\/+$/, '') || '/';
+              const pagePattern = new RegExp('^/project/' + projectId + '(?:/[^/]+)?$');
+              const form = formId ? document.getElementById(formId) : null;
+              const isVisible = el => {
+                const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' &&
+                  Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0 &&
+                  r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+              };
+              const normalize = value => String(value || '').replace(/[\\u200c\\u200f\\s]+/g, '').toLowerCase();
+              const strong = [], weak = [];
+              let visibleCount = 0;
+              nodes.forEach((el, index) => {
+                if (!isVisible(el) || el.disabled) return;
+                visibleCount++;
+                const tag = el.tagName.toLowerCase();
+                const identity = String(el.id || '') + ' ' +
+                  (typeof el.className === 'string' ? el.className : '');
+                const label = normalize([
+                  el.innerText, el.getAttribute('aria-label'), el.getAttribute('title'),
+                  el.getAttribute('value')
+                ].filter(Boolean).join(' '));
+                const labelMatch = /ارسالپیشنهاد|ثبتپیشنهاد|پیشنهادداده|submitproposal|placebid|sendproposal/.test(label);
+                const identityMatch = /bid-send|proposal|place-bid/i.test(identity);
+                const owner = el.getAttribute('data-project-id') ||
+                  (el.closest('[data-project-id]') && el.closest('[data-project-id]').getAttribute('data-project-id')) || '';
+                if (owner && owner !== String(projectId)) return;
+
+                const rawHref = el.getAttribute('href') || '';
+                const rawData = el.getAttribute('data-href') || el.getAttribute('data-url') ||
+                  el.getAttribute('data-action') || '';
+                const rawTarget = rawHref || rawData;
+                let targetPath = '', unsafe = false;
+                if (rawTarget && !/^javascript:/i.test(rawTarget) && !rawTarget.startsWith('#')) {
+                  try {
+                    const targetUrl = new URL(rawTarget, location.href);
+                    targetPath = targetUrl.pathname.replace(/\\/+$/, '') || '/';
+                    unsafe = targetUrl.origin !== location.origin;
+                  } catch (_) { unsafe = true; }
+                } else if (rawTarget.startsWith('#')) {
+                  targetPath = currentPath;
+                }
+                const ids = [...targetPath.matchAll(/(?:^|\\/)(\\d+)(?=\\/|$)/g)].map(m => m[1]);
+                if (ids.some(value => value !== String(projectId))) unsafe = true;
+                const allowedPath = !targetPath || targetPath === currentPath ||
+                  targetPath === endpoint || pagePattern.test(targetPath);
+                if (!allowedPath) unsafe = true;
+
+                const controls = (el.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean);
+                const toggleTarget = el.getAttribute('data-bs-target') || el.getAttribute('data-target') || '';
+                let linkedToForm = Boolean(form && controls.includes(formId));
+                if (form && toggleTarget.startsWith('#')) {
+                  const targetEl = document.getElementById(toggleTarget.slice(1));
+                  linkedToForm = linkedToForm || Boolean(
+                    targetEl && (targetEl === form || targetEl.contains(form) || form.contains(targetEl))
+                  );
+                }
+                if (form && !linkedToForm) {
+                  for (const id of controls) {
+                    const targetEl = document.getElementById(id);
+                    if (targetEl && (targetEl === form || targetEl.contains(form) || form.contains(targetEl))) {
+                      linkedToForm = true;
+                      break;
+                    }
+                  }
+                }
+                const exactPath = targetPath === endpoint || pagePattern.test(targetPath);
+                const projectBound = owner === String(projectId) || linkedToForm || exactPath;
+                const clickable = ['button', 'a'].includes(tag) ||
+                  el.getAttribute('role') === 'button' || el.hasAttribute('onclick') ||
+                  el.hasAttribute('data-bs-toggle') || el.hasAttribute('data-toggle') ||
+                  /bid-send/i.test(identity);
+                if (!clickable || unsafe || (!labelMatch && !identityMatch && !projectBound)) return;
+                const item = {index, tag, label: label.slice(0, 90), project_bound: projectBound, linked_to_form: linkedToForm};
+                if (projectBound) strong.push(item);
+                else if (labelMatch || identityMatch) weak.push(item);
+              });
+
+              let selected = null, strategy = '';
+              if (strong.length === 1) {
+                selected = strong[0];
+                strategy = selected.linked_to_form ? 'form_target' : 'project_id_or_endpoint';
+              } else if (strong.length > 1) {
+                const native = strong.filter(item => ['button', 'a'].includes(item.tag));
+                if (native.length === 1) {
+                  selected = native[0];
+                  strategy = 'unique_native_control';
+                }
+              } else if (weak.length === 1) {
+                selected = weak[0];
+                strategy = 'unique_cta_on_project_detail';
+              }
+              return {
+                selected_index: selected ? selected.index : null,
+                selected_strategy: strategy,
+                page_matches_project: true,
+                visible_actionables: visibleCount,
+                strong_matches: strong.length,
+                weak_matches: weak.length
+              };
+            }""",
+            {"selector": selector, "projectId": str(project_id), "formId": str(form_id or "")},
+        )
+    except Exception as exc:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics.update({"page_matches_project": True, "inspection_error": type(exc).__name__})
+        log.warning(
+            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=inspection_failed error_type=%s",
+            source_name,
+            project_id,
+            type(exc).__name__,
+        )
+        return None
+
+    if diagnostics is not None:
+        diagnostics.update(result)
+    selected_index = result.get("selected_index")
+    if selected_index is None:
+        log.warning(
+            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=ambiguous_or_missing visible=%s strong=%s weak=%s",
+            source_name,
+            project_id,
+            result.get("visible_actionables", 0),
+            result.get("strong_matches", 0),
+            result.get("weak_matches", 0),
+        )
+        return None
+    log.info(
+        "[BID][CTA-DISCOVERY] source=%s id=%s outcome=selected strategy=%s index=%s",
+        source_name,
+        project_id,
+        result.get("selected_strategy"),
+        selected_index,
+    )
+    return page.locator(selector).nth(int(selected_index))
 
 
 async def _find_submitter(
@@ -659,7 +751,7 @@ _STAGE_FA = {
     "submit_button": "آماده‌شدن دکمهٔ ارسال",
 }
 #: stages after which nothing was clicked, so a fresh browser can safely try again
-_RETRYABLE_STAGES = {"launch", "page_load", "page_check", "find_form", "open_form"}
+_RETRYABLE_STAGES = {"launch", "page_load"}
 _NOISE_RESOURCE_TYPES = {"image", "media", "font"}
 _TRACKER_HOSTS = (
     "google-analytics.com",
@@ -738,6 +830,9 @@ async def _submit_once(
         "submitter_id": submitter_id,
         "endpoint_path": endpoint_parts.path,
         "request_sent": False,
+        "response_received": False,
+        "site_confirmed": False,
+        "stage": "preflight",
     }
 
     if not page_parts.scheme or _origin(page_url) != _origin(base_url):
@@ -787,6 +882,7 @@ async def _submit_once(
     context = None
     action_clicked = False
     stage = "launch"
+    safe_debug["stage"] = stage
     page = None
     form_ref = None
     try:
@@ -841,17 +937,71 @@ async def _submit_once(
                 await _block_page_noise(context)
             page = await context.new_page()
             page.set_default_timeout(12_000)
+
+            def _on_page_error(error: Exception) -> None:
+                log.warning(
+                    "[BID][BROWSER-PAGE-ERROR] source=%s id=%s error_type=%s detail=%r",
+                    source_name,
+                    project_id,
+                    type(error).__name__,
+                    str(error).splitlines()[0][:180] if str(error) else "",
+                )
+
+            def _on_request_failed(request: Any) -> None:
+                if request.resource_type in _NOISE_RESOURCE_TYPES or any(
+                    host in request.url for host in _TRACKER_HOSTS
+                ):
+                    return
+                log.warning(
+                    "[BID][BROWSER-REQUEST-FAILED] source=%s id=%s method=%s resource=%s path=%s failure=%r",
+                    source_name,
+                    project_id,
+                    request.method,
+                    request.resource_type,
+                    urlsplit(request.url).path,
+                    str(request.failure or "")[:160],
+                )
+
+            page.on("pageerror", _on_page_error)
+            page.on("requestfailed", _on_request_failed)
             try:
                 stage = "page_load"
+                safe_debug["stage"] = stage
                 load_timeout_ms = int(float(bid_cfg.get("page_load_timeout_seconds") or 30) * 1000)
                 # "commit" = the server answered; do not wait for every sub-resource. A slow
                 # third-party file must not turn a usable page into a 25 s timeout.
+                navigation_started = time.monotonic()
                 navigation = await page.goto(page_url, wait_until="commit", timeout=load_timeout_ms)
-                for state, wait_ms in (("domcontentloaded", 10_000), ("load", 6_000)):
-                    try:
-                        await page.wait_for_load_state(state, timeout=wait_ms)
-                    except PlaywrightTimeoutError:
-                        log.debug("[BID][BROWSER-LOAD] id=%s state=%s not reached in %sms; continuing", project_id, state, wait_ms)
+                dom_ready = False
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=4_000)
+                    dom_ready = True
+                except PlaywrightTimeoutError:
+                    pass  # inspect the live DOM even if a third-party resource stalls
+                page_state = await page.evaluate(
+                    """() => ({
+                      ready_state: document.readyState,
+                      body_present: Boolean(document.body),
+                      forms: document.forms.length
+                    })"""
+                )
+                safe_debug["navigation"] = {
+                    "http_status": navigation.status if navigation is not None else None,
+                    "dom_content_loaded": dom_ready,
+                    **page_state,
+                    "elapsed_ms": int((time.monotonic() - navigation_started) * 1000),
+                }
+                log.info(
+                    "[BID][BROWSER-NAVIGATION] source=%s id=%s status=%s dom_ready=%s "
+                    "ready_state=%s forms=%s elapsed_ms=%s",
+                    source_name,
+                    project_id,
+                    navigation.status if navigation is not None else "unknown",
+                    dom_ready,
+                    page_state.get("ready_state"),
+                    page_state.get("forms"),
+                    safe_debug["navigation"]["elapsed_ms"],
+                )
                 if navigation is not None and navigation.status >= 400:
                     return _failure(
                         f"مرورگر نتوانست صفحه پروژه را باز کند (HTTP {navigation.status}).",
@@ -873,6 +1023,7 @@ async def _submit_once(
                     )
 
                 stage = "page_check"
+                safe_debug["stage"] = stage
                 body_text = await page.locator("body").inner_text(timeout=12_000)
                 lowered = body_text.casefold()
                 logged_markers = [
@@ -905,6 +1056,7 @@ async def _submit_once(
                     text_selector = _attr_selector("name", field_mapping["description"])
                     form_selector = f"form:has({amount_selector}):has({text_selector})"
                 stage = "find_form"
+                safe_debug["stage"] = stage
                 bid_cfg["_debug_form_id"] = form_id
                 form = page.locator(form_selector).first
                 form_ref = form
@@ -925,9 +1077,30 @@ async def _submit_once(
                 # The form may live in a hidden off-canvas. Open it only via
                 # a CTA tied to this project's numeric ID, then require visibility.
                 stage = "open_form"
+                safe_debug["stage"] = stage
                 if not await form.is_visible():
-                    cta = await _find_open_form_cta(page, source_name, str(project_id), current_url)
+                    cta_diagnostics: dict[str, Any] = {}
+                    cta = await _find_open_form_cta(
+                        page,
+                        source_name,
+                        str(project_id),
+                        current_url,
+                        form_id=form_id,
+                        diagnostics=cta_diagnostics,
+                    )
+                    safe_debug["cta_discovery"] = cta_diagnostics
                     if cta is None:
+                        log.error(
+                            "[BID][CTA-NOT-FOUND] source=%s id=%s page_path=%s form_id=%s diagnostics=%s",
+                            source_name,
+                            project_id,
+                            urlsplit(current_url).path,
+                            form_id,
+                            {
+                                key: cta_diagnostics.get(key)
+                                for key in ("visible_actionables", "strong_matches", "weak_matches", "reason")
+                            },
+                        )
                         await _dump_debug(page, form, bid_cfg, source_name, project_id, "project-cta-not-found")
                         return _failure(
                             "دکمه بازکردن فرم برای همین پروژه پیدا نشد؛ لینک‌های پروژه‌های مرتبط نادیده گرفته شدند.",
@@ -1010,6 +1183,7 @@ async def _submit_once(
                     valid_days_value = None
 
                 stage = "fill"
+                safe_debug["stage"] = stage
                 current_field = "amount"
                 try:
                     await fill_field("amount", str(int(amount)))
@@ -1044,6 +1218,7 @@ async def _submit_once(
                     )
 
                 stage = "validate"
+                safe_debug["stage"] = stage
                 form_valid = await form.evaluate("(el) => el.checkValidity()")
                 if not form_valid:
                     try:
@@ -1147,11 +1322,14 @@ async def _submit_once(
                 def on_request(request: Any) -> None:
                     if _is_bid_request(request.url, request.method):
                         request_seen["value"] = True
+                        safe_debug["request_sent"] = True
 
                 def on_response(resp: Any) -> None:
                     if not response_future.done() and _is_bid_request(resp.url, resp.request.method):
                         response_future.set_result(resp)
 
+                stage = "submit"
+                safe_debug["stage"] = stage
                 try:
                     editor_check = await control_message_state(form, field_mapping.get("description", ""))
                 except Exception:  # noqa: BLE001
@@ -1171,6 +1349,7 @@ async def _submit_once(
                     # Exactly one real click. Never replay the endpoint directly if
                     # the site does not issue the request.
                     action_clicked = True
+                    safe_debug["request_sent"] = "unknown"
                     await submitter.click()
                     clicked_at = time.monotonic()
                     while not response_future.done():
@@ -1200,6 +1379,9 @@ async def _submit_once(
                             timeout=2_000,
                         )
                         status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
+                        safe_debug["request_sent"] = True if request_seen["value"] else "unknown"
+                        safe_debug["site_confirmed"] = True
+                        safe_debug["confirmation"] = "site_ui_state"
                         log.info(
                             "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=ui_confirmed_without_response status_text=%r",
                             source_name,
@@ -1219,6 +1401,9 @@ async def _submit_once(
                     if not request_seen["value"]:
                         # Definite: no request left the browser, so nothing was registered.
                         safe_debug["request_sent"] = False
+                        safe_debug["response_received"] = False
+                        safe_debug["site_confirmed"] = False
+                        safe_debug["confirmation"] = "browser_did_not_send_request"
                         try:
                             invalid = await form.evaluate(
                                 "(el) => [...el.querySelectorAll(':invalid, .is-invalid')]"
@@ -1265,6 +1450,9 @@ async def _submit_once(
 
                     # A request left the browser but no answer came back: genuinely ambiguous.
                     safe_debug["request_sent"] = "unknown"
+                    safe_debug["response_received"] = False
+                    safe_debug["site_confirmed"] = False
+                    safe_debug["confirmation"] = "request_sent_response_missing"
                     log.warning(
                         "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=request_sent_no_response waited=%.0fs",
                         source_name,
@@ -1282,6 +1470,7 @@ async def _submit_once(
                 response = response_future.result()
 
                 safe_debug["request_sent"] = True
+                safe_debug["response_received"] = True
                 response_text = await response.text()
                 ok, message = html_parser.detect_success(response.status, response_text, bid_cfg)
                 if not ok and response.status < 400:
@@ -1303,6 +1492,8 @@ async def _submit_once(
                         pass
 
                 if not ok:
+                    safe_debug["site_confirmed"] = False
+                    safe_debug["confirmation"] = "server_response_not_successful"
                     # Subscription / daily-limit outranks everything
                     if html_parser.requires_subscription(response_text):
                         sub_snippet = html_parser.subscription_limit_snippet(response_text)
@@ -1356,6 +1547,8 @@ async def _submit_once(
                         payload_debug=safe_debug,
                     )
 
+                safe_debug["site_confirmed"] = True
+                safe_debug["confirmation"] = "server_response_success"
                 log.info(
                     "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s outcome=confirmed_success",
                     source_name,
@@ -1374,10 +1567,13 @@ async def _submit_once(
                     await _dump_debug(page, form_ref, bid_cfg, source_name, project_id, f"timeout-{stage}")
                 raise
     except PlaywrightTimeoutError:
+        safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
         safe_debug["stage"] = stage
         retryable = (not action_clicked) and stage in _RETRYABLE_STAGES
         safe_debug["retryable"] = retryable
+        if retryable:
+            safe_debug["retry_reason"] = f"timeout_before_submit:{stage}"
         log.warning(
             "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout stage=%s clicked=%s will_retry=%s",
             source_name,
@@ -1398,14 +1594,22 @@ async def _submit_once(
             debug=safe_debug,
         )
     except Exception as exc:
+        safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
         # A browser/page that died before any click is safe to retry once on a fresh browser.
+        safe_debug["response_received"] = False
+        safe_debug["site_confirmed"] = False
+        safe_debug["confirmation"] = "unknown_after_click" if action_clicked else "not_submitted"
         safe_debug["retryable"] = (not action_clicked) and type(exc).__name__ == "TargetClosedError"
+        if safe_debug["retryable"]:
+            safe_debug["retry_reason"] = f"browser_closed_before_submit:{stage}"
         log.warning(
-            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=browser_error error_type=%s clicked=%s",
+            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=browser_error stage=%s error_type=%s detail=%r clicked=%s",
             source_name,
             project_id,
+            stage,
             type(exc).__name__,
+            str(exc).splitlines()[0][:180] if str(exc) else "",
             action_clicked,
         )
         return _failure(
@@ -1430,9 +1634,10 @@ async def submit_js_managed_form(**kwargs: Any) -> SubmissionResult:
         result = await _submit_once(**kwargs)
         if (result.payload_debug or {}).get("retryable"):
             log.warning(
-                "[BID][BROWSER-RETRY] source=%s id=%s reason=browser_closed_before_click",
+                "[BID][BROWSER-RETRY] source=%s id=%s reason=%s",
                 kwargs.get("source_name"),
                 kwargs.get("project_id"),
+                (result.payload_debug or {}).get("retry_reason", "safe_pre_submit_retry"),
             )
             await asyncio.sleep(1.0)
             result = await _submit_once(**kwargs)

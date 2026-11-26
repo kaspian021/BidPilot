@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from .config import AppConfig, Secrets, get_secrets
 from .db import Database
@@ -394,14 +397,79 @@ def build_application(config: AppConfig, secrets: Secrets | None = None) -> Appl
 
 
 def configure_logging(level: str = "INFO") -> None:
+    """Configure concise console logs plus a rotating UTF-8 diagnostic file.
+
+    Application DEBUG messages remain available when requested, while noisy
+    database/HTTP internals are capped at WARNING so they cannot bury the
+    project -> proposal -> browser -> confirmation trace.
+    """
     level_value = getattr(logging, str(level or "INFO").upper(), logging.INFO)
-    logging.basicConfig(
-        level=level_value,
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # basicConfig is a no-op when an embedding host already installed a handler;
-    # still apply the requested level so INFO diagnostics are not silently hidden.
-    logging.getLogger().setLevel(level_value)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    root = logging.getLogger()
+    root.setLevel(level_value)
+
+    # A test runner or embedding host can close its temporary stderr stream
+    # between bot instances. Never reuse a tagged console handler with a dead
+    # stream; rebind to the current stderr instead.
+    for handler in list(root.handlers):
+        if not isinstance(handler, logging.StreamHandler):
+            continue
+        stream = getattr(handler, "stream", None)
+        if stream is None or getattr(stream, "closed", False):
+            # This includes untagged handlers installed by a host/test runner.
+            # A closed stderr stream raises during the next flush()/emit().
+            root.removeHandler(handler)
+
+    # Respect a host's existing live console handler. Otherwise install ours.
+    has_console = any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        and getattr(handler, "stream", None) is not None
+        and not getattr(handler.stream, "closed", False)
+        for handler in root.handlers
+    )
+    if not has_console:
+        console = logging.StreamHandler(sys.stderr)
+        console.setFormatter(formatter)
+        console._bidpilot_kind = "console"  # type: ignore[attr-defined]
+        root.addHandler(console)
+
+    try:
+        log_dir = Path("data") / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = (log_dir / "bidpilot.log").resolve()
+        already_added = any(
+            getattr(handler, "_bidpilot_log_path", None) == str(log_path)
+            for handler in root.handlers
+        )
+        if not already_added:
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+                delay=True,
+            )
+            file_handler.setFormatter(formatter)
+            file_handler._bidpilot_log_path = str(log_path)  # type: ignore[attr-defined]
+            root.addHandler(file_handler)
+    except OSError:
+        # Logging to disk is helpful, but must never prevent the bot starting.
+        root.warning("Could not create the rotating BidPilot log file", exc_info=True)
+
+    # Keep diagnostics for our own pipeline at the requested level, but suppress
+    # high-volume SQL statements, cursor/PRAGMA calls and transport internals.
+    for logger_name in (
+        "aiosqlite",
+        "sqlalchemy",
+        "sqlalchemy.engine",
+        "sqlalchemy.pool",
+        "sqlalchemy.dialects",
+        "httpx",
+        "httpcore",
+        "urllib3",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)

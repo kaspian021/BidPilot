@@ -280,15 +280,15 @@ async def test_a_truncated_answer_is_retried_with_more_room():
 
 class LongProposalClient(LLMClient):
     async def complete(self, system, user, *, max_tokens=None, response_format=None):
-        body, _signature = VALID_LLM_TEXT.rsplit("\\n\\nبا احترام،", 1)
-        extra = "\\n".join(
+        body = VALID_LLM_TEXT.rsplit(chr(10) * 2, 1)[0]
+        intro, price = body.split("قیمت پیشنهادی من", 1)
+        extra = chr(10).join(
             "برای اجرای دقیق این بخش، ابتدا نیازها را بررسی می‌کنم و سپس خروجی را مرحله‌ای تحویل می‌دهم."
             for _ in range(24)
         )
-        return LLMResponse(
-            text=f"{body}\\n{extra}\\n\\nبا احترام،\\nمحمد رضایی",
-            finish_reason="stop",
-        )
+        long_body = chr(10) * 2 + extra + chr(10) * 2 + "قیمت پیشنهادی من" + price
+        signature = chr(10) * 2 + "با احترام،" + chr(10) + "محمد رضایی"
+        return LLMResponse(text=intro + long_body + signature, finish_reason="stop")
 
 
 async def test_auto_trim_preserves_the_exact_name_and_closing_price_block():

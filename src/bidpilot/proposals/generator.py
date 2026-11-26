@@ -323,10 +323,24 @@ class ProposalGenerator:
                     else:
                         trimmed = cut.rstrip()
                     if len(trimmed) >= self.settings.min_chars:
-                        text = trimmed
-                        report_trimmed = validate_proposal(text, self.settings, amount)
-                        if not any("خیلی بلند" in i for i in report_trimmed.issues):
-                            pass
+                        # Trimming can cut off the exact-name signature that was
+                        # deliberately appended above. Re-apply the deterministic
+                        # identity lock after *all* text transformations.
+                        text = enforce_identity(trimmed, self.profile)
+                        report_trimmed = validate_proposal(
+                            text,
+                            self.settings,
+                            amount,
+                            hide_price=hide_price,
+                            profile=self.profile,
+                        )
+                        if report_trimmed.issues:
+                            log.info(
+                                "[PROPOSAL][POST-TRIM-VALIDATION] provider=%s chars=%s issues=%s",
+                                provider.id,
+                                len(text),
+                                report_trimmed.issues,
+                            )
             report = validate_proposal(text, self.settings, amount, hide_price=hide_price, profile=self.profile)
             if not report.ok and len(text) < 60:
                 # Garbage (a stray word, leaked reasoning): a repair call on a slow free model

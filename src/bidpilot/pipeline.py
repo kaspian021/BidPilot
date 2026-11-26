@@ -557,6 +557,15 @@ class BidPipeline:
 
         if getattr(self.generator, "last_llm_error", "") and not report.llm_error:
             report.llm_error = str(self.generator.last_llm_error)
+        log.info(
+            "[PIPELINE][PROPOSAL-READY] source=%s id=%s generated_by=%s chars=%s "
+            "template_fallback=%s",
+            project.source,
+            project.external_id,
+            proposal.generated_by,
+            len(proposal.text or ""),
+            bool(getattr(self.generator, "last_llm_error", "")),
+        )
         report.proposed.append(project.title)
         plan = BidPlan(
             project=project,
@@ -589,6 +598,18 @@ class BidPipeline:
             log.exception("Submit crashed for %s", project.uid)
             result = SubmissionResult(status=SubmissionStatus.FAILED, message=f"خطای غیرمنتظره: {exc}")
         plan.result = result
+        submit_debug = result.payload_debug or {}
+        log.info(
+            "[PIPELINE][SUBMIT-RESULT] source=%s id=%s status=%s http=%s "
+            "request_sent=%s stage=%s elapsed_ms=%.0f",
+            project.source,
+            project.external_id,
+            result.status.value if hasattr(result.status, "value") else result.status,
+            result.http_status,
+            submit_debug.get("request_sent", "not_reported"),
+            submit_debug.get("stage", "completed"),
+            (time.monotonic() - started) * 1000,
+        )
         if self.live and any(
             marker in str(result.message or "").casefold()
             for marker in (

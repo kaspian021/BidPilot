@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import time
@@ -410,10 +411,20 @@ def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.setLevel(level_value)
 
-    # Install our handlers exactly once. This also works when BidPilot runs
-    # inside Telegram/another host that has already configured logging.
+    # A test runner or embedding host can close its temporary stderr stream
+    # between bot instances. Never reuse a tagged console handler with a dead
+    # stream; rebind to the current stderr instead.
+    for handler in list(root.handlers):
+        if getattr(handler, "_bidpilot_kind", "") != "console":
+            continue
+        stream = getattr(handler, "stream", None)
+        if stream is None or getattr(stream, "closed", False):
+            root.removeHandler(handler)
+
+    # Install our console handler exactly once. This also works when BidPilot
+    # runs inside Telegram/another host that has already configured logging.
     if not any(getattr(handler, "_bidpilot_kind", "") == "console" for handler in root.handlers):
-        console = logging.StreamHandler()
+        console = logging.StreamHandler(sys.stderr)
         console.setFormatter(formatter)
         console._bidpilot_kind = "console"  # type: ignore[attr-defined]
         root.addHandler(console)

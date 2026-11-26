@@ -859,6 +859,7 @@ async def _submit_once(
         "request_sent": False,
         "response_received": False,
         "site_confirmed": False,
+        "confirmation": "not_submitted",
         "stage": "preflight",
     }
 

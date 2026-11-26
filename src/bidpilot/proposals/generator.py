@@ -327,16 +327,37 @@ class ProposalGenerator:
                         # body; a naive prefix slice removed the price/signature
                         # block and made otherwise usable model output fail.
                         signature = canonical_signature(self.profile).strip()
-                        suffix = f"\n\n{signature}" if signature and trimmed.endswith(signature) else ""
-                        body = trimmed[: -len(suffix)].rstrip() if suffix else trimmed
-                        body_limit = max(0, limit - len(suffix))
+                        signature_suffix = (
+                            f"\n\n{signature}" if signature and trimmed.endswith(signature) else ""
+                        )
+                        body = trimmed[: -len(signature_suffix)].rstrip() if signature_suffix else trimmed
+
+                        # Preserve the final price/currency paragraph together
+                        # with the signature. Otherwise a length trim can keep
+                        # the greeting but cut the actual amount from the bid.
+                        closing_suffix = ""
+                        if not hide_price and amount is not None:
+                            paragraphs = body.split("\n\n")
+                            for closing_index in range(len(paragraphs) - 1, -1, -1):
+                                candidate = "\n\n".join(paragraphs[closing_index:]).strip()
+                                if mentions_amount(candidate, amount) and mentions_currency(candidate):
+                                    closing_suffix = f"\n\n{candidate}"
+                                    body = "\n\n".join(paragraphs[:closing_index]).rstrip()
+                                    break
+
+                        protected_suffix = closing_suffix + signature_suffix
+                        body_limit = max(0, limit - len(protected_suffix))
                         cut = body[:body_limit]
                         for sep in ("\n\n", "\n", "۔", ".", "!", "؟", "?"):
                             idx = cut.rfind(sep)
                             if idx > body_limit * 0.6:
                                 cut = cut[: idx + len(sep)].rstrip()
                                 break
-                        text = f"{cut}{suffix}" if suffix else enforce_identity(cut.rstrip(), self.profile)
+                        text = (
+                            f"{cut}{protected_suffix}"
+                            if protected_suffix
+                            else enforce_identity(cut.rstrip(), self.profile)
+                        )
                         report_trimmed = validate_proposal(
                             text,
                             self.settings,

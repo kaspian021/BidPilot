@@ -464,7 +464,9 @@ async def test_slow_page_names_the_stage_and_retries_once_before_any_click(site,
         pytest.skip("playwright browser unavailable")
     assert result.status is SubmissionStatus.FAILED
     assert "بازشدن صفحهٔ پروژه" in result.message
+    assert "هیچ کلیک یا درخواستی" in result.message
     assert result.payload_debug["request_sent"] is False
+    assert result.payload_debug["confirmation"] == "not_submitted"
     assert result.payload_debug["stage"] == "page_load"
     assert sum(1 for hit in HITS if hit.startswith("/slow/")) == 2  # one automatic retry, no more
     assert RECEIVED == []

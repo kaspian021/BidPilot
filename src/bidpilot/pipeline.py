@@ -557,14 +557,16 @@ class BidPipeline:
 
         if getattr(self.generator, "last_llm_error", "") and not report.llm_error:
             report.llm_error = str(self.generator.last_llm_error)
+        llm_error = str(getattr(self.generator, "last_llm_error", "") or "")
         log.info(
             "[PIPELINE][PROPOSAL-READY] source=%s id=%s generated_by=%s chars=%s "
-            "template_fallback=%s",
+            "template_fallback=%s llm_error=%r",
             project.source,
             project.external_id,
             proposal.generated_by,
             len(proposal.text or ""),
-            bool(getattr(self.generator, "last_llm_error", "")),
+            str(proposal.generated_by).casefold() == "template",
+            llm_error[:220],
         )
         report.proposed.append(project.title)
         plan = BidPlan(
@@ -601,12 +603,16 @@ class BidPipeline:
         submit_debug = result.payload_debug or {}
         log.info(
             "[PIPELINE][SUBMIT-RESULT] source=%s id=%s status=%s http=%s "
-            "request_sent=%s stage=%s elapsed_ms=%.0f",
+            "request_sent=%s response_received=%s site_confirmed=%s confirmation=%s "
+            "stage=%s elapsed_ms=%.0f",
             project.source,
             project.external_id,
             result.status.value if hasattr(result.status, "value") else result.status,
             result.http_status,
             submit_debug.get("request_sent", "not_reported"),
+            submit_debug.get("response_received", "not_reported"),
+            submit_debug.get("site_confirmed", "not_reported"),
+            submit_debug.get("confirmation", "not_reported"),
             submit_debug.get("stage", "completed"),
             (time.monotonic() - started) * 1000,
         )

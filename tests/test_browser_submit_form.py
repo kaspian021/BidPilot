@@ -69,6 +69,23 @@ if (mode === 'external-submit') {
   f.after(submit);
   submit.setAttribute('form', f.id);
 }
+if (mode === 'aria-div-open' || mode === 'onclick-div-open') {
+  const old = document.getElementById('open');
+  const custom = document.createElement('div');
+  custom.id = mode;
+  custom.className = mode === 'onclick-div-open' ? 'bid-send--button' : 'btn btn-primary';
+  custom.textContent = 'ارسال پیشنهاد';
+  if (mode === 'aria-div-open') custom.setAttribute('aria-controls', 'panel');
+  if (mode === 'onclick-div-open') {
+    custom.setAttribute('onclick', "document.getElementById('panel').style.display='block'");
+  }
+  if (mode === 'aria-div-open') custom.setAttribute('role', 'button');
+  custom.addEventListener('click', () => {
+    document.getElementById('panel').style.display = 'block';
+    setTimeout(() => document.getElementById('panel').style.transform = 'none', 20);
+  });
+  old.replaceWith(custom);
+}
 let ifr = null;
 if (mode === 'iframe') {
   // TinyMCE-like: the real editor lives in an iframe and is copied to the textarea on submit only.
@@ -302,6 +319,44 @@ async def test_submit_button_associated_with_form_outside_form_is_supported(site
     assert result.status is SubmissionStatus.SUBMITTED, result.message
     assert len(RECEIVED) == 1
     assert RECEIVED[0]["path"] == "/conversation/ajax/bid-send/777"
+
+
+@pytest.mark.asyncio
+async def test_parscoders_accepts_aria_controlled_custom_element_as_project_cta(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(
+            site,
+            tmp_path,
+            source_name="parscoders",
+            page_url=f"{site}/project/777?mode=aria-div-open",
+        )
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    assert RECEIVED[0]["path"] == "/conversation/ajax/bid-send/777"
+    assert result.payload_debug["cta_discovery"]["selected_strategy"] == "form_target"
+
+
+@pytest.mark.asyncio
+async def test_parscoders_accepts_unique_delegated_onclick_div_cta(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(
+            site,
+            tmp_path,
+            source_name="parscoders",
+            page_url=f"{site}/project/777?mode=onclick-div-open",
+        )
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    assert RECEIVED[0]["path"] == "/conversation/ajax/bid-send/777"
+    assert result.payload_debug["cta_discovery"]["selected_strategy"] == "unique_cta_on_project_detail"
 
 
 @pytest.mark.asyncio

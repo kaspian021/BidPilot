@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from bidpilot.bot import BotService
 from bidpilot import logging_utils
+from bidpilot.bot import BotService
 
 
 class _Store:

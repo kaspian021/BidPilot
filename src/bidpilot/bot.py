@@ -1151,7 +1151,13 @@ class BotService:
         try:
             from .logging_utils import setup_file_logging
             setup_file_logging(self.store)
-            self._log_event("INFO", "system", "logging reconfigured", enabled=str(self.store.get("admin.logging.enabled")), level=str(self.store.get("admin.logging.level") or "DEBUG"))
+            self._log_event(
+                "INFO",
+                "system",
+                "logging reconfigured",
+                enabled=str(self.store.get("admin.logging.enabled")),
+                configured_level=str(self.store.get("admin.logging.level") or "DEBUG"),
+            )
         except Exception as e:
             log.warning("Refresh logging failed: %s", e)
 

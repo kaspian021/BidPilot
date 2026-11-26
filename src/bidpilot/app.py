@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
 import time
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from .config import AppConfig, Secrets, get_secrets
 from .db import Database

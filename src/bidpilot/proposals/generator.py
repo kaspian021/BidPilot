@@ -323,10 +323,20 @@ class ProposalGenerator:
                     else:
                         trimmed = cut.rstrip()
                     if len(trimmed) >= self.settings.min_chars:
-                        # Trimming can cut off the exact-name signature that was
-                        # deliberately appended above. Re-apply the deterministic
-                        # identity lock after *all* text transformations.
-                        text = enforce_identity(trimmed, self.profile)
+                        # Reserve the deterministic signature before cutting the
+                        # body; a naive prefix slice removed the price/signature
+                        # block and made otherwise usable model output fail.
+                        signature = canonical_signature(self.profile).strip()
+                        suffix = f"\n\n{signature}" if signature and trimmed.endswith(signature) else ""
+                        body = trimmed[: -len(suffix)].rstrip() if suffix else trimmed
+                        body_limit = max(0, limit - len(suffix))
+                        cut = body[:body_limit]
+                        for sep in ("\n\n", "\n", "۔", ".", "!", "؟", "?"):
+                            idx = cut.rfind(sep)
+                            if idx > body_limit * 0.6:
+                                cut = cut[: idx + len(sep)].rstrip()
+                                break
+                        text = f"{cut}{suffix}" if suffix else enforce_identity(cut.rstrip(), self.profile)
                         report_trimmed = validate_proposal(
                             text,
                             self.settings,

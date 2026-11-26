@@ -69,6 +69,29 @@ if (mode === 'external-submit') {
   f.after(submit);
   submit.setAttribute('form', f.id);
 }
+if (mode === 'detail-links' || mode === 'detail-links-no-cta') {
+  const old = document.getElementById('open');
+  old.remove();
+  // Links to /project/<id> are detail/navigation links, not bid openers.
+  for (let i = 0; i < 9; i++) {
+    const link = document.createElement('a');
+    link.className = 'related-project-link';
+    link.href = location.pathname;
+    link.textContent = 'مشاهده جزئیات پروژه';
+    document.body.appendChild(link);
+  }
+  if (mode === 'detail-links') {
+    const custom = document.createElement('div');
+    custom.id = 'delegated-proposal-opener';
+    custom.className = 'btn btn-primary';
+    custom.textContent = 'ارسال پیشنهاد';
+    custom.addEventListener('click', () => {
+      document.getElementById('panel').style.display = 'block';
+      setTimeout(() => document.getElementById('panel').style.transform = 'none', 20);
+    });
+    document.body.prepend(custom);
+  }
+}
 if (mode === 'aria-div-open' || mode === 'onclick-div-open') {
   const old = document.getElementById('open');
   const custom = document.createElement('div');
@@ -357,6 +380,46 @@ async def test_parscoders_accepts_unique_delegated_onclick_div_cta(site, tmp_pat
     assert len(RECEIVED) == 1
     assert RECEIVED[0]["path"] == "/conversation/ajax/bid-send/777"
     assert result.payload_debug["cta_discovery"]["selected_strategy"] == "unique_cta_on_project_detail"
+
+
+@pytest.mark.asyncio
+async def test_same_project_detail_links_are_not_misclassified_as_bid_ctas(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(
+            site,
+            tmp_path,
+            source_name="parscoders",
+            page_url=f"{site}/project/777?mode=detail-links",
+        )
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    discovery = result.payload_debug["cta_discovery"]
+    assert discovery["strong_matches"] == 0
+    assert discovery["weak_matches"] == 1
+    assert discovery["selected_strategy"] == "unique_cta_on_project_detail"
+
+
+@pytest.mark.asyncio
+async def test_same_project_detail_links_alone_never_trigger_bid_submit(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(
+            site,
+            tmp_path,
+            source_name="parscoders",
+            page_url=f"{site}/project/777?mode=detail-links-no-cta",
+        )
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert "دکمه بازکردن فرم" in result.message
+    assert result.payload_debug["request_sent"] is False
+    assert RECEIVED == []
 
 
 @pytest.mark.asyncio

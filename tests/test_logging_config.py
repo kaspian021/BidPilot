@@ -11,6 +11,16 @@ def test_configure_logging_writes_rotating_file_and_suppresses_sql_noise(tmp_pat
     original_root_level = root.level
     db_logger = logging.getLogger("aiosqlite")
     original_db_level = db_logger.level
+    noisy_loggers = (
+        "sqlalchemy",
+        "sqlalchemy.engine",
+        "sqlalchemy.pool",
+        "sqlalchemy.dialects",
+        "httpx",
+        "httpcore",
+        "urllib3",
+    )
+    original_levels = {name: logging.getLogger(name).level for name in noisy_loggers}
     monkeypatch.chdir(tmp_path)
 
     try:
@@ -21,7 +31,8 @@ def test_configure_logging_writes_rotating_file_and_suppresses_sql_noise(tmp_pat
         db_logger.debug("sqlite-noise-marker")
 
         for handler in root.handlers:
-            handler.flush()
+            if getattr(handler, "_bidpilot_log_path", None):
+                handler.flush()
 
         log_path = Path("data/logs/bidpilot.log")
         assert log_path.is_file()
@@ -35,3 +46,5 @@ def test_configure_logging_writes_rotating_file_and_suppresses_sql_noise(tmp_pat
                 handler.close()
         root.setLevel(original_root_level)
         db_logger.setLevel(original_db_level)
+        for name, level in original_levels.items():
+            logging.getLogger(name).setLevel(level)

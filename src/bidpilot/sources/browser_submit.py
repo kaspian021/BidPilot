@@ -543,7 +543,12 @@ async def _find_open_form_cta(
               const nodes = [...document.querySelectorAll(selector)];
               const endpoint = '/conversation/ajax/bid-send/' + projectId;
               const currentPath = location.pathname.replace(/\\/+$/, '') || '/';
-              const pagePattern = new RegExp('^/project/' + projectId + '(?:/[^/]+)?              const isVisible = el => {
+              const form = formId ? document.getElementById(formId) : null;
+              const isSameProjectDetailPath = targetPath => (
+                targetPath === '/project/' + projectId ||
+                targetPath.startsWith('/project/' + projectId + '/')
+              );
+              const isVisible = el => {
                 const r = el.getBoundingClientRect(), s = getComputedStyle(el);
                 return s.display !== 'none' && s.visibility !== 'hidden' &&
                   Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0 &&
@@ -585,7 +590,7 @@ async def _find_open_form_cta(
                 const ids = [...targetPath.matchAll(/(?:^|\\/)(\\d+)(?=\\/|$)/g)].map(m => m[1]);
                 if (ids.some(value => value !== String(projectId))) unsafe = true;
                 const allowedPath = !targetPath || targetPath === currentPath ||
-                  targetPath === endpoint || pagePattern.test(targetPath);
+                  targetPath === endpoint || isSameProjectDetailPath(targetPath);
                 if (!allowedPath) unsafe = true;
 
                 const controls = (el.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean);

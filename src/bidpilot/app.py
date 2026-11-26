@@ -415,15 +415,23 @@ def configure_logging(level: str = "INFO") -> None:
     # between bot instances. Never reuse a tagged console handler with a dead
     # stream; rebind to the current stderr instead.
     for handler in list(root.handlers):
-        if getattr(handler, "_bidpilot_kind", "") != "console":
+        if not isinstance(handler, logging.StreamHandler):
             continue
         stream = getattr(handler, "stream", None)
         if stream is None or getattr(stream, "closed", False):
+            # This includes untagged handlers installed by a host/test runner.
+            # A closed stderr stream raises during the next flush()/emit().
             root.removeHandler(handler)
 
-    # Install our console handler exactly once. This also works when BidPilot
-    # runs inside Telegram/another host that has already configured logging.
-    if not any(getattr(handler, "_bidpilot_kind", "") == "console" for handler in root.handlers):
+    # Respect a host's existing live console handler. Otherwise install ours.
+    has_console = any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        and getattr(handler, "stream", None) is not None
+        and not getattr(handler.stream, "closed", False)
+        for handler in root.handlers
+    )
+    if not has_console:
         console = logging.StreamHandler(sys.stderr)
         console.setFormatter(formatter)
         console._bidpilot_kind = "console"  # type: ignore[attr-defined]

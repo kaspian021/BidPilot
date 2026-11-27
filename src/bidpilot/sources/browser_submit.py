@@ -426,19 +426,6 @@ async def _dump_debug(
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = target / f"{stamp}-{re.sub(r'[^A-Za-z0-9_.-]', '_', source)}-{project_id}-{reason}"
 
-        # The full page image shows the CTA and panel context. A viewport image
-        # is also saved because it is the most useful view for off-canvas bugs.
-        try:
-            await page.screenshot(path=str(base.with_suffix(".png")), full_page=True, timeout=8_000)
-        except Exception:
-            await page.screenshot(path=str(base.with_suffix(".png")), full_page=False, timeout=5_000)
-        try:
-            await page.screenshot(
-                path=str(base.with_name(base.name + "-viewport.png")), full_page=False, timeout=5_000
-            )
-        except Exception:
-            pass
-
         # Keep the whole DOM (including CTA siblings), but strip every field
         # value, textarea/editor contents, inline script and CSRF-like attribute.
         safe_html = await page.evaluate(
@@ -489,12 +476,31 @@ async def _dump_debug(
             )
         except Exception as exc:  # noqa: BLE001
             log.info("[BID][BROWSER-DEBUG] DOM inventory failed error_type=%s", type(exc).__name__)
+        # Screenshots last and independently: on a page that is still loading they can fail
+        # (pending fonts, busy main thread) and must not cost us the HTML/DOM evidence above.
+        shots = []
+        for suffix, full in ((".png", True), ("-viewport.png", False)):
+            target_file = base.with_name(base.name + suffix) if suffix != ".png" else base.with_suffix(".png")
+            try:
+                await page.screenshot(path=str(target_file), full_page=full, timeout=6_000, animations="disabled")
+                shots.append(target_file.name)
+            except Exception as shot_error:  # noqa: BLE001
+                log.info(
+                    "[BID][BROWSER-DEBUG] screenshot %s failed error_type=%s detail=%r",
+                    "full" if full else "viewport",
+                    type(shot_error).__name__,
+                    str(shot_error).splitlines()[0][:160] if str(shot_error) else "",
+                )
         log.warning(
-            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s",
-            source, project_id, reason, base
+            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s screenshots=%s",
+            source, project_id, reason, base, shots
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
-        log.info("[BID][BROWSER-DEBUG] capture failed error_type=%s", type(exc).__name__)
+        log.info(
+            "[BID][BROWSER-DEBUG] capture failed error_type=%s detail=%r",
+            type(exc).__name__,
+            str(exc).splitlines()[0][:160] if str(exc) else "",
+        )
 
 
 #: One shared selector so discovery (JS index) and clicking (locator.nth) always agree.
@@ -579,6 +585,18 @@ async def _page_state(page: Any, form_id: str) -> dict[str, Any]:
         return dict(await page.evaluate(_PAGE_STATE_JS, {"formId": str(form_id or "")}))
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
         return {"error": type(exc).__name__}
+
+
+async def _wait_scripts_ready(page: Any, timeout_s: float) -> bool:
+    """True once the HTML parser finished (``interactive``/``complete``) and handlers had a moment to bind."""
+    try:
+        await page.wait_for_function(
+            "document.readyState !== 'loading'", timeout=max(100, int(timeout_s * 1000))
+        )
+    except Exception:  # noqa: BLE001 - still loading, or page closed
+        return False
+    await page.wait_for_timeout(300)  # DOMContentLoaded handlers (jQuery ready) run right after
+    return True
 
 
 async def _find_open_form_cta(
@@ -915,20 +933,96 @@ _TRACKER_HOSTS = (
 )
 
 
-async def _block_page_noise(context: Any) -> None:
-    """Skip images, fonts, media and analytics: the bid form needs none of them.
+def _site_root(host: str) -> str:
+    parts = [part for part in (host or "").lower().split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (host or "").lower()
 
-    On slow or filtered networks these (not the form) are what keeps a page
-    "loading" for half a minute. Scripts and styles stay untouched so the site's
-    own form logic and layout work exactly as for a person.
+
+def _is_third_party(url: str, base_url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    base_host = (urlsplit(base_url).hostname or "").lower()
+    if not host or not base_host:
+        return False
+    return _site_root(host) != _site_root(base_host)
+
+
+class _PendingRequests:
+    """Which requests are still in flight, so a page stuck in ``loading`` explains itself."""
+
+    def __init__(self) -> None:
+        self._open: dict[int, tuple[Any, float]] = {}
+        self.skipped: list[dict[str, Any]] = []
+
+    def started(self, request: Any) -> None:
+        self._open[id(request)] = (request, time.monotonic())
+
+    def done(self, request: Any) -> None:
+        self._open.pop(id(request), None)
+
+    def snapshot(self, limit: int = 12) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        rows = []
+        for request, started in self._open.values():
+            parts = urlsplit(str(request.url))
+            rows.append({
+                "type": request.resource_type,
+                "host": parts.hostname or "",
+                "path": parts.path[:80],
+                "age_ms": int((now - started) * 1000),
+            })
+        rows.sort(key=lambda row: row["age_ms"], reverse=True)
+        return rows[:limit]
+
+
+_STUB_BODIES = {
+    "script": ("application/javascript", ""),
+    "stylesheet": ("text/css", ""),
+}
+
+
+async def _block_page_noise(
+    context: Any,
+    base_url: str = "",
+    tracker: _PendingRequests | None = None,
+    third_party_budget_ms: int = 5_000,
+) -> None:
+    """Skip images, fonts, media and analytics, and never let a slow third party stall the page.
+
+    The bid form needs none of the blocked resources. Scripts and styles of the site itself stay
+    untouched. A *third-party* script/stylesheet (a CDN font CSS, a widget, a captcha loader) that
+    does not answer within ``third_party_budget_ms`` is replaced by an empty file: such a request
+    blocks the HTML parser, so the site's own scripts (and the click handler of the proposal
+    button) would otherwise never run on slow or filtered networks.
     """
 
     async def handler(route: Any) -> None:
         request = route.request
-        if request.resource_type in _NOISE_RESOURCE_TYPES or any(host in request.url for host in _TRACKER_HOSTS):
-            await route.abort()
-        else:
+        try:
+            if request.resource_type in _NOISE_RESOURCE_TYPES or any(host in request.url for host in _TRACKER_HOSTS):
+                await route.abort()
+                return
+            if (
+                base_url
+                and request.resource_type in _STUB_BODIES
+                and _is_third_party(request.url, base_url)
+            ):
+                try:
+                    response = await route.fetch(timeout=max(500, third_party_budget_ms))
+                    await route.fulfill(response=response)
+                except Exception as exc:  # noqa: BLE001 - slow, filtered or failing third party
+                    content_type, body = _STUB_BODIES[request.resource_type]
+                    if tracker is not None:
+                        tracker.skipped.append({
+                            "type": request.resource_type,
+                            "host": urlsplit(request.url).hostname or "",
+                            "path": urlsplit(request.url).path[:80],
+                            "reason": type(exc).__name__,
+                        })
+                    await route.fulfill(status=200, content_type=content_type, body=body)
+                return
             await route.continue_()
+        except Exception:  # noqa: BLE001 - page/context already closed or request already handled
+            return
 
     await context.route("**/*", handler)
 
@@ -1159,10 +1253,20 @@ async def _submit_once(
             cookie_specs = _browser_cookies(cookies, base_url)
             if cookie_specs:
                 await context.add_cookies(cookie_specs)
+            pending = _PendingRequests()
+            safe_debug["skipped_third_party"] = pending.skipped  # filled live by the route handler
             if bid_cfg.get("browser_block_noise", True):
-                await _block_page_noise(context)
+                await _block_page_noise(
+                    context,
+                    base_url,
+                    pending,
+                    int(bid_cfg.get("third_party_budget_ms") or 5_000),
+                )
             page = await context.new_page()
             page.set_default_timeout(12_000)
+            page.on("request", pending.started)
+            page.on("requestfinished", pending.done)
+            page.on("requestfailed", pending.done)
 
             def _on_page_error(error: Exception) -> None:
                 log.warning(
@@ -1244,6 +1348,16 @@ async def _submit_once(
                     page_state.get("forms"),
                     safe_debug["navigation"]["elapsed_ms"],
                 )
+                if not dom_ready:
+                    safe_debug["pending_requests"] = pending.snapshot()
+                    log.warning(
+                        "[BID][PENDING] source=%s id=%s ready_state=%s waiting_on=%s skipped_third_party=%s",
+                        source_name,
+                        project_id,
+                        page_state.get("ready_state"),
+                        safe_debug["pending_requests"],
+                        pending.skipped,
+                    )
                 trace.step(
                     "navigation",
                     http=navigation.status if navigation is not None else None,
@@ -1411,55 +1525,122 @@ async def _submit_once(
                             debug=safe_debug,
                         )
                     if cta is not None and not await form.is_visible():
-                        selector = str(cta_diagnostics.get("selector") or "")
-                        order = [
-                            int(index)
-                            for index in (cta_diagnostics.get("ordered_indexes") or [])
-                            if str(index).lstrip("-").isdigit()
-                        ] or [int(cta_diagnostics.get("selected_index") or 0)]
+                        # Clicking an opener before the site's own scripts ran does nothing (no
+                        # handler is bound yet), and indexes shift while the page is still being
+                        # parsed. So: wait for scripts, re-discover, click, and repeat until a
+                        # time budget runs out. A click is harmless until the form is visible.
                         open_timeout = max(250, min(30_000, int(bid_cfg.get("form_open_timeout_ms") or 12_000)))
+                        open_budget = max(
+                            open_timeout, int(bid_cfg.get("form_open_budget_ms") or 60_000)
+                        ) / 1000
+                        open_deadline = time.monotonic() + open_budget
                         opened = False
-                        attempts = order[:4]
-                        for position, index in enumerate(attempts, start=1):
-                            opener = page.locator(selector).nth(index) if selector else cta
-                            per_try_timeout = open_timeout if position == len(attempts) else min(open_timeout, 5_000)
-                            try:
-                                await opener.scroll_into_view_if_needed(timeout=3_000)
-                                await opener.click(timeout=8_000)
-                                await form.wait_for(state="visible", timeout=per_try_timeout)
+                        open_round = 0
+                        click_errors: list[str] = []
+                        while not opened and time.monotonic() < open_deadline:
+                            open_round += 1
+                            remaining_s = max(0.0, open_deadline - time.monotonic())
+                            scripts_ready = await _wait_scripts_ready(page, min(remaining_s, 10.0))
+                            if await form.is_visible():
                                 opened = True
-                            except Exception as click_error:  # noqa: BLE001
+                                break
+                            if open_round > 1 or cta is None:
+                                cta = await _find_open_form_cta(
+                                    page,
+                                    source_name,
+                                    str(project_id),
+                                    current_url,
+                                    form_id=form_id,
+                                    diagnostics=cta_diagnostics,
+                                    quiet=True,
+                                )
+                            selector = str(cta_diagnostics.get("selector") or "")
+                            order = [
+                                int(index)
+                                for index in (cta_diagnostics.get("ordered_indexes") or [])
+                                if str(index).lstrip("-").isdigit()
+                            ]
+                            if selector and order:
+                                openers = [(index, page.locator(selector).nth(index)) for index in order[:3]]
+                            elif cta is not None:  # sources with a single, exact opener locator
+                                openers = [(0, cta)]
+                            else:
+                                await page.wait_for_timeout(1_000)
+                                continue
+                            attempts = openers
+                            for position, (index, opener) in enumerate(attempts, start=1):
+                                if time.monotonic() >= open_deadline:
+                                    break
+                                wait_ms = open_timeout if scripts_ready else min(open_timeout, 3_000)
+                                wait_ms = int(max(250, min(wait_ms, (open_deadline - time.monotonic()) * 1000)))
+                                try:
+                                    await opener.scroll_into_view_if_needed(timeout=3_000)
+                                    await opener.click(timeout=6_000)
+                                    await form.wait_for(state="visible", timeout=wait_ms)
+                                    opened = True
+                                except Exception as click_error:  # noqa: BLE001
+                                    kind = type(click_error).__name__
+                                    click_errors.append(kind)
+                                    trace.step(
+                                        "cta_click",
+                                        round=open_round,
+                                        index=index,
+                                        position=position,
+                                        scripts_ready=scripts_ready,
+                                        opened=False,
+                                        error_type=kind,
+                                    )
+                                    log.warning(
+                                        "[BID][CTA-CLICK] source=%s id=%s round=%s index=%s try=%s/%s "
+                                        "scripts_ready=%s opened=False error_type=%s",
+                                        source_name,
+                                        project_id,
+                                        open_round,
+                                        index,
+                                        position,
+                                        len(attempts),
+                                        scripts_ready,
+                                        kind,
+                                    )
+                                    continue
                                 trace.step(
                                     "cta_click",
+                                    round=open_round,
                                     index=index,
                                     position=position,
-                                    opened=False,
-                                    error_type=type(click_error).__name__,
+                                    scripts_ready=scripts_ready,
+                                    opened=True,
                                 )
-                                log.warning(
-                                    "[BID][CTA-CLICK] source=%s id=%s index=%s try=%s/%s opened=False "
-                                    "error_type=%s",
+                                log.info(
+                                    "[BID][CTA-CLICK] source=%s id=%s round=%s index=%s try=%s/%s "
+                                    "scripts_ready=%s opened=True",
                                     source_name,
                                     project_id,
+                                    open_round,
                                     index,
                                     position,
                                     len(attempts),
-                                    type(click_error).__name__,
+                                    scripts_ready,
                                 )
-                                continue
-                            trace.step("cta_click", index=index, position=position, opened=True)
-                            log.info(
-                                "[BID][CTA-CLICK] source=%s id=%s index=%s try=%s/%s opened=True",
-                                source_name,
-                                project_id,
-                                index,
-                                position,
-                                len(attempts),
-                            )
-                            break
+                                break
                         if not opened:
                             safe_debug["form_open_timeout_ms"] = open_timeout
+                            safe_debug["form_open_budget_s"] = round(open_budget, 1)
+                            safe_debug["open_rounds"] = open_round
+                            safe_debug["click_errors"] = click_errors[-6:]
+                            safe_debug["pending_requests"] = pending.snapshot()
                             safe_debug["page_state"] = await _page_state(page, form_id)
+                            log.error(
+                                "[BID][FORM-NOT-OPENED] source=%s id=%s rounds=%s budget_s=%s ready_state=%s "
+                                "waiting_on=%s skipped_third_party=%s",
+                                source_name,
+                                project_id,
+                                open_round,
+                                round(open_budget, 1),
+                                (safe_debug["page_state"] or {}).get("ready_state"),
+                                safe_debug["pending_requests"],
+                                pending.skipped,
+                            )
                             await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-did-not-open")
                             return _failure(
                                 "پس از کلیک روی دکمه مخصوص پروژه، پنل ارسال واقعاً باز نشد؛ "

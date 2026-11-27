@@ -39,6 +39,12 @@ PAGE = """<!doctype html><html lang="fa" dir="rtl"><body>
   <button type="button" id="msg_submit_btn" disabled data-href="/conversation/ajax/bid-send/777">ارسال</button>
 </form></div>
 <script>
+if ((new URLSearchParams(location.search).get('mode') || '') === 'hang-script') {
+  // A third-party script that never answers blocks the parser: nothing below runs until it ends.
+  document.write('<script src="http://localhost:' + location.port + '/slow-script.js"><\\/script>');
+}
+</script>
+<script>
 const f = document.getElementById('init_message_form');
 const amount = f.bidAmount;
 amount.addEventListener('input', () => {
@@ -50,6 +56,15 @@ f.addEventListener('input', refresh); f.addEventListener('change', refresh);
 function refresh(){ document.getElementById('msg_submit_btn').disabled = !f.checkValidity(); }
 const mode = new URLSearchParams(location.search).get('mode') || 'plain';
 if (mode === 'no-open') document.getElementById('open').removeAttribute('onclick');
+if (mode === 'hang-script') {
+  // The opener only gets its handler from this (blocked) script, like the site's bundled JS.
+  const opener = document.getElementById('open');
+  opener.removeAttribute('onclick');
+  opener.addEventListener('click', () => {
+    document.getElementById('panel').style.display = 'block';
+    setTimeout(() => document.getElementById('panel').style.transform = 'none', 20);
+  });
+}
 if (mode === 'anchor-open') {
   const opener = document.getElementById('open');
   const link = document.createElement('a');
@@ -195,6 +210,13 @@ class Handler(BaseHTTPRequestHandler):
         HITS.append(self.path)
         if self.path.startswith('/slow/'):
             time.sleep(4)  # a server that does not answer in time
+        if self.path.startswith('/slow-script.js'):
+            time.sleep(25)  # a third-party script that never answers in time
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         body = PAGE.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -466,6 +488,7 @@ async def test_hidden_form_that_does_not_open_is_not_filled_and_is_fully_diagnos
     bid_cfg = {
         "valid_days": 7,
         "form_open_timeout_ms": 250,
+        "form_open_budget_ms": 600,
         "cta_discovery_timeout_ms": 500,
         "browser_debug_dir": str(tmp_path / "dbg"),
         "trace_dir": str(tmp_path / "trace"),
@@ -583,3 +606,49 @@ async def test_every_attempt_writes_a_readable_trace_and_missing_cta_dumps_page_
     names = [step["step"] for step in record["steps"]]
     assert names[:3] == ["navigation", "form_lookup", "cta_attempt"] and names[-1] == "result"
     assert "SECRET" not in lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_slow_third_party_script_cannot_keep_the_page_from_running_its_own_scripts(site, tmp_path):
+    """The production failure: page stuck in 'loading', opener has no handler yet, click does nothing."""
+    _require_chromium()
+    bid_cfg = {
+        "valid_days": 7,
+        "third_party_budget_ms": 1_000,
+        "dom_ready_timeout_ms": 1_000,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
+    }
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=hang-script", bid_cfg=bid_cfg)
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    skipped = result.payload_debug.get("skipped_third_party") or []
+    assert skipped and skipped[0]["host"] == "localhost"
+
+
+@pytest.mark.asyncio
+async def test_page_stuck_loading_reports_what_it_is_waiting_on(site, tmp_path):
+    _require_chromium()
+    bid_cfg = {
+        "valid_days": 7,
+        "browser_block_noise": False,  # nothing rescues the page: the report must name the culprit
+        "dom_ready_timeout_ms": 1_000,
+        "form_open_timeout_ms": 250,
+        "form_open_budget_ms": 1_500,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
+    }
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=hang-script", bid_cfg=bid_cfg)
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert RECEIVED == []
+    waiting = result.payload_debug["pending_requests"]
+    assert any(row["host"] == "localhost" and row["path"] == "/slow-script.js" for row in waiting)
+    assert result.payload_debug["open_rounds"] >= 1

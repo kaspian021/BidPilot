@@ -39,6 +39,12 @@ PAGE = """<!doctype html><html lang="fa" dir="rtl"><body>
   <button type="button" id="msg_submit_btn" disabled data-href="/conversation/ajax/bid-send/777">ارسال</button>
 </form></div>
 <script>
+if ((new URLSearchParams(location.search).get('mode') || '') === 'hang-script') {
+  // A third-party script that never answers blocks the parser: nothing below runs until it ends.
+  document.write('<script src="http://localhost:' + location.port + '/slow-script.js"><\\/script>');
+}
+</script>
+<script>
 const f = document.getElementById('init_message_form');
 const amount = f.bidAmount;
 amount.addEventListener('input', () => {
@@ -50,6 +56,15 @@ f.addEventListener('input', refresh); f.addEventListener('change', refresh);
 function refresh(){ document.getElementById('msg_submit_btn').disabled = !f.checkValidity(); }
 const mode = new URLSearchParams(location.search).get('mode') || 'plain';
 if (mode === 'no-open') document.getElementById('open').removeAttribute('onclick');
+if (mode === 'hang-script') {
+  // The opener only gets its handler from this (blocked) script, like the site's bundled JS.
+  const opener = document.getElementById('open');
+  opener.removeAttribute('onclick');
+  opener.addEventListener('click', () => {
+    document.getElementById('panel').style.display = 'block';
+    setTimeout(() => document.getElementById('panel').style.transform = 'none', 20);
+  });
+}
 if (mode === 'anchor-open') {
   const opener = document.getElementById('open');
   const link = document.createElement('a');
@@ -91,6 +106,38 @@ if (mode === 'detail-links' || mode === 'detail-links-no-cta') {
     });
     document.body.prepend(custom);
   }
+}
+function panelOpener(text) {
+  const el = document.createElement('div');
+  el.className = 'btn btn-primary';
+  el.textContent = text;
+  el.addEventListener('click', () => {
+    document.getElementById('panel').style.display = 'block';
+    setTimeout(() => document.getElementById('panel').style.transform = 'none', 20);
+  });
+  return el;
+}
+if (mode === 'below-fold') {
+  // The opener sits far below the first screen: a viewport-only check would never see it.
+  document.getElementById('open').remove();
+  const spacer = document.createElement('div');
+  spacer.style.height = '4000px';
+  document.body.appendChild(spacer);
+  document.body.appendChild(panelOpener('ارسال پیشنهاد'));
+}
+if (mode === 'late-cta') {
+  // The opener is rendered by a script well after the form already exists.
+  document.getElementById('open').remove();
+  setTimeout(() => document.body.prepend(panelOpener('ارسال پیشنهاد')), 2500);
+}
+if (mode === 'decoy-first') {
+  // Two identical labels: the first one does nothing, the second opens the panel.
+  document.getElementById('open').remove();
+  const decoy = document.createElement('div');
+  decoy.className = 'btn btn-secondary';
+  decoy.textContent = 'ارسال پیشنهاد';
+  document.body.prepend(decoy);
+  document.body.appendChild(panelOpener('ارسال پیشنهاد'));
 }
 if (mode === 'aria-div-open' || mode === 'onclick-div-open') {
   const old = document.getElementById('open');
@@ -163,6 +210,13 @@ class Handler(BaseHTTPRequestHandler):
         HITS.append(self.path)
         if self.path.startswith('/slow/'):
             time.sleep(4)  # a server that does not answer in time
+        if self.path.startswith('/slow-script.js'):
+            time.sleep(25)  # a third-party script that never answers in time
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         body = PAGE.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -210,7 +264,7 @@ def _args(base: str, tmp_path, **overrides):
         "proposal_text": "سلام\nاین یک پیشنهاد آزمایشی است.\nخط سوم",
         "amount": 500_000,
         "delivery_days": 14,
-        "bid_cfg": {"valid_days": 7, "browser_debug_dir": str(tmp_path / "dbg")},
+        "bid_cfg": {"valid_days": 7, "browser_debug_dir": str(tmp_path / "dbg"), "trace_dir": str(tmp_path / "trace")},
         "auth_cfg": {},
     }
     values.update(overrides)
@@ -412,6 +466,12 @@ async def test_same_project_detail_links_alone_never_trigger_bid_submit(site, tm
             tmp_path,
             source_name="parscoders",
             page_url=f"{site}/project/777?mode=detail-links-no-cta",
+            bid_cfg={
+                "valid_days": 7,
+                "cta_discovery_timeout_ms": 1_500,
+                "browser_debug_dir": str(tmp_path / "dbg"),
+                "trace_dir": str(tmp_path / "trace"),
+            },
         )
     )
     if "نصب نیست" in result.message or "دسترس نیست" in result.message:
@@ -428,7 +488,10 @@ async def test_hidden_form_that_does_not_open_is_not_filled_and_is_fully_diagnos
     bid_cfg = {
         "valid_days": 7,
         "form_open_timeout_ms": 250,
+        "form_open_budget_ms": 600,
+        "cta_discovery_timeout_ms": 500,
         "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
     }
     result = await submit_js_managed_form(
         **_args(
@@ -458,7 +521,12 @@ async def test_hidden_form_that_does_not_open_is_not_filled_and_is_fully_diagnos
 @pytest.mark.asyncio
 async def test_slow_page_names_the_stage_and_retries_once_before_any_click(site, tmp_path):
     _require_chromium()
-    bid_cfg = {"valid_days": 7, "browser_debug_dir": str(tmp_path / "dbg"), "page_load_timeout_seconds": 1}
+    bid_cfg = {
+        "valid_days": 7,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
+        "page_load_timeout_seconds": 1,
+    }
     result = await submit_js_managed_form(**_args(site, tmp_path, page_url=f"{site}/slow/777", bid_cfg=bid_cfg))
     if "نصب نیست" in result.message:
         pytest.skip("playwright browser unavailable")
@@ -470,3 +538,117 @@ async def test_slow_page_names_the_stage_and_retries_once_before_any_click(site,
     assert result.payload_debug["stage"] == "page_load"
     assert sum(1 for hit in HITS if hit.startswith("/slow/")) == 2  # one automatic retry, no more
     assert RECEIVED == []
+
+
+@pytest.mark.asyncio
+async def test_parscoders_opener_below_the_first_screen_is_found(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, source_name="parscoders", page_url=f"{site}/project/777?mode=below-fold")
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+
+
+@pytest.mark.asyncio
+async def test_parscoders_opener_rendered_late_by_scripts_is_waited_for(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, source_name="parscoders", page_url=f"{site}/project/777?mode=late-cta")
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+
+
+@pytest.mark.asyncio
+async def test_parscoders_tries_next_candidate_when_first_looks_right_but_does_not_open(site, tmp_path):
+    _require_chromium()
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, source_name="parscoders", page_url=f"{site}/project/777?mode=decoy-first")
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    assert result.payload_debug["cta_discovery"]["selected_strategy"] == "ordered_try_each"
+
+
+@pytest.mark.asyncio
+async def test_every_attempt_writes_a_readable_trace_and_missing_cta_dumps_page_state(site, tmp_path):
+    _require_chromium()
+    bid_cfg = {
+        "valid_days": 7,
+        "cta_discovery_timeout_ms": 1_000,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
+    }
+    result = await submit_js_managed_form(
+        **_args(
+            site,
+            tmp_path,
+            source_name="parscoders",
+            page_url=f"{site}/project/777?mode=detail-links-no-cta",
+            bid_cfg=bid_cfg,
+        )
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    state = result.payload_debug["page_state"]
+    assert state["form"]["present"] is True and state["form"]["layout_visible"] is False
+    assert any(item["node"].startswith("div#panel") for item in state["form"]["ancestors"])
+    lines = (tmp_path / "trace" / "bid_trace.jsonl").read_text(encoding="utf-8").splitlines()
+    record = json.loads(lines[-1])
+    names = [step["step"] for step in record["steps"]]
+    assert names[:3] == ["navigation", "form_lookup", "cta_attempt"] and names[-1] == "result"
+    assert "SECRET" not in lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_slow_third_party_script_cannot_keep_the_page_from_running_its_own_scripts(site, tmp_path):
+    """The production failure: page stuck in 'loading', opener has no handler yet, click does nothing."""
+    _require_chromium()
+    bid_cfg = {
+        "valid_days": 7,
+        "third_party_budget_ms": 1_000,
+        "dom_ready_timeout_ms": 1_000,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
+    }
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=hang-script", bid_cfg=bid_cfg)
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.SUBMITTED, result.message
+    assert len(RECEIVED) == 1
+    skipped = result.payload_debug.get("skipped_third_party") or []
+    assert skipped and skipped[0]["host"] == "localhost"
+
+
+@pytest.mark.asyncio
+async def test_page_stuck_loading_reports_what_it_is_waiting_on(site, tmp_path):
+    _require_chromium()
+    bid_cfg = {
+        "valid_days": 7,
+        "browser_block_noise": False,  # nothing rescues the page: the report must name the culprit
+        "dom_ready_timeout_ms": 1_000,
+        "form_open_timeout_ms": 250,
+        "form_open_budget_ms": 1_500,
+        "browser_debug_dir": str(tmp_path / "dbg"),
+        "trace_dir": str(tmp_path / "trace"),
+    }
+    result = await submit_js_managed_form(
+        **_args(site, tmp_path, page_url=f"{site}/project/777?mode=hang-script", bid_cfg=bid_cfg)
+    )
+    if "نصب نیست" in result.message or "دسترس نیست" in result.message:
+        pytest.skip("playwright browser unavailable")
+    assert result.status is SubmissionStatus.FAILED
+    assert RECEIVED == []
+    waiting = result.payload_debug["pending_requests"]
+    assert any(row["host"] == "localhost" and row["path"] == "/slow-script.js" for row in waiting)
+    assert result.payload_debug["open_rounds"] >= 1

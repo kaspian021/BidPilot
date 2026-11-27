@@ -426,19 +426,6 @@ async def _dump_debug(
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = target / f"{stamp}-{re.sub(r'[^A-Za-z0-9_.-]', '_', source)}-{project_id}-{reason}"
 
-        # The full page image shows the CTA and panel context. A viewport image
-        # is also saved because it is the most useful view for off-canvas bugs.
-        try:
-            await page.screenshot(path=str(base.with_suffix(".png")), full_page=True, timeout=8_000)
-        except Exception:
-            await page.screenshot(path=str(base.with_suffix(".png")), full_page=False, timeout=5_000)
-        try:
-            await page.screenshot(
-                path=str(base.with_name(base.name + "-viewport.png")), full_page=False, timeout=5_000
-            )
-        except Exception:
-            pass
-
         # Keep the whole DOM (including CTA siblings), but strip every field
         # value, textarea/editor contents, inline script and CSRF-like attribute.
         safe_html = await page.evaluate(
@@ -489,12 +476,127 @@ async def _dump_debug(
             )
         except Exception as exc:  # noqa: BLE001
             log.info("[BID][BROWSER-DEBUG] DOM inventory failed error_type=%s", type(exc).__name__)
+        # Screenshots last and independently: on a page that is still loading they can fail
+        # (pending fonts, busy main thread) and must not cost us the HTML/DOM evidence above.
+        shots = []
+        for suffix, full in ((".png", True), ("-viewport.png", False)):
+            target_file = base.with_name(base.name + suffix) if suffix != ".png" else base.with_suffix(".png")
+            try:
+                await page.screenshot(path=str(target_file), full_page=full, timeout=6_000, animations="disabled")
+                shots.append(target_file.name)
+            except Exception as shot_error:  # noqa: BLE001
+                log.info(
+                    "[BID][BROWSER-DEBUG] screenshot %s failed error_type=%s detail=%r",
+                    "full" if full else "viewport",
+                    type(shot_error).__name__,
+                    str(shot_error).splitlines()[0][:160] if str(shot_error) else "",
+                )
         log.warning(
-            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s",
-            source, project_id, reason, base
+            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s screenshots=%s",
+            source, project_id, reason, base, shots
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
-        log.info("[BID][BROWSER-DEBUG] capture failed error_type=%s", type(exc).__name__)
+        log.info(
+            "[BID][BROWSER-DEBUG] capture failed error_type=%s detail=%r",
+            type(exc).__name__,
+            str(exc).splitlines()[0][:160] if str(exc) else "",
+        )
+
+
+#: One shared selector so discovery (JS index) and clicking (locator.nth) always agree.
+_CTA_SELECTOR = (
+    "button, a, [role='button'], [onclick], [data-bs-toggle], [data-toggle], "
+    "[class*='bid-send'], [class*='btn'], [class*='button'], "
+    "[class*='proposal'], [class*='bid'], [data-project-id], [data-action], "
+    "span, div, li, label, i"
+)
+
+_PAGE_STATE_JS = r"""
+({formId}) => {
+  const short = (el) => {
+    const cls = typeof el.className === 'string' && el.className.trim()
+      ? '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.') : '';
+    return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + cls;
+  };
+  const rectOf = (el) => {
+    const r = el.getBoundingClientRect();
+    return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)};
+  };
+  const layoutVisible = (el) => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
+      r.width > 0 && r.height > 0;
+  };
+  const form = formId ? document.getElementById(formId) : null;
+  const chain = [];
+  let node = form, depth = 0;
+  while (node && depth < 8) {
+    const cs = getComputedStyle(node);
+    chain.push({
+      node: short(node), display: cs.display, visibility: cs.visibility, opacity: cs.opacity,
+      transform: cs.transform === 'none' ? '' : cs.transform.slice(0, 40), rect: rectOf(node)
+    });
+    node = node.parentElement; depth++;
+  }
+  const hits = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (hits.length >= 20) break;
+    if (el.children.length > 3) continue;
+    const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('value') || '')
+      .replace(/\s+/g, ' ').trim();
+    if (!text || text.length > 60 || !/پیشنهاد|proposal|bid/i.test(text)) continue;
+    const a = el.closest('a[href]');
+    let href = '';
+    try { href = a ? new URL(a.getAttribute('href'), location.href).pathname : ''; } catch (_) {}
+    const r = el.getBoundingClientRect();
+    hits.push({
+      el: short(el), text: text.slice(0, 40), layout_visible: layoutVisible(el),
+      in_viewport: r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth,
+      rect: rectOf(el), disabled: Boolean(el.disabled), role: el.getAttribute('role') || '',
+      onclick: el.hasAttribute('onclick'), href_path: href,
+      owner_project_id: el.closest('[data-project-id]')?.getAttribute('data-project-id') || '',
+      inside_form: Boolean(form && form.contains(el))
+    });
+  }
+  const bodyText = (document.body && document.body.innerText) || '';
+  return {
+    ready_state: document.readyState,
+    title: (document.title || '').slice(0, 80),
+    viewport: {w: innerWidth, h: innerHeight},
+    counts: {
+      forms: document.forms.length, buttons: document.querySelectorAll('button').length,
+      links: document.querySelectorAll('a[href]').length, scripts: document.scripts.length,
+      stylesheets: document.styleSheets.length, body_chars: bodyText.length
+    },
+    session_hints: {
+      has_logout_text: /خروج از حساب|خروج/.test(bodyText),
+      has_login_text: /ورود به حساب|ورود \/ ثبت|ورود با گوگل/.test(bodyText)
+    },
+    form: form ? {present: true, layout_visible: layoutVisible(form), ancestors: chain} : {present: false},
+    label_hits: hits
+  };
+}
+"""
+
+
+async def _page_state(page: Any, form_id: str) -> dict[str, Any]:
+    """Compact, secret-free picture of what the browser can actually see right now."""
+    try:
+        return dict(await page.evaluate(_PAGE_STATE_JS, {"formId": str(form_id or "")}))
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
+        return {"error": type(exc).__name__}
+
+
+async def _wait_scripts_ready(page: Any, timeout_s: float) -> bool:
+    """True once the HTML parser finished (``interactive``/``complete``) and handlers had a moment to bind."""
+    try:
+        await page.wait_for_function(
+            "document.readyState !== 'loading'", timeout=max(100, int(timeout_s * 1000))
+        )
+    except Exception:  # noqa: BLE001 - still loading, or page closed
+        return False
+    await page.wait_for_timeout(300)  # DOMContentLoaded handlers (jQuery ready) run right after
+    return True
 
 
 async def _find_open_form_cta(
@@ -505,8 +607,15 @@ async def _find_open_form_cta(
     *,
     form_id: str = "",
     diagnostics: dict[str, Any] | None = None,
+    quiet: bool = False,
 ) -> Any | None:
-    """Find this project's proposal opener, including custom/off-canvas controls."""
+    """Find this project's proposal opener, including custom/off-canvas controls.
+
+    The best candidate is returned. When several controls look plausible,
+    ``diagnostics["ordered_indexes"]`` lists all of them best-first so the caller
+    can try them one by one (clicking an opener is harmless: nothing is typed or
+    submitted until the bid form is really visible).
+    """
     if source_name.casefold() != "parscoders":
         selectors = [
             "button.bid-send--button:visible",
@@ -529,37 +638,30 @@ async def _find_open_form_cta(
             diagnostics.update({"page_matches_project": False, "reason": "detail_page_id_mismatch"})
         return None
 
-    # Include common delegated-action containers too. Some marketplace themes
-    # attach one document-level click handler to a generic .btn/.button div,
-    # without role=button or an inline onclick attribute.
-    selector = (
-        "button, a, [role='button'], [onclick], [data-bs-toggle], [data-toggle], "
-        "[class*='bid-send'], [class*='btn'], [class*='button'], "
-        "[class*='proposal'], [class*='bid'], [data-project-id], [data-action]"
-    )
+    selector = _CTA_SELECTOR
     try:
         result = await page.evaluate(
-            """({selector, projectId, formId}) => {
+            r"""({selector, projectId, formId}) => {
               const nodes = [...document.querySelectorAll(selector)];
               const endpoint = '/conversation/ajax/bid-send/' + projectId;
-              const currentPath = location.pathname.replace(/\\/+$/, '') || '/';
+              const currentPath = location.pathname.replace(/\/+$/, '') || '/';
               const form = formId ? document.getElementById(formId) : null;
               const isSameProjectDetailPath = targetPath => (
                 targetPath === '/project/' + projectId ||
                 targetPath.startsWith('/project/' + projectId + '/')
               );
+              // Layout visibility only: a button below the fold is still a real
+              // button, Playwright scrolls it into view before clicking.
               const isVisible = el => {
                 const r = el.getBoundingClientRect(), s = getComputedStyle(el);
                 return s.display !== 'none' && s.visibility !== 'hidden' &&
-                  Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0 &&
-                  r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+                  Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0;
               };
-              const normalize = value => String(value || '').replace(/[\\u200c\\u200f\\s]+/g, '').toLowerCase();
-              const strong = [], weak = [], candidates = [];
+              const normalize = value => String(value || '').replace(/[‌‏\s]+/g, '').toLowerCase();
+              const LABEL = /ارسالپیشنهاد|ثبتپیشنهاد|ارائهپیشنهاد|پیشنهاددهید|پیشنهادبدهید|پیشنهادبدید|پیشنهادخود|پیشنهادداده|submitproposal|placebid|sendproposal|sendbid/;
+              const strong = [], weak = [], candidates = [], labelHits = [];
               let visibleCount = 0;
               nodes.forEach((el, index) => {
-                if (!isVisible(el) || el.disabled) return;
-                visibleCount++;
                 const tag = el.tagName.toLowerCase();
                 const identity = String(el.id || '') + ' ' +
                   (typeof el.className === 'string' ? el.className : '');
@@ -567,7 +669,18 @@ async def _find_open_form_cta(
                   el.innerText, el.getAttribute('aria-label'), el.getAttribute('title'),
                   el.getAttribute('value')
                 ].filter(Boolean).join(' '));
-                const labelMatch = /ارسالپیشنهاد|ثبتپیشنهاد|پیشنهادداده|submitproposal|placebid|sendproposal/.test(label);
+                // Long text means a big container that merely *contains* the words.
+                const labelMatch = label.length <= 60 && LABEL.test(label);
+                const visible = isVisible(el);
+                if (labelMatch && labelHits.length < 12) {
+                  labelHits.push({
+                    index, tag, id: String(el.id || '').slice(0, 60),
+                    class_name: String(typeof el.className === 'string' ? el.className : '').slice(0, 80),
+                    visible, disabled: Boolean(el.disabled), label: label.slice(0, 50)
+                  });
+                }
+                if (!visible || el.disabled) return;
+                visibleCount++;
                 const identityMatch = /bid-send|proposal|place-bid/i.test(identity);
                 const owner = el.getAttribute('data-project-id') ||
                   (el.closest('[data-project-id]') && el.closest('[data-project-id]').getAttribute('data-project-id')) || '';
@@ -581,34 +694,42 @@ async def _find_open_form_cta(
                 if (rawTarget && !/^javascript:/i.test(rawTarget) && !rawTarget.startsWith('#')) {
                   try {
                     const targetUrl = new URL(rawTarget, location.href);
-                    targetPath = targetUrl.pathname.replace(/\\/+$/, '') || '/';
+                    targetPath = targetUrl.pathname.replace(/\/+$/, '') || '/';
                     unsafe = targetUrl.origin !== location.origin;
                   } catch (_) { unsafe = true; }
                 } else if (rawTarget.startsWith('#')) {
                   targetPath = currentPath;
                 }
-                const ids = [...targetPath.matchAll(/(?:^|\\/)(\\d+)(?=\\/|$)/g)].map(m => m[1]);
+                // A label sitting inside a link that goes elsewhere is navigation.
+                const wrapLink = el.closest('a[href]');
+                if (wrapLink && wrapLink !== el) {
+                  const wrapHref = wrapLink.getAttribute('href') || '';
+                  if (wrapHref && !wrapHref.startsWith('#') && !/^javascript:/i.test(wrapHref)) {
+                    try {
+                      const wp = new URL(wrapHref, location.href).pathname.replace(/\/+$/, '') || '/';
+                      if (wp !== currentPath && wp !== endpoint && !isSameProjectDetailPath(wp)) unsafe = true;
+                    } catch (_) { unsafe = true; }
+                  }
+                }
+                const ids = [...targetPath.matchAll(/(?:^|\/)(\d+)(?=\/|$)/g)].map(m => m[1]);
                 if (ids.some(value => value !== String(projectId))) unsafe = true;
                 const allowedPath = !targetPath || targetPath === currentPath ||
                   targetPath === endpoint || isSameProjectDetailPath(targetPath);
                 if (!allowedPath) unsafe = true;
 
-                const controls = (el.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean);
-                const toggleTarget = el.getAttribute('data-bs-target') || el.getAttribute('data-target') || '';
+                const controls = (el.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+                const toggleTarget = el.getAttribute('data-bs-target') || el.getAttribute('data-target') ||
+                  (rawHref.startsWith('#') ? rawHref : '');
+                const containsForm = targetEl => Boolean(
+                  form && targetEl && (targetEl === form || targetEl.contains(form) || form.contains(targetEl))
+                );
                 let linkedToForm = Boolean(form && controls.includes(formId));
-                if (form && toggleTarget.startsWith('#')) {
-                  const targetEl = document.getElementById(toggleTarget.slice(1));
-                  linkedToForm = linkedToForm || Boolean(
-                    targetEl && (targetEl === form || targetEl.contains(form) || form.contains(targetEl))
-                  );
+                if (form && toggleTarget.startsWith('#') && toggleTarget.length > 1) {
+                  linkedToForm = linkedToForm || containsForm(document.getElementById(toggleTarget.slice(1)));
                 }
                 if (form && !linkedToForm) {
                   for (const id of controls) {
-                    const targetEl = document.getElementById(id);
-                    if (targetEl && (targetEl === form || targetEl.contains(form) || form.contains(targetEl))) {
-                      linkedToForm = true;
-                      break;
-                    }
+                    if (containsForm(document.getElementById(id))) { linkedToForm = true; break; }
                   }
                 }
                 // A link back to /project/<id> is just a project/detail link,
@@ -621,10 +742,9 @@ async def _find_open_form_cta(
                   el.getAttribute('role') === 'button' || el.hasAttribute('onclick') ||
                   el.hasAttribute('data-bs-toggle') || el.hasAttribute('data-toggle') ||
                   /bid-send/i.test(identity);
-                // ParsCoders sometimes uses a generic .btn <div> with a
-                // delegated listener. A unique, explicit «ارسال پیشنهاد»
-                // label is an acceptable weak candidate on this validated
-                // project detail page; multiple matches remain an abort.
+                // ParsCoders sometimes uses a generic .btn <div>/<span> with a
+                // delegated listener. An explicit «ارسال پیشنهاد» label is an
+                // acceptable weak candidate on this validated detail page.
                 const clickable = nativeOrInteractive || labelMatch;
                 if (!clickable || unsafe || (!labelMatch && !identityMatch && !projectBound)) return;
                 const item = {
@@ -639,35 +759,45 @@ async def _find_open_form_cta(
                   linked_to_form: linkedToForm,
                   exact_endpoint: exactEndpoint,
                   label_match: labelMatch,
-                  identity_match: identityMatch
+                  identity_match: identityMatch,
+                  native: ['button', 'a'].includes(tag) || el.getAttribute('role') === 'button'
                 };
                 candidates.push(item);
                 if (projectBound) strong.push(item);
                 else if (labelMatch || identityMatch) weak.push(item);
               });
 
+              // Best first: real buttons/links before generic elements, then the
+              // tightest label (an inner <span> is worse than its <button>).
+              const rank = items => [...items].sort((a, b) =>
+                (Number(b.native) - Number(a.native)) || (a.label.length - b.label.length));
+              const ordered = [...rank(strong), ...rank(weak)];
               let selected = null, strategy = '';
               if (strong.length === 1) {
                 selected = strong[0];
                 strategy = selected.linked_to_form ? 'form_target' : 'project_id_or_endpoint';
               } else if (strong.length > 1) {
-                const native = strong.filter(item => ['button', 'a'].includes(item.tag));
-                if (native.length === 1) {
-                  selected = native[0];
-                  strategy = 'unique_native_control';
-                }
+                const native = strong.filter(item => item.native);
+                selected = native.length === 1 ? native[0] : ordered[0];
+                strategy = native.length === 1 ? 'unique_native_control' : 'ordered_try_each';
               } else if (weak.length === 1) {
                 selected = weak[0];
                 strategy = 'unique_cta_on_project_detail';
+              } else if (weak.length > 1) {
+                selected = ordered[0];
+                strategy = 'ordered_try_each';
               }
               return {
                 selected_index: selected ? selected.index : null,
                 selected_strategy: strategy,
+                ordered_indexes: ordered.map(item => item.index).slice(0, 6),
                 page_matches_project: true,
+                total_nodes: nodes.length,
                 visible_actionables: visibleCount,
                 strong_matches: strong.length,
                 weak_matches: weak.length,
-                candidates: candidates.slice(0, 12)
+                candidates: candidates.slice(0, 12),
+                label_hits: labelHits
               };
             }""",
             {"selector": selector, "projectId": str(project_id), "formId": str(form_id or "")},
@@ -685,24 +815,29 @@ async def _find_open_form_cta(
 
     if diagnostics is not None:
         diagnostics.update(result)
+        diagnostics["selector"] = selector
     selected_index = result.get("selected_index")
     if selected_index is None:
-        log.warning(
-            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=ambiguous_or_missing visible=%s strong=%s weak=%s candidates=%s",
+        (log.debug if quiet else log.warning)(
+            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=missing nodes=%s visible=%s strong=%s weak=%s "
+            "label_hits=%s candidates=%s",
             source_name,
             project_id,
+            result.get("total_nodes", 0),
             result.get("visible_actionables", 0),
             result.get("strong_matches", 0),
             result.get("weak_matches", 0),
+            result.get("label_hits", []),
             result.get("candidates", []),
         )
         return None
     log.info(
-        "[BID][CTA-DISCOVERY] source=%s id=%s outcome=selected strategy=%s index=%s",
+        "[BID][CTA-DISCOVERY] source=%s id=%s outcome=selected strategy=%s index=%s ordered=%s",
         source_name,
         project_id,
         result.get("selected_strategy"),
         selected_index,
+        result.get("ordered_indexes"),
     )
     return page.locator(selector).nth(int(selected_index))
 
@@ -798,22 +933,171 @@ _TRACKER_HOSTS = (
 )
 
 
-async def _block_page_noise(context: Any) -> None:
-    """Skip images, fonts, media and analytics: the bid form needs none of them.
+def _site_root(host: str) -> str:
+    parts = [part for part in (host or "").lower().split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (host or "").lower()
 
-    On slow or filtered networks these (not the form) are what keeps a page
-    "loading" for half a minute. Scripts and styles stay untouched so the site's
-    own form logic and layout work exactly as for a person.
+
+def _is_third_party(url: str, base_url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    base_host = (urlsplit(base_url).hostname or "").lower()
+    if not host or not base_host:
+        return False
+    return _site_root(host) != _site_root(base_host)
+
+
+class _PendingRequests:
+    """Which requests are still in flight, so a page stuck in ``loading`` explains itself."""
+
+    def __init__(self) -> None:
+        self._open: dict[int, tuple[Any, float]] = {}
+        self.skipped: list[dict[str, Any]] = []
+
+    def started(self, request: Any) -> None:
+        self._open[id(request)] = (request, time.monotonic())
+
+    def done(self, request: Any) -> None:
+        self._open.pop(id(request), None)
+
+    def snapshot(self, limit: int = 12) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        rows = []
+        for request, started in self._open.values():
+            parts = urlsplit(str(request.url))
+            rows.append({
+                "type": request.resource_type,
+                "host": parts.hostname or "",
+                "path": parts.path[:80],
+                "age_ms": int((now - started) * 1000),
+            })
+        rows.sort(key=lambda row: row["age_ms"], reverse=True)
+        return rows[:limit]
+
+
+_STUB_BODIES = {
+    "script": ("application/javascript", ""),
+    "stylesheet": ("text/css", ""),
+}
+
+
+async def _block_page_noise(
+    context: Any,
+    base_url: str = "",
+    tracker: _PendingRequests | None = None,
+    third_party_budget_ms: int = 5_000,
+) -> None:
+    """Skip images, fonts, media and analytics, and never let a slow third party stall the page.
+
+    The bid form needs none of the blocked resources. Scripts and styles of the site itself stay
+    untouched. A *third-party* script/stylesheet (a CDN font CSS, a widget, a captcha loader) that
+    does not answer within ``third_party_budget_ms`` is replaced by an empty file: such a request
+    blocks the HTML parser, so the site's own scripts (and the click handler of the proposal
+    button) would otherwise never run on slow or filtered networks.
     """
 
     async def handler(route: Any) -> None:
         request = route.request
-        if request.resource_type in _NOISE_RESOURCE_TYPES or any(host in request.url for host in _TRACKER_HOSTS):
-            await route.abort()
-        else:
+        try:
+            if request.resource_type in _NOISE_RESOURCE_TYPES or any(host in request.url for host in _TRACKER_HOSTS):
+                await route.abort()
+                return
+            if (
+                base_url
+                and request.resource_type in _STUB_BODIES
+                and _is_third_party(request.url, base_url)
+            ):
+                try:
+                    response = await route.fetch(timeout=max(500, third_party_budget_ms))
+                    await route.fulfill(response=response)
+                except Exception as exc:  # noqa: BLE001 - slow, filtered or failing third party
+                    content_type, body = _STUB_BODIES[request.resource_type]
+                    if tracker is not None:
+                        tracker.skipped.append({
+                            "type": request.resource_type,
+                            "host": urlsplit(request.url).hostname or "",
+                            "path": urlsplit(request.url).path[:80],
+                            "reason": type(exc).__name__,
+                        })
+                    await route.fulfill(status=200, content_type=content_type, body=body)
+                return
             await route.continue_()
+        except Exception:  # noqa: BLE001 - page/context already closed or request already handled
+            return
 
     await context.route("**/*", handler)
+
+
+class _Trace:
+    """Ordered, timed record of one submit attempt (no secrets, no field values).
+
+    One attempt = one JSON line in ``data/logs/bid_trace.jsonl`` plus one compact
+    ``[BID][TRACE]`` log line, so a failure can be read from top to bottom instead
+    of being reassembled from dozens of interleaved DEBUG lines.
+    """
+
+    def __init__(self, source: str, project_id: str) -> None:
+        self.source = source
+        self.project_id = str(project_id)
+        self.started = time.monotonic()
+        self.steps: list[dict[str, Any]] = []
+
+    def step(self, name: str, **info: Any) -> None:
+        self.steps.append({"t_ms": int((time.monotonic() - self.started) * 1000), "step": name, **info})
+
+    def summary(self) -> str:
+        parts = []
+        for item in self.steps:
+            extras = " ".join(
+                f"{key}={value}"
+                for key, value in item.items()
+                if key not in {"t_ms", "step"} and not isinstance(value, (dict, list))
+            )
+            parts.append(f"{item['t_ms']}ms:{item['step']}" + (f"({extras})" if extras else ""))
+        return " -> ".join(parts)
+
+
+def _flush_trace(trace: _Trace | None, result: Any, bid_cfg: dict[str, Any]) -> None:
+    if trace is None:
+        return
+    try:
+        debug = getattr(result, "payload_debug", None) or {}
+        status = getattr(getattr(result, "status", None), "value", getattr(result, "status", ""))
+        trace.step(
+            "result",
+            status=status,
+            stage=debug.get("stage"),
+            request_sent=debug.get("request_sent"),
+            confirmation=debug.get("confirmation"),
+        )
+        log.info(
+            "[BID][TRACE] source=%s id=%s status=%s stage=%s | %s",
+            trace.source,
+            trace.project_id,
+            status,
+            debug.get("stage"),
+            trace.summary(),
+        )
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source": trace.source,
+            "project_id": trace.project_id,
+            "status": str(status),
+            "message": str(getattr(result, "message", ""))[:300],
+            "stage": debug.get("stage"),
+            "steps": trace.steps,
+            "page_state": debug.get("page_state"),
+            "cta_discovery": debug.get("cta_discovery"),
+            "navigation": debug.get("navigation"),
+        }
+        target = Path(str(bid_cfg.get("trace_dir") or "data/logs"))
+        target.mkdir(parents=True, exist_ok=True)
+        trace_file = target / "bid_trace.jsonl"
+        if trace_file.exists() and trace_file.stat().st_size > 5_000_000:
+            trace_file.replace(target / "bid_trace.1.jsonl")
+        with trace_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001 - tracing must never break a bid
+        log.info("[BID][TRACE] write failed error_type=%s", type(exc).__name__)
 
 
 def _failure(
@@ -852,8 +1136,11 @@ async def _submit_once(
     delivery_days: int | None,
     bid_cfg: dict[str, Any],
     auth_cfg: dict[str, Any],
+    trace: _Trace | None = None,
 ) -> SubmissionResult:
     """Open the project in Chromium and click the form's actual submit button."""
+    if trace is None:
+        trace = _Trace(source_name, project_id)
     page_parts = urlsplit(page_url)
     endpoint_parts = urlsplit(endpoint_url)
     safe_debug = {
@@ -966,10 +1253,20 @@ async def _submit_once(
             cookie_specs = _browser_cookies(cookies, base_url)
             if cookie_specs:
                 await context.add_cookies(cookie_specs)
+            pending = _PendingRequests()
+            safe_debug["skipped_third_party"] = pending.skipped  # filled live by the route handler
             if bid_cfg.get("browser_block_noise", True):
-                await _block_page_noise(context)
+                await _block_page_noise(
+                    context,
+                    base_url,
+                    pending,
+                    int(bid_cfg.get("third_party_budget_ms") or 5_000),
+                )
             page = await context.new_page()
             page.set_default_timeout(12_000)
+            page.on("request", pending.started)
+            page.on("requestfinished", pending.done)
+            page.on("requestfailed", pending.done)
 
             def _on_page_error(error: Exception) -> None:
                 log.warning(
@@ -1005,12 +1302,26 @@ async def _submit_once(
                 # third-party file must not turn a usable page into a 25 s timeout.
                 navigation_started = time.monotonic()
                 navigation = await page.goto(page_url, wait_until="commit", timeout=load_timeout_ms)
+                # The old 4 s wait often expired while the page was still "loading"
+                # (no forms/CSS yet), so the opener button was looked up on a half-built
+                # DOM. Wait for the parser to finish, then give styles/scripts a short
+                # best-effort window; a stalled tracker may still not block us forever.
                 dom_ready = False
+                load_ready = False
+                dcl_timeout = max(1_000, int(bid_cfg.get("dom_ready_timeout_ms") or 20_000))
                 try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=4_000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=dcl_timeout)
                     dom_ready = True
                 except PlaywrightTimeoutError:
                     pass  # inspect the live DOM even if a third-party resource stalls
+                if dom_ready:
+                    try:
+                        await page.wait_for_load_state(
+                            "load", timeout=max(500, int(bid_cfg.get("load_ready_timeout_ms") or 6_000))
+                        )
+                        load_ready = True
+                    except PlaywrightTimeoutError:
+                        pass
                 page_state = await page.evaluate(
                     """() => ({
                       ready_state: document.readyState,
@@ -1021,19 +1332,39 @@ async def _submit_once(
                 safe_debug["navigation"] = {
                     "http_status": navigation.status if navigation is not None else None,
                     "dom_content_loaded": dom_ready,
+                    "load_event": load_ready,
                     **page_state,
                     "elapsed_ms": int((time.monotonic() - navigation_started) * 1000),
                 }
                 log.info(
-                    "[BID][BROWSER-NAVIGATION] source=%s id=%s status=%s dom_ready=%s "
+                    "[BID][BROWSER-NAVIGATION] source=%s id=%s status=%s dom_ready=%s load=%s "
                     "ready_state=%s forms=%s elapsed_ms=%s",
                     source_name,
                     project_id,
                     navigation.status if navigation is not None else "unknown",
                     dom_ready,
+                    load_ready,
                     page_state.get("ready_state"),
                     page_state.get("forms"),
                     safe_debug["navigation"]["elapsed_ms"],
+                )
+                if not dom_ready:
+                    safe_debug["pending_requests"] = pending.snapshot()
+                    log.warning(
+                        "[BID][PENDING] source=%s id=%s ready_state=%s waiting_on=%s skipped_third_party=%s",
+                        source_name,
+                        project_id,
+                        page_state.get("ready_state"),
+                        safe_debug["pending_requests"],
+                        pending.skipped,
+                    )
+                trace.step(
+                    "navigation",
+                    http=navigation.status if navigation is not None else None,
+                    dom_ready=dom_ready,
+                    load=load_ready,
+                    ready_state=page_state.get("ready_state"),
+                    forms=page_state.get("forms"),
                 )
                 if navigation is not None and navigation.status >= 400:
                     return _failure(
@@ -1093,7 +1424,18 @@ async def _submit_once(
                 bid_cfg["_debug_form_id"] = form_id
                 form = page.locator(form_selector).first
                 form_ref = form
-                if await form.count() != 1:
+                # The form can be injected a moment after "commit"; wait for it instead
+                # of judging a half-built DOM.
+                try:
+                    await form.wait_for(
+                        state="attached",
+                        timeout=max(500, int(bid_cfg.get("form_attach_timeout_ms") or 10_000)),
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+                form_count = await form.count()
+                trace.step("form_lookup", count=form_count)
+                if form_count != 1:
                     guest_markers = ("ورود با گوگل", "ثبت‌نام رایگان", "ثبت نام رایگان")
                     if any(marker in body_text for marker in guest_markers):
                         return _failure(
@@ -1101,6 +1443,7 @@ async def _submit_once(
                             "نشست منقضی شده است. کوکی را در /market تازه کن و /test را اجرا کن.",
                             debug=safe_debug,
                         )
+                    safe_debug["page_state"] = await _page_state(page, form_id)
                     await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-missing")
                     return _failure(
                         "فرم مورد انتظار در صفحه مرورگر پیدا نشد؛ هیچ پیشنهادی ارسال نشد.",
@@ -1113,45 +1456,197 @@ async def _submit_once(
                 safe_debug["stage"] = stage
                 if not await form.is_visible():
                     cta_diagnostics: dict[str, Any] = {}
-                    cta = await _find_open_form_cta(
-                        page,
-                        source_name,
-                        str(project_id),
-                        current_url,
-                        form_id=form_id,
-                        diagnostics=cta_diagnostics,
+                    cta = None
+                    # The opener may be rendered by page scripts a little after the form
+                    # exists, so poll instead of giving up on the first (single) look.
+                    cta_deadline = time.monotonic() + max(
+                        0.5, int(bid_cfg.get("cta_discovery_timeout_ms") or 12_000) / 1000
                     )
+                    cta_attempt = 0
+                    while True:
+                        cta_attempt += 1
+                        last_attempt = time.monotonic() >= cta_deadline
+                        cta = await _find_open_form_cta(
+                            page,
+                            source_name,
+                            str(project_id),
+                            current_url,
+                            form_id=form_id,
+                            diagnostics=cta_diagnostics,
+                            quiet=not last_attempt,
+                        )
+                        trace.step(
+                            "cta_attempt",
+                            n=cta_attempt,
+                            found=cta is not None,
+                            nodes=cta_diagnostics.get("total_nodes"),
+                            visible=cta_diagnostics.get("visible_actionables"),
+                            strong=cta_diagnostics.get("strong_matches"),
+                            weak=cta_diagnostics.get("weak_matches"),
+                        )
+                        if cta is not None or last_attempt:
+                            break
+                        await page.wait_for_timeout(1_000)
+                        if await form.is_visible():  # the page opened it by itself
+                            break
                     safe_debug["cta_discovery"] = cta_diagnostics
-                    if cta is None:
+                    if cta is None and not await form.is_visible():
+                        state = await _page_state(page, form_id)
+                        safe_debug["page_state"] = state
                         log.error(
-                            "[BID][CTA-NOT-FOUND] source=%s id=%s page_path=%s form_id=%s diagnostics=%s",
+                            "[BID][CTA-NOT-FOUND] source=%s id=%s page_path=%s form_id=%s attempts=%s "
+                            "diagnostics=%s",
                             source_name,
                             project_id,
                             urlsplit(current_url).path,
                             form_id,
+                            cta_attempt,
                             {
                                 key: cta_diagnostics.get(key)
-                                for key in ("visible_actionables", "strong_matches", "weak_matches", "reason")
+                                for key in (
+                                    "total_nodes",
+                                    "visible_actionables",
+                                    "strong_matches",
+                                    "weak_matches",
+                                    "label_hits",
+                                    "reason",
+                                )
                             },
+                        )
+                        log.error(
+                            "[BID][PAGE-STATE] source=%s id=%s state=%s",
+                            source_name,
+                            project_id,
+                            json.dumps(state, ensure_ascii=False, default=str)[:3_500],
                         )
                         await _dump_debug(page, form, bid_cfg, source_name, project_id, "project-cta-not-found")
                         return _failure(
                             "دکمه بازکردن فرم برای همین پروژه پیدا نشد؛ لینک‌های پروژه‌های مرتبط نادیده گرفته شدند.",
                             debug=safe_debug,
                         )
-                    await cta.scroll_into_view_if_needed(timeout=3_000)
-                    await cta.click(timeout=8_000)
-                    open_timeout = max(250, min(30_000, int(bid_cfg.get("form_open_timeout_ms") or 12_000)))
-                    try:
-                        await form.wait_for(state="visible", timeout=open_timeout)
-                    except Exception:
-                        safe_debug["form_open_timeout_ms"] = open_timeout
-                        await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-did-not-open")
-                        return _failure(
-                            "پس از کلیک روی دکمه مخصوص پروژه، پنل ارسال واقعاً باز نشد؛ "
-                            "هیچ فیلدی تغییر نکرد و پیشنهادی ارسال نشد.",
-                            debug=safe_debug,
-                        )
+                    if cta is not None and not await form.is_visible():
+                        # Clicking an opener before the site's own scripts ran does nothing (no
+                        # handler is bound yet), and indexes shift while the page is still being
+                        # parsed. So: wait for scripts, re-discover, click, and repeat until a
+                        # time budget runs out. A click is harmless until the form is visible.
+                        open_timeout = max(250, min(30_000, int(bid_cfg.get("form_open_timeout_ms") or 12_000)))
+                        open_budget = max(
+                            open_timeout, int(bid_cfg.get("form_open_budget_ms") or 60_000)
+                        ) / 1000
+                        open_deadline = time.monotonic() + open_budget
+                        opened = False
+                        open_round = 0
+                        click_errors: list[str] = []
+                        while not opened and time.monotonic() < open_deadline:
+                            open_round += 1
+                            remaining_s = max(0.0, open_deadline - time.monotonic())
+                            scripts_ready = await _wait_scripts_ready(page, min(remaining_s, 10.0))
+                            if await form.is_visible():
+                                opened = True
+                                break
+                            if open_round > 1 or cta is None:
+                                cta = await _find_open_form_cta(
+                                    page,
+                                    source_name,
+                                    str(project_id),
+                                    current_url,
+                                    form_id=form_id,
+                                    diagnostics=cta_diagnostics,
+                                    quiet=True,
+                                )
+                            selector = str(cta_diagnostics.get("selector") or "")
+                            order = [
+                                int(index)
+                                for index in (cta_diagnostics.get("ordered_indexes") or [])
+                                if str(index).lstrip("-").isdigit()
+                            ]
+                            if selector and order:
+                                openers = [(index, page.locator(selector).nth(index)) for index in order[:3]]
+                            elif cta is not None:  # sources with a single, exact opener locator
+                                openers = [(0, cta)]
+                            else:
+                                await page.wait_for_timeout(1_000)
+                                continue
+                            attempts = openers
+                            for position, (index, opener) in enumerate(attempts, start=1):
+                                if time.monotonic() >= open_deadline:
+                                    break
+                                wait_ms = open_timeout if scripts_ready else min(open_timeout, 3_000)
+                                wait_ms = int(max(250, min(wait_ms, (open_deadline - time.monotonic()) * 1000)))
+                                try:
+                                    await opener.scroll_into_view_if_needed(timeout=3_000)
+                                    await opener.click(timeout=6_000)
+                                    await form.wait_for(state="visible", timeout=wait_ms)
+                                    opened = True
+                                except Exception as click_error:  # noqa: BLE001
+                                    kind = type(click_error).__name__
+                                    click_errors.append(kind)
+                                    trace.step(
+                                        "cta_click",
+                                        round=open_round,
+                                        index=index,
+                                        position=position,
+                                        scripts_ready=scripts_ready,
+                                        opened=False,
+                                        error_type=kind,
+                                    )
+                                    log.warning(
+                                        "[BID][CTA-CLICK] source=%s id=%s round=%s index=%s try=%s/%s "
+                                        "scripts_ready=%s opened=False error_type=%s",
+                                        source_name,
+                                        project_id,
+                                        open_round,
+                                        index,
+                                        position,
+                                        len(attempts),
+                                        scripts_ready,
+                                        kind,
+                                    )
+                                    continue
+                                trace.step(
+                                    "cta_click",
+                                    round=open_round,
+                                    index=index,
+                                    position=position,
+                                    scripts_ready=scripts_ready,
+                                    opened=True,
+                                )
+                                log.info(
+                                    "[BID][CTA-CLICK] source=%s id=%s round=%s index=%s try=%s/%s "
+                                    "scripts_ready=%s opened=True",
+                                    source_name,
+                                    project_id,
+                                    open_round,
+                                    index,
+                                    position,
+                                    len(attempts),
+                                    scripts_ready,
+                                )
+                                break
+                        if not opened:
+                            safe_debug["form_open_timeout_ms"] = open_timeout
+                            safe_debug["form_open_budget_s"] = round(open_budget, 1)
+                            safe_debug["open_rounds"] = open_round
+                            safe_debug["click_errors"] = click_errors[-6:]
+                            safe_debug["pending_requests"] = pending.snapshot()
+                            safe_debug["page_state"] = await _page_state(page, form_id)
+                            log.error(
+                                "[BID][FORM-NOT-OPENED] source=%s id=%s rounds=%s budget_s=%s ready_state=%s "
+                                "waiting_on=%s skipped_third_party=%s",
+                                source_name,
+                                project_id,
+                                open_round,
+                                round(open_budget, 1),
+                                (safe_debug["page_state"] or {}).get("ready_state"),
+                                safe_debug["pending_requests"],
+                                pending.skipped,
+                            )
+                            await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-did-not-open")
+                            return _failure(
+                                "پس از کلیک روی دکمه مخصوص پروژه، پنل ارسال واقعاً باز نشد؛ "
+                                "هیچ فیلدی تغییر نکرد و پیشنهادی ارسال نشد.",
+                                debug=safe_debug,
+                            )
                     await page.wait_for_timeout(500)
                 if not await form.is_visible():
                     await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-still-hidden")
@@ -1170,6 +1665,8 @@ async def _submit_once(
                         "فرم پیشنهاد پیش از تکمیل دوباره مخفی شد؛ هیچ فیلدی تغییر نکرد.",
                         debug=safe_debug,
                     )
+
+                trace.step("form_ready")
 
                 async def fill_field(logical_name: str, value: str) -> None:
                     field_name = field_mapping.get(logical_name)
@@ -1670,7 +2167,8 @@ async def submit_js_managed_form(**kwargs: Any) -> SubmissionResult:
         _browser_lock = PriorityLock()
     # paid plans are served first when several users/sites wait for the one browser
     async with _browser_lock.hold(submit_priority.get()):
-        result = await _submit_once(**kwargs)
+        trace = _Trace(str(kwargs.get("source_name")), str(kwargs.get("project_id")))
+        result = await _submit_once(trace=trace, **kwargs)
         if (result.payload_debug or {}).get("retryable"):
             log.warning(
                 "[BID][BROWSER-RETRY] source=%s id=%s reason=%s",
@@ -1678,8 +2176,10 @@ async def submit_js_managed_form(**kwargs: Any) -> SubmissionResult:
                 kwargs.get("project_id"),
                 (result.payload_debug or {}).get("retry_reason", "safe_pre_submit_retry"),
             )
+            trace.step("retry", reason=(result.payload_debug or {}).get("retry_reason", "safe_pre_submit_retry"))
             await asyncio.sleep(1.0)
-            result = await _submit_once(**kwargs)
+            result = await _submit_once(trace=trace, **kwargs)
         if result.payload_debug:
             result.payload_debug.pop("retryable", None)
+        _flush_trace(trace, result, kwargs.get("bid_cfg") or {})
         return result

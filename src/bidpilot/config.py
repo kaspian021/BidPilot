@@ -166,6 +166,8 @@ class LLMConfig(BaseModel):
     #: tokens per minute to stay under (0 = take the provider preset's value).
     #: Free Groq keys allow 8,000/min; the client waits instead of getting 429s.
     tokens_per_minute: int = 0
+    #: simultaneous model calls per user (several marketplaces run at once on one key)
+    max_concurrency: int = 2
     #: forward LLM traffic through a local proxy (e.g. V2Ray on 127.0.0.1:10809).
     #: Groq answers HTTP 403 to Iranian IPs, so this is often the only way in.
     proxy: str = ""

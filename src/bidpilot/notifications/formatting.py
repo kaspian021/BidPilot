@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html import escape
 
+from ..error_analyzer import analyze_error
 from ..models import BidPlan, Event, EventKind, Project, SubmissionStatus
 from ..pricing.budget import format_toman
 from ..text import to_persian_digits, truncate
@@ -47,6 +48,15 @@ def _bid_block(bid: BidPlan) -> str:
         lines.append(f"📐 منطق قیمت: {_e(bid.rationale)}")
     if bid.result and bid.result.message:
         lines.append(f"📝 نتیجه سایت: {_e(bid.result.message)}")
+        if status == SubmissionStatus.FAILED.value:
+            ai = (bid.result.payload_debug or {}).get("analysis")
+            analysis = ai if isinstance(ai, dict) and ai.get("title") else analyze_error(
+                bid.result.message, status_code=bid.result.http_status
+            )
+            if analysis.get("category") != "unknown":
+                lines.append(f"🔍 علت: {_e(analysis.get('title'))}")
+                if analysis.get("action"):
+                    lines.append(f"🛠 اقدام: {_e(analysis.get('action'))}")
     if bid.proposal:
         lines.append(f"🤖 منبع متن: {_e(bid.proposal.generated_by)}")
     return "\n".join(lines)

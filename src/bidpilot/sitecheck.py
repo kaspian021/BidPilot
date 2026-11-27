@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig, Secrets, load_config, secrets_from_store
-from .credentials import site_credentials
+from .credentials import mark_credentials_verified, site_credentials
 from .onboarding import DEFAULT_SITE, site_label
 from .settings_store import SettingsStore
 from .sources import create_source
@@ -64,15 +64,35 @@ async def check_site(
     config_path: str = "config/config.yaml",
     site: str | None = None,
     fetch_projects: bool = True,
+    chat_id: str | int | None = None,
 ) -> SiteCheck:
-    """Verify the active (or given) marketplace account, without sending anything."""
+    """Verify the active (or given) marketplace account, without sending anything.
+
+    With ``chat_id`` the *user's own* account for that site is checked (never the
+    machine-wide one that belongs to the operator).
+    """
+    from .per_user import user_scope
+
     cfg, secrets = _site_env(store, config_path)
-    name = str(site or store.get("marketplace.name") or DEFAULT_SITE).strip().lower()
+    chosen = site
+    if not chosen and chat_id is not None:
+        try:
+            from .per_user import get_user
+
+            chosen = get_user(store, chat_id, "marketplace.name")
+            if not chosen:
+                names = get_user(store, chat_id, "marketplace.names")
+                if isinstance(names, (list, tuple)) and names:
+                    chosen = str(names[0])
+        except Exception:  # noqa: BLE001
+            chosen = None
+    name = str(chosen or store.get("marketplace.name") or DEFAULT_SITE).strip().lower()
     label = site_label(name)
-    creds = site_credentials(name, store)
+    creds = site_credentials(name, store, chat_id=chat_id) if chat_id is not None else site_credentials(name, store)
 
     try:
-        source = create_source(name, _source_settings(cfg, name), cfg, secrets)
+        with user_scope(chat_id):
+            source = create_source(name, _source_settings(cfg, name), cfg, secrets)
     except Exception as exc:  # unknown source / broken config
         return SiteCheck(name, label, False, f"سایت ساخته نشد: {exc}", method=creds.method)
 
@@ -103,7 +123,15 @@ async def check_site(
                     ok, detail = False, f"{detail}\n⚠️ {health_detail}"
             except Exception as exc:  # network hiccup on the listing page
                 ok, detail = False, f"{detail}\n⚠️ لیست پروژه‌ها خوانده نشد: {exc}"
-        return SiteCheck(name, label, bool(ok), detail, method=creds.method, projects=projects)
+        result = SiteCheck(name, label, bool(ok), detail, method=creds.method, projects=projects)
+        if result.ok and name != "mock" and creds.method != "none":
+            # a proven login is remembered (credential stays encrypted at
+            # rest): starting the bot again never asks for it a second time
+            try:
+                mark_credentials_verified(store, name, chat_id=chat_id, method=creds.method)
+            except Exception:  # noqa: BLE001 - bookkeeping must not fail the check
+                pass
+        return result
     finally:
         try:
             await source.aclose()

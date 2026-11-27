@@ -334,7 +334,7 @@ class HtmlMarketSource(Source):
                 continue
 
             final_path = urlsplit(str(response.url)).path.casefold()
-            log.info(
+            log.debug(
                 "[AUTH][VERIFY-RESPONSE] source=%s requested_path=%s status=%s final_path=%s html_chars=%s",
                 self.name,
                 urlsplit(str(path)).path,
@@ -543,7 +543,7 @@ class HtmlMarketSource(Source):
         mode = self.discovery_mode()
         ai_enabled = self.ai_discovery_enabled()
         cfg = self.discovery_settings()
-        log.info(
+        log.debug(
             "[FETCH][START] source=%s base_url=%s mode=%s ai_enabled=%s log_extraction_details=%s",
             self.name,
             self.base_url,
@@ -576,7 +576,7 @@ class HtmlMarketSource(Source):
                     )
                 self.last_discovery_error = str(exc)
         else:
-            log.info(
+            log.debug(
                 "[FETCH][AI-BYPASSED] source=%s mode=%s reason=see_DISCOVERY_DISABLED",
                 self.name,
                 mode,
@@ -899,7 +899,11 @@ class HtmlMarketSource(Source):
         project: Project,
     ) -> tuple[Any, dict[str, Any], str] | None:
         """GET the «ارسال پیشنهاد» target once and look for the real form there."""
-        cta_url = parser.find_proposal_cta_url(html, page_url)
+        cta_url = parser.find_proposal_cta_url(
+            html,
+            page_url,
+            str(project.external_id) if self.name.casefold() == "parscoders" else None,
+        )
         if not cta_url or urlsplit(cta_url).path == urlsplit(page_url).path:
             return None
         log.info(
@@ -950,6 +954,21 @@ class HtmlMarketSource(Source):
                 "و کوکی یا نام کاربری/رمز را وارد کن."
             )
 
+        if self.name.casefold() == "parscoders":
+            project_id = str(project.external_id or "")
+            if not project_id.isdigit():
+                return self.fail(
+                    "شناسه پروژه پارس‌کدرز معتبر نیست؛ لینک‌های عملیاتی مثل نشان‌کردن یا شناسه ساختگی "
+                    "اجازه ورود به صف ارسال ندارند."
+                )
+            if project.url:
+                url_project_id = parser.parscoders_project_id(project.url)
+                if url_project_id != project_id:
+                    return self.fail(
+                        "لینک پروژه و شناسه آن با هم تطابق ندارند؛ برای جلوگیری از پیشنهاد روی پروژه اشتباه "
+                        "ارسال متوقف شد."
+                    )
+
         bid_cfg = self.settings.get("bid") or {}
         detail_path = (self.settings.get("detail") or {}).get("path", "{external_id}")
         page_path = detail_path.format(external_id=project.external_id, url=project.url)
@@ -964,7 +983,7 @@ class HtmlMarketSource(Source):
 
         # Keep the target URL query-free in logs; the HTML size and final path
         # are enough to diagnose an empty/changed form or a login/challenge page.
-        log.info(
+        log.debug(
             "[BID][PAGE-RESPONSE] source=%s id=%s status=%s final_url=%s html_chars=%s content_type=%r",
             self.name,
             project.external_id,

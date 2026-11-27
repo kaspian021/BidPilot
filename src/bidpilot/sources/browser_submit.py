@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ..models import SubmissionResult, SubmissionStatus
+from ..priority_lock import PriorityLock, submit_priority
 from . import html_parser
 
 log = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ _EDITOR_SELECTOR = ", ".join(
 )
 _NUMERIC_FIELDS = {"amount", "days", "_validDays"}
 _STEP_TIMEOUT_MS = 3_000
-_browser_lock: asyncio.Lock | None = None
+_browser_lock: PriorityLock | None = None
 
 
 def _digits(value: str) -> str:
@@ -172,38 +173,128 @@ async def _human_fill_input(page: Any, control: Any, logical_name: str, value: s
     )
 
 
+_EDITOR_API_JS = """
+(el, payload) => {
+  const fire = (node, name) => node.dispatchEvent(new Event(name, {bubbles: true}));
+  try {
+    if (window.tinymce) {
+      let ed = (el.id && tinymce.get && tinymce.get(el.id)) || null;
+      if (!ed && tinymce.editors) {
+        for (let i = 0; i < tinymce.editors.length; i++) {
+          const cand = tinymce.editors[i];
+          if (cand && (cand.targetElm === el || (cand.getElement && cand.getElement() === el))) { ed = cand; break; }
+        }
+      }
+      if (ed) {
+        ed.focus();
+        ed.setContent(payload.html);
+        ed.save();
+        fire(el, 'input'); fire(el, 'change');
+        return {kind: 'tinymce', text: ed.getContent({format: 'text'}) || ''};
+      }
+    }
+  } catch (e) {}
+  try {
+    if (window.CKEDITOR && CKEDITOR.instances) {
+      const ins = CKEDITOR.instances[el.name] || CKEDITOR.instances[el.id];
+      if (ins) {
+        ins.setData(payload.html);
+        ins.updateElement();
+        fire(el, 'change');
+        return {kind: 'ckeditor4', text: String(ins.getData() || '').replace(/<[^>]+>/g, ' ')};
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+"""
+
+_IFRAME_EDITOR_SELECTORS = (
+    "iframe.tox-edit-area__iframe",
+    "iframe[id$='_ifr']",
+    "iframe.cke_wysiwyg_frame",
+    "iframe.note-editor",
+)
+
+
+def _norm_text(value: str) -> str:
+    return " ".join(re.sub(r"<[^>]+>", " ", str(value or "")).split())
+
+
+def _contains_probe(haystack: str, value: str) -> bool:
+    probe = _norm_text(value)[:25]
+    return bool(probe) and probe in _norm_text(haystack)
+
+
+async def _type_lines(page: Any, value: str) -> None:
+    lines = value.replace("\r\n", "\n").split("\n")
+    for index, line in enumerate(lines):
+        if index:
+            await page.keyboard.press("Enter")
+        if line:
+            await page.keyboard.insert_text(line)
+
+
 async def _human_fill_message(page: Any, form: Any, control: Any, value: str) -> str:
-    """Write the proposal into the visible rich editor and keep the hidden <textarea> in sync."""
-    editor = None
+    """Write the proposal into the site's rich editor and keep the hidden <textarea> in sync.
+
+    Order: the editor's own public API (TinyMCE/CKEditor — what the site's code
+    reads on submit), then real typing inside an editor iframe, then a visible
+    contenteditable, then the plain textarea. Whatever path wins, the textarea
+    that is actually submitted is verified to hold the text.
+    """
+    import html as html_lib
+
+    html_value = "".join(
+        f"<p>{html_lib.escape(line)}</p>" if line.strip() else "<p><br></p>"
+        for line in value.replace("\r\n", "\n").split("\n")
+    )
+
+    async def textarea_value() -> str:
+        return str(await control.evaluate("(el) => el.value || ''"))
+
+    async def ensure_textarea(method: str) -> str:
+        if not _contains_probe(await textarea_value(), value):
+            await control.evaluate(_SET_VALUE_JS, value)
+            return method + "+textarea_js"
+        return method
+
+    try:
+        outcome = await control.evaluate(_EDITOR_API_JS, {"html": html_value, "text": value})
+        if outcome and _contains_probe(outcome.get("text", ""), value):
+            return await ensure_textarea(str(outcome.get("kind") or "editor_api"))
+    except Exception as exc:  # noqa: BLE001
+        log.info("[BID][BROWSER-EDITOR] api fill failed error_type=%s", type(exc).__name__)
+
+    for scope in (form, page):
+        for selector in _IFRAME_EDITOR_SELECTORS:
+            try:
+                body = scope.frame_locator(selector).first.locator("body")
+                if (
+                    not await scope.locator(selector).count()
+                    or not await scope.locator(selector).first.is_visible()
+                ):
+                    continue
+                await body.click(timeout=_STEP_TIMEOUT_MS)
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Delete")
+                await _type_lines(page, value)
+                if _contains_probe(await body.inner_text(timeout=_STEP_TIMEOUT_MS), value):
+                    return await ensure_textarea("iframe_editor")
+            except Exception as exc:  # noqa: BLE001
+                log.info("[BID][BROWSER-EDITOR] iframe typing failed error_type=%s", type(exc).__name__)
+
     for scope in (form, page):
         candidate = scope.locator(_EDITOR_SELECTOR).first
         try:
-            if await candidate.count() and await candidate.is_visible():
-                editor = candidate
-                break
-        except Exception:  # noqa: BLE001
-            continue
-
-    if editor is not None:
-        try:
-            await editor.scroll_into_view_if_needed(timeout=_STEP_TIMEOUT_MS)
-            await editor.click(timeout=_STEP_TIMEOUT_MS)
+            if not (await candidate.count() and await candidate.is_visible()):
+                continue
+            await candidate.scroll_into_view_if_needed(timeout=_STEP_TIMEOUT_MS)
+            await candidate.click(timeout=_STEP_TIMEOUT_MS)
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Delete")
-            lines = value.replace("\r\n", "\n").split("\n")
-            for index, line in enumerate(lines):
-                if index:
-                    await page.keyboard.press("Enter")
-                if line:
-                    await page.keyboard.insert_text(line)
-            synced = str(await control.evaluate("(el) => el.value || ''"))
-            probe = " ".join(value.split())[:25]
-            if probe and probe in " ".join(re.sub(r"<[^>]+>", " ", synced).split()):
-                return "editor"
-            # The editor shows the text but did not mirror it to the textarea
-            # (custom editor wired to a different event): mirror it ourselves.
-            await control.evaluate(_SET_VALUE_JS, value)
-            return "editor+textarea_js"
+            await _type_lines(page, value)
+            return await ensure_textarea("editor")
         except Exception as exc:  # noqa: BLE001
             log.info("[BID][BROWSER-EDITOR] editor typing failed error_type=%s", type(exc).__name__)
 
@@ -216,33 +307,797 @@ async def _human_fill_message(page: Any, form: Any, control: Any, value: str) ->
     return "textarea_js"
 
 
+async def control_message_state(form: Any, field_name: str) -> str:
+    """One-line summary of what the message textarea holds right before the click (for diagnosis)."""
+    if not field_name:
+        return "no_field"
+    control = form.locator(_attr_selector("name", field_name)).first
+    length = int(await control.evaluate("(el) => (el.value || '').length"))
+    return f"textarea_chars={length}"
+
+
+_NOTICE_JS = """
+() => {
+  const selectors = ['.swal2-popup', '.swal-modal', '.sweet-alert', '.toast', '.toast-message', '.iziToast',
+    '.noty_body', '.toastify', '.alert', '[role=alert]', '.modal.show .modal-body', '.modal.in .modal-body',
+    '.invalid-feedback', '.text-danger', '.help-block', '.parsley-errors-list', 'label.error', '.error-message'];
+  const out = [], seen = new Set();
+  for (const sel of selectors) {
+    for (const el of document.querySelectorAll(sel)) {
+      const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+      if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none') continue;
+      const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+      if (text && text.length < 400 && !seen.has(text)) { seen.add(text); out.push(text); }
+    }
+  }
+  return out.slice(0, 8);
+}
+"""
+
+
+async def _visible_notices(page: Any) -> list[str]:
+    try:
+        return [str(item) for item in await page.evaluate(_NOTICE_JS)]
+    except Exception:  # noqa: BLE001 - page may be navigating
+        return []
+
+
+def _debug_capture_enabled(bid_cfg: dict[str, Any]) -> bool:
+    """Admin can override browser diagnostics at runtime from Telegram."""
+    try:
+        from ..settings_store import get_store
+
+        override = get_store().get("admin.browser_debug_enabled")
+        if override is not None:
+            if isinstance(override, bool):
+                return override
+            return str(override).strip().lower() in {"1", "true", "yes", "on", "بله"}
+    except Exception:  # noqa: BLE001 - diagnostics must not depend on the settings store
+        pass
+    return bid_cfg.get("browser_debug", True) is not False
+
+
+_DEBUG_SNAPSHOT_JS = """
+() => {
+  const pathOnly = (raw) => {
+    if (!raw) return "";
+    try { return new URL(raw, location.href).pathname; } catch (_) { return String(raw).split(/[?#]/)[0]; }
+  };
+  const visible = (el) => {
+    const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+    return st.display !== "none" && st.visibility !== "hidden" && Number(st.opacity || 1) > 0 &&
+      r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 &&
+      r.left < innerWidth && r.top < innerHeight;
+  };
+  const describe = (el) => ({
+    tag: el.tagName.toLowerCase(),
+    id: el.id || "",
+    class: typeof el.className === "string" ? el.className.slice(0, 180) : "",
+    name: el.getAttribute("name") || "",
+    type: el.getAttribute("type") || "",
+    text: (el.innerText || el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim().slice(0, 180),
+    role: el.getAttribute("role") || "",
+    aria_controls: el.getAttribute("aria-controls") || "",
+    aria_expanded: el.getAttribute("aria-expanded") || "",
+    form: (el.form && (el.form.id || el.form.getAttribute("name"))) || (el.closest("form")?.id || ""),
+    ancestor_project_id: el.getAttribute("data-project-id") || el.closest("[data-project-id]")?.getAttribute("data-project-id") || "",
+    href_path: pathOnly(el.getAttribute("href")),
+    action_path: pathOnly(el.getAttribute("action")),
+    data_href_path: pathOnly(el.getAttribute("data-href")),
+    data_url_path: pathOnly(el.getAttribute("data-url")),
+    data_action_path: pathOnly(el.getAttribute("data-action")),
+    data_target: el.getAttribute("data-target") || "",
+    data_bs_target: el.getAttribute("data-bs-target") || "",
+    onclick_present: el.hasAttribute("onclick"),
+    disabled: Boolean(el.disabled),
+    required: Boolean(el.required),
+    visible: visible(el),
+    rect: (() => { const r=el.getBoundingClientRect(); return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}; })()
+  });
+  const forms = [...document.querySelectorAll("form")].slice(0, 30).map(form => ({
+    ...describe(form),
+    method: (form.getAttribute("method") || "get").toLowerCase(),
+    fields: [...form.querySelectorAll("input,textarea,select,button")].slice(0, 100).map(describe)
+  }));
+  const controls = [...document.querySelectorAll("button,input[type=submit],input[type=button],[role=button],a[href],[onclick],[data-bs-toggle],[data-toggle],[class*='bid-send'],[data-project-id]")]
+    .slice(0, 400).map(describe);
+  return {
+    title: document.title || "",
+    path: location.pathname,
+    readyState: document.readyState,
+    viewport: {width: innerWidth, height: innerHeight},
+    counts: {forms: document.forms.length, buttons: document.querySelectorAll("button").length,
+      inputs: document.querySelectorAll("input").length, textareas: document.querySelectorAll("textarea").length},
+    forms, controls
+  };
+}
+"""
+
+
 async def _dump_debug(
     page: Any, form: Any, bid_cfg: dict[str, Any], source: str, project_id: str, reason: str
 ) -> None:
-    """Best-effort screenshot + sanitized form HTML so a failure can be diagnosed from real data."""
-    if bid_cfg.get("browser_debug", True) is False:
+    """Save full-page, value-redacted HTML + DOM inventory + screenshots."""
+    if not _debug_capture_enabled(bid_cfg):
         return
     try:
         target = Path(str(bid_cfg.get("browser_debug_dir") or "data/browser_debug"))
         target.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = target / f"{stamp}-{re.sub(r'[^A-Za-z0-9_.-]', '_', source)}-{project_id}-{reason}"
-        await page.screenshot(path=str(base.with_suffix(".png")), full_page=False, timeout=5_000)
-        html = ""
+
+        # Keep the whole DOM (including CTA siblings), but strip every field
+        # value, textarea/editor contents, inline script and CSRF-like attribute.
+        safe_html = await page.evaluate(
+            """() => {
+              const root = document.documentElement.cloneNode(true);
+              root.querySelectorAll("script,noscript").forEach(el => {
+                if (el.tagName === "SCRIPT") el.textContent = "/* script content omitted from diagnostics */";
+                else el.remove();
+              });
+              root.querySelectorAll("input").forEach(el => {
+                el.setAttribute("value", "[REDACTED]");
+                if (el.hasAttribute("value")) el.value = "[REDACTED]";
+              });
+              root.querySelectorAll("textarea").forEach(el => { el.textContent = "[REDACTED]"; el.value = "[REDACTED]"; });
+              root.querySelectorAll("select option").forEach(el => {
+                if (el.hasAttribute("value")) el.setAttribute("value", "[REDACTED]");
+              });
+              root.querySelectorAll("[contenteditable=true],[contenteditable='']").forEach(el => {
+                el.textContent = "[EDITOR CONTENT REDACTED]";
+              });
+              root.querySelectorAll("*").forEach(el => {
+                for (const attr of [...el.attributes]) {
+                  if (/(token|csrf|password|secret|cookie|api.?key)/i.test(attr.name)) {
+                    el.setAttribute(attr.name, "[REDACTED]");
+                  } else if (["href","action","src","data-href","data-url","data-action"].includes(attr.name.toLowerCase())) {
+                    try {
+                      const u = new URL(attr.value, location.href);
+                      el.setAttribute(attr.name, u.pathname);
+                    } catch (_) { el.setAttribute(attr.name, String(attr.value).split(/[?#]/)[0]); }
+                  }
+                }
+              });
+              return "<!doctype html>\\n" + root.outerHTML;
+            }"""
+        )
+        base.with_suffix(".html").write_text(str(safe_html)[:500_000], encoding="utf-8")
         try:
-            html = await form.evaluate(
-                "(el) => { const c = el.cloneNode(true);"
-                " c.querySelectorAll('input[type=hidden]').forEach(i => i.setAttribute('value', '<redacted>'));"
-                " return c.outerHTML; }"
+            snapshot = await page.evaluate(_DEBUG_SNAPSHOT_JS)
+            snapshot.update({
+                "source": source,
+                "project_id": str(project_id),
+                "reason": reason,
+                "page_url_path": urlsplit(str(page.url)).path,
+                "form_selector_id": str(bid_cfg.get("_debug_form_id") or ""),
+            })
+            base.with_suffix(".json").write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except Exception:  # noqa: BLE001
-            html = await page.content()
-        base.with_suffix(".html").write_text(str(html)[:200_000], encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            log.info("[BID][BROWSER-DEBUG] DOM inventory failed error_type=%s", type(exc).__name__)
+        # Screenshots last and independently: on a page that is still loading they can fail
+        # (pending fonts, busy main thread) and must not cost us the HTML/DOM evidence above.
+        shots = []
+        for suffix, full in ((".png", True), ("-viewport.png", False)):
+            target_file = base.with_name(base.name + suffix) if suffix != ".png" else base.with_suffix(".png")
+            try:
+                await page.screenshot(path=str(target_file), full_page=full, timeout=6_000, animations="disabled")
+                shots.append(target_file.name)
+            except Exception as shot_error:  # noqa: BLE001
+                log.info(
+                    "[BID][BROWSER-DEBUG] screenshot %s failed error_type=%s detail=%r",
+                    "full" if full else "viewport",
+                    type(shot_error).__name__,
+                    str(shot_error).splitlines()[0][:160] if str(shot_error) else "",
+                )
         log.warning(
-            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s", source, project_id, reason, base
+            "[BID][BROWSER-DEBUG] source=%s id=%s reason=%s saved=%s screenshots=%s",
+            source, project_id, reason, base, shots
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
-        log.info("[BID][BROWSER-DEBUG] capture failed error_type=%s", type(exc).__name__)
+        log.info(
+            "[BID][BROWSER-DEBUG] capture failed error_type=%s detail=%r",
+            type(exc).__name__,
+            str(exc).splitlines()[0][:160] if str(exc) else "",
+        )
+
+
+#: One shared selector so discovery (JS index) and clicking (locator.nth) always agree.
+_CTA_SELECTOR = (
+    "button, a, [role='button'], [onclick], [data-bs-toggle], [data-toggle], "
+    "[class*='bid-send'], [class*='btn'], [class*='button'], "
+    "[class*='proposal'], [class*='bid'], [data-project-id], [data-action], "
+    "span, div, li, label, i"
+)
+
+_PAGE_STATE_JS = r"""
+({formId}) => {
+  const short = (el) => {
+    const cls = typeof el.className === 'string' && el.className.trim()
+      ? '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.') : '';
+    return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + cls;
+  };
+  const rectOf = (el) => {
+    const r = el.getBoundingClientRect();
+    return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)};
+  };
+  const layoutVisible = (el) => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
+      r.width > 0 && r.height > 0;
+  };
+  const form = formId ? document.getElementById(formId) : null;
+  const chain = [];
+  let node = form, depth = 0;
+  while (node && depth < 8) {
+    const cs = getComputedStyle(node);
+    chain.push({
+      node: short(node), display: cs.display, visibility: cs.visibility, opacity: cs.opacity,
+      transform: cs.transform === 'none' ? '' : cs.transform.slice(0, 40), rect: rectOf(node)
+    });
+    node = node.parentElement; depth++;
+  }
+  const hits = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (hits.length >= 20) break;
+    if (el.children.length > 3) continue;
+    const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('value') || '')
+      .replace(/\s+/g, ' ').trim();
+    if (!text || text.length > 60 || !/پیشنهاد|proposal|bid/i.test(text)) continue;
+    const a = el.closest('a[href]');
+    let href = '';
+    try { href = a ? new URL(a.getAttribute('href'), location.href).pathname : ''; } catch (_) {}
+    const r = el.getBoundingClientRect();
+    hits.push({
+      el: short(el), text: text.slice(0, 40), layout_visible: layoutVisible(el),
+      in_viewport: r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth,
+      rect: rectOf(el), disabled: Boolean(el.disabled), role: el.getAttribute('role') || '',
+      onclick: el.hasAttribute('onclick'), href_path: href,
+      owner_project_id: el.closest('[data-project-id]')?.getAttribute('data-project-id') || '',
+      inside_form: Boolean(form && form.contains(el))
+    });
+  }
+  const bodyText = (document.body && document.body.innerText) || '';
+  return {
+    ready_state: document.readyState,
+    title: (document.title || '').slice(0, 80),
+    viewport: {w: innerWidth, h: innerHeight},
+    counts: {
+      forms: document.forms.length, buttons: document.querySelectorAll('button').length,
+      links: document.querySelectorAll('a[href]').length, scripts: document.scripts.length,
+      stylesheets: document.styleSheets.length, body_chars: bodyText.length
+    },
+    session_hints: {
+      has_logout_text: /خروج از حساب|خروج/.test(bodyText),
+      has_login_text: /ورود به حساب|ورود \/ ثبت|ورود با گوگل/.test(bodyText)
+    },
+    form: form ? {present: true, layout_visible: layoutVisible(form), ancestors: chain} : {present: false},
+    label_hits: hits
+  };
+}
+"""
+
+
+async def _page_state(page: Any, form_id: str) -> dict[str, Any]:
+    """Compact, secret-free picture of what the browser can actually see right now."""
+    try:
+        return dict(await page.evaluate(_PAGE_STATE_JS, {"formId": str(form_id or "")}))
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
+        return {"error": type(exc).__name__}
+
+
+async def _wait_scripts_ready(page: Any, timeout_s: float) -> bool:
+    """True once the HTML parser finished (``interactive``/``complete``) and handlers had a moment to bind."""
+    try:
+        await page.wait_for_function(
+            "document.readyState !== 'loading'", timeout=max(100, int(timeout_s * 1000))
+        )
+    except Exception:  # noqa: BLE001 - still loading, or page closed
+        return False
+    await page.wait_for_timeout(300)  # DOMContentLoaded handlers (jQuery ready) run right after
+    return True
+
+
+async def _find_open_form_cta(
+    page: Any,
+    source_name: str,
+    project_id: str,
+    current_url: str,
+    *,
+    form_id: str = "",
+    diagnostics: dict[str, Any] | None = None,
+    quiet: bool = False,
+) -> Any | None:
+    """Find this project's proposal opener, including custom/off-canvas controls.
+
+    The best candidate is returned. When several controls look plausible,
+    ``diagnostics["ordered_indexes"]`` lists all of them best-first so the caller
+    can try them one by one (clicking an opener is harmless: nothing is typed or
+    submitted until the bid form is really visible).
+    """
+    if source_name.casefold() != "parscoders":
+        selectors = [
+            "button.bid-send--button:visible",
+            "a.bid-send--button:visible",
+            "button:has-text('ارسال پیشنهاد'):visible",
+            "a:has-text('ارسال پیشنهاد'):visible",
+        ]
+        for selector in selectors:
+            try:
+                group = page.locator(selector)
+                if await group.count() == 1 and await group.first.is_visible():
+                    return group.first
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    page_match = re.fullmatch(r"/project/(\d+)(?:/[^/]+)?/?", urlsplit(current_url).path)
+    if not str(project_id).isdigit() or not page_match or page_match.group(1) != str(project_id):
+        if diagnostics is not None:
+            diagnostics.update({"page_matches_project": False, "reason": "detail_page_id_mismatch"})
+        return None
+
+    selector = _CTA_SELECTOR
+    try:
+        result = await page.evaluate(
+            r"""({selector, projectId, formId}) => {
+              const nodes = [...document.querySelectorAll(selector)];
+              const endpoint = '/conversation/ajax/bid-send/' + projectId;
+              const currentPath = location.pathname.replace(/\/+$/, '') || '/';
+              const form = formId ? document.getElementById(formId) : null;
+              const isSameProjectDetailPath = targetPath => (
+                targetPath === '/project/' + projectId ||
+                targetPath.startsWith('/project/' + projectId + '/')
+              );
+              // Layout visibility only: a button below the fold is still a real
+              // button, Playwright scrolls it into view before clicking.
+              const isVisible = el => {
+                const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' &&
+                  Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0;
+              };
+              const normalize = value => String(value || '').replace(/[‌‏\s]+/g, '').toLowerCase();
+              const LABEL = /ارسالپیشنهاد|ثبتپیشنهاد|ارائهپیشنهاد|پیشنهاددهید|پیشنهادبدهید|پیشنهادبدید|پیشنهادخود|پیشنهادداده|submitproposal|placebid|sendproposal|sendbid/;
+              const strong = [], weak = [], candidates = [], labelHits = [];
+              let visibleCount = 0;
+              nodes.forEach((el, index) => {
+                const tag = el.tagName.toLowerCase();
+                const identity = String(el.id || '') + ' ' +
+                  (typeof el.className === 'string' ? el.className : '');
+                const label = normalize([
+                  el.innerText, el.getAttribute('aria-label'), el.getAttribute('title'),
+                  el.getAttribute('value')
+                ].filter(Boolean).join(' '));
+                // Long text means a big container that merely *contains* the words.
+                const labelMatch = label.length <= 60 && LABEL.test(label);
+                const visible = isVisible(el);
+                if (labelMatch && labelHits.length < 12) {
+                  labelHits.push({
+                    index, tag, id: String(el.id || '').slice(0, 60),
+                    class_name: String(typeof el.className === 'string' ? el.className : '').slice(0, 80),
+                    visible, disabled: Boolean(el.disabled), label: label.slice(0, 50)
+                  });
+                }
+                if (!visible || el.disabled) return;
+                visibleCount++;
+                const identityMatch = /bid-send|proposal|place-bid/i.test(identity);
+                const owner = el.getAttribute('data-project-id') ||
+                  (el.closest('[data-project-id]') && el.closest('[data-project-id]').getAttribute('data-project-id')) || '';
+                if (owner && owner !== String(projectId)) return;
+
+                const rawHref = el.getAttribute('href') || '';
+                const rawData = el.getAttribute('data-href') || el.getAttribute('data-url') ||
+                  el.getAttribute('data-action') || '';
+                const rawTarget = rawHref || rawData;
+                let targetPath = '', unsafe = false;
+                if (rawTarget && !/^javascript:/i.test(rawTarget) && !rawTarget.startsWith('#')) {
+                  try {
+                    const targetUrl = new URL(rawTarget, location.href);
+                    targetPath = targetUrl.pathname.replace(/\/+$/, '') || '/';
+                    unsafe = targetUrl.origin !== location.origin;
+                  } catch (_) { unsafe = true; }
+                } else if (rawTarget.startsWith('#')) {
+                  targetPath = currentPath;
+                }
+                // A label sitting inside a link that goes elsewhere is navigation.
+                const wrapLink = el.closest('a[href]');
+                if (wrapLink && wrapLink !== el) {
+                  const wrapHref = wrapLink.getAttribute('href') || '';
+                  if (wrapHref && !wrapHref.startsWith('#') && !/^javascript:/i.test(wrapHref)) {
+                    try {
+                      const wp = new URL(wrapHref, location.href).pathname.replace(/\/+$/, '') || '/';
+                      if (wp !== currentPath && wp !== endpoint && !isSameProjectDetailPath(wp)) unsafe = true;
+                    } catch (_) { unsafe = true; }
+                  }
+                }
+                const ids = [...targetPath.matchAll(/(?:^|\/)(\d+)(?=\/|$)/g)].map(m => m[1]);
+                if (ids.some(value => value !== String(projectId))) unsafe = true;
+                const allowedPath = !targetPath || targetPath === currentPath ||
+                  targetPath === endpoint || isSameProjectDetailPath(targetPath);
+                if (!allowedPath) unsafe = true;
+
+                const controls = (el.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+                const toggleTarget = el.getAttribute('data-bs-target') || el.getAttribute('data-target') ||
+                  (rawHref.startsWith('#') ? rawHref : '');
+                const containsForm = targetEl => Boolean(
+                  form && targetEl && (targetEl === form || targetEl.contains(form) || form.contains(targetEl))
+                );
+                let linkedToForm = Boolean(form && controls.includes(formId));
+                if (form && toggleTarget.startsWith('#') && toggleTarget.length > 1) {
+                  linkedToForm = linkedToForm || containsForm(document.getElementById(toggleTarget.slice(1)));
+                }
+                if (form && !linkedToForm) {
+                  for (const id of controls) {
+                    if (containsForm(document.getElementById(id))) { linkedToForm = true; break; }
+                  }
+                }
+                // A link back to /project/<id> is just a project/detail link,
+                // not proof that it opens the bid panel. Only an explicit
+                // data-project-id, form relationship, or exact bid endpoint
+                // is a strong project binding.
+                const exactEndpoint = targetPath === endpoint;
+                const projectBound = owner === String(projectId) || linkedToForm || exactEndpoint;
+                const nativeOrInteractive = ['button', 'a'].includes(tag) ||
+                  el.getAttribute('role') === 'button' || el.hasAttribute('onclick') ||
+                  el.hasAttribute('data-bs-toggle') || el.hasAttribute('data-toggle') ||
+                  /bid-send/i.test(identity);
+                // ParsCoders sometimes uses a generic .btn <div>/<span> with a
+                // delegated listener. An explicit «ارسال پیشنهاد» label is an
+                // acceptable weak candidate on this validated detail page.
+                const clickable = nativeOrInteractive || labelMatch;
+                if (!clickable || unsafe || (!labelMatch && !identityMatch && !projectBound)) return;
+                const item = {
+                  index,
+                  tag,
+                  id: String(el.id || '').slice(0, 80),
+                  class_name: String(typeof el.className === 'string' ? el.className : '').slice(0, 120),
+                  label: label.slice(0, 90),
+                  href_path: targetPath.slice(0, 140),
+                  owner_project_id: owner,
+                  project_bound: projectBound,
+                  linked_to_form: linkedToForm,
+                  exact_endpoint: exactEndpoint,
+                  label_match: labelMatch,
+                  identity_match: identityMatch,
+                  native: ['button', 'a'].includes(tag) || el.getAttribute('role') === 'button'
+                };
+                candidates.push(item);
+                if (projectBound) strong.push(item);
+                else if (labelMatch || identityMatch) weak.push(item);
+              });
+
+              // Best first: real buttons/links before generic elements, then the
+              // tightest label (an inner <span> is worse than its <button>).
+              const rank = items => [...items].sort((a, b) =>
+                (Number(b.native) - Number(a.native)) || (a.label.length - b.label.length));
+              const ordered = [...rank(strong), ...rank(weak)];
+              let selected = null, strategy = '';
+              if (strong.length === 1) {
+                selected = strong[0];
+                strategy = selected.linked_to_form ? 'form_target' : 'project_id_or_endpoint';
+              } else if (strong.length > 1) {
+                const native = strong.filter(item => item.native);
+                selected = native.length === 1 ? native[0] : ordered[0];
+                strategy = native.length === 1 ? 'unique_native_control' : 'ordered_try_each';
+              } else if (weak.length === 1) {
+                selected = weak[0];
+                strategy = 'unique_cta_on_project_detail';
+              } else if (weak.length > 1) {
+                selected = ordered[0];
+                strategy = 'ordered_try_each';
+              }
+              return {
+                selected_index: selected ? selected.index : null,
+                selected_strategy: strategy,
+                ordered_indexes: ordered.map(item => item.index).slice(0, 6),
+                page_matches_project: true,
+                total_nodes: nodes.length,
+                visible_actionables: visibleCount,
+                strong_matches: strong.length,
+                weak_matches: weak.length,
+                candidates: candidates.slice(0, 12),
+                label_hits: labelHits
+              };
+            }""",
+            {"selector": selector, "projectId": str(project_id), "formId": str(form_id or "")},
+        )
+    except Exception as exc:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics.update({"page_matches_project": True, "inspection_error": type(exc).__name__})
+        log.warning(
+            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=inspection_failed error_type=%s",
+            source_name,
+            project_id,
+            type(exc).__name__,
+        )
+        return None
+
+    if diagnostics is not None:
+        diagnostics.update(result)
+        diagnostics["selector"] = selector
+    selected_index = result.get("selected_index")
+    if selected_index is None:
+        (log.debug if quiet else log.warning)(
+            "[BID][CTA-DISCOVERY] source=%s id=%s outcome=missing nodes=%s visible=%s strong=%s weak=%s "
+            "label_hits=%s candidates=%s",
+            source_name,
+            project_id,
+            result.get("total_nodes", 0),
+            result.get("visible_actionables", 0),
+            result.get("strong_matches", 0),
+            result.get("weak_matches", 0),
+            result.get("label_hits", []),
+            result.get("candidates", []),
+        )
+        return None
+    log.info(
+        "[BID][CTA-DISCOVERY] source=%s id=%s outcome=selected strategy=%s index=%s ordered=%s",
+        source_name,
+        project_id,
+        result.get("selected_strategy"),
+        selected_index,
+        result.get("ordered_indexes"),
+    )
+    return page.locator(selector).nth(int(selected_index))
+
+
+async def _find_submitter(
+    page: Any, form: Any, submitter_id: str, endpoint_attribute: str, endpoint_url: str
+) -> tuple[Any | None, str]:
+    """Find a visible submitter associated with this form.
+
+    The exact ID is searched in the whole document (some sites place a
+    form-associated button beside/outside the <form>), then scoped fallbacks
+    are checked inside the real bid form. No unrelated page button is clicked.
+    """
+    form_id = str(await form.get_attribute("id") or "")
+    expected_path = urlsplit(endpoint_url).path.rstrip("/")
+    candidates: list[tuple[str, Any, bool]] = []
+    if submitter_id:
+        candidates.append(("id", page.locator(_attr_selector("id", submitter_id)).first, True))
+    if endpoint_attribute and expected_path:
+        candidates.append(("endpoint", form.locator(f"[{endpoint_attribute}]").first, False))
+    candidates.extend([
+        ("type=submit", form.locator("button[type=submit], input[type=submit]").first, False),
+        ("text", form.locator("button").filter(has_text=re.compile("ارسال|ثبت پیشنهاد")).first, False),
+        ("input-button", form.locator("input[type=button][value*='ارسال']").first, False),
+        ("button", form.locator("button").first, False),
+    ])
+
+    seen: dict[str, str] = {}
+    for _ in range(8):
+        for label, loc, require_association in candidates:
+            try:
+                if not await loc.count():
+                    seen[label] = "پیدا نشد"
+                    continue
+                if not await loc.is_visible():
+                    seen[label] = "پنهان"
+                    continue
+                if require_association:
+                    associated_form_id = await loc.evaluate(
+                        """(el) => {
+                          const owner = el.form || el.closest("form");
+                          return owner ? String(owner.id || "") : "";
+                        }"""
+                    )
+                    associated = bool(form_id) and associated_form_id == form_id
+                    if not associated:
+                        seen[label] = "به فرم متصل نیست"
+                        continue
+                attr_value = await loc.get_attribute(endpoint_attribute) if endpoint_attribute else None
+                if attr_value:
+                    actual_path = urlsplit(urljoin(str(page.url), attr_value)).path.rstrip("/")
+                    if actual_path != expected_path:
+                        seen[label] = "مسیر متفاوت"
+                        continue
+                await loc.scroll_into_view_if_needed(timeout=1_500)
+                if await loc.is_visible():
+                    return loc, ""
+                seen[label] = "پس از اسکرول پنهان"
+            except Exception as exc:  # noqa: BLE001
+                seen[label] = type(exc).__name__
+        await page.wait_for_timeout(500)
+    try:
+        form_visible = await form.is_visible()
+    except Exception:
+        form_visible = None
+    detail = "، ".join(f"{key}: {value}" for key, value in seen.items())
+    return None, f"{detail}؛ فرم {'نمایان' if form_visible else 'پنهان'}"
+
+
+_STAGE_FA = {
+    "launch": "راه‌اندازی مرورگر",
+    "page_load": "بازشدن صفحهٔ پروژه",
+    "page_check": "بررسی صفحه",
+    "find_form": "پیداکردن فرم",
+    "open_form": "بازکردن پنل ارسال پیشنهاد",
+    "fill": "پرکردن فرم",
+    "validate": "اعتبارسنجی فرم",
+    "submit_button": "آماده‌شدن دکمهٔ ارسال",
+}
+#: stages after which nothing was clicked, so a fresh browser can safely try again
+_RETRYABLE_STAGES = {"launch", "page_load", "page_check"}
+_NOISE_RESOURCE_TYPES = {"image", "media", "font"}
+_TRACKER_HOSTS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "connect.facebook.net",
+    "hotjar.com",
+    "clarity.ms",
+    "mc.yandex.ru",
+    "metrika",
+)
+
+
+def _site_root(host: str) -> str:
+    parts = [part for part in (host or "").lower().split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (host or "").lower()
+
+
+def _is_third_party(url: str, base_url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    base_host = (urlsplit(base_url).hostname or "").lower()
+    if not host or not base_host:
+        return False
+    return _site_root(host) != _site_root(base_host)
+
+
+class _PendingRequests:
+    """Which requests are still in flight, so a page stuck in ``loading`` explains itself."""
+
+    def __init__(self) -> None:
+        self._open: dict[int, tuple[Any, float]] = {}
+        self.skipped: list[dict[str, Any]] = []
+
+    def started(self, request: Any) -> None:
+        self._open[id(request)] = (request, time.monotonic())
+
+    def done(self, request: Any) -> None:
+        self._open.pop(id(request), None)
+
+    def snapshot(self, limit: int = 12) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        rows = []
+        for request, started in self._open.values():
+            parts = urlsplit(str(request.url))
+            rows.append({
+                "type": request.resource_type,
+                "host": parts.hostname or "",
+                "path": parts.path[:80],
+                "age_ms": int((now - started) * 1000),
+            })
+        rows.sort(key=lambda row: row["age_ms"], reverse=True)
+        return rows[:limit]
+
+
+_STUB_BODIES = {
+    "script": ("application/javascript", ""),
+    "stylesheet": ("text/css", ""),
+}
+
+
+async def _block_page_noise(
+    context: Any,
+    base_url: str = "",
+    tracker: _PendingRequests | None = None,
+    third_party_budget_ms: int = 5_000,
+) -> None:
+    """Skip images, fonts, media and analytics, and never let a slow third party stall the page.
+
+    The bid form needs none of the blocked resources. Scripts and styles of the site itself stay
+    untouched. A *third-party* script/stylesheet (a CDN font CSS, a widget, a captcha loader) that
+    does not answer within ``third_party_budget_ms`` is replaced by an empty file: such a request
+    blocks the HTML parser, so the site's own scripts (and the click handler of the proposal
+    button) would otherwise never run on slow or filtered networks.
+    """
+
+    async def handler(route: Any) -> None:
+        request = route.request
+        try:
+            if request.resource_type in _NOISE_RESOURCE_TYPES or any(host in request.url for host in _TRACKER_HOSTS):
+                await route.abort()
+                return
+            if (
+                base_url
+                and request.resource_type in _STUB_BODIES
+                and _is_third_party(request.url, base_url)
+            ):
+                try:
+                    response = await route.fetch(timeout=max(500, third_party_budget_ms))
+                    await route.fulfill(response=response)
+                except Exception as exc:  # noqa: BLE001 - slow, filtered or failing third party
+                    content_type, body = _STUB_BODIES[request.resource_type]
+                    if tracker is not None:
+                        tracker.skipped.append({
+                            "type": request.resource_type,
+                            "host": urlsplit(request.url).hostname or "",
+                            "path": urlsplit(request.url).path[:80],
+                            "reason": type(exc).__name__,
+                        })
+                    await route.fulfill(status=200, content_type=content_type, body=body)
+                return
+            await route.continue_()
+        except Exception:  # noqa: BLE001 - page/context already closed or request already handled
+            return
+
+    await context.route("**/*", handler)
+
+
+class _Trace:
+    """Ordered, timed record of one submit attempt (no secrets, no field values).
+
+    One attempt = one JSON line in ``data/logs/bid_trace.jsonl`` plus one compact
+    ``[BID][TRACE]`` log line, so a failure can be read from top to bottom instead
+    of being reassembled from dozens of interleaved DEBUG lines.
+    """
+
+    def __init__(self, source: str, project_id: str) -> None:
+        self.source = source
+        self.project_id = str(project_id)
+        self.started = time.monotonic()
+        self.steps: list[dict[str, Any]] = []
+
+    def step(self, name: str, **info: Any) -> None:
+        self.steps.append({"t_ms": int((time.monotonic() - self.started) * 1000), "step": name, **info})
+
+    def summary(self) -> str:
+        parts = []
+        for item in self.steps:
+            extras = " ".join(
+                f"{key}={value}"
+                for key, value in item.items()
+                if key not in {"t_ms", "step"} and not isinstance(value, (dict, list))
+            )
+            parts.append(f"{item['t_ms']}ms:{item['step']}" + (f"({extras})" if extras else ""))
+        return " -> ".join(parts)
+
+
+def _flush_trace(trace: _Trace | None, result: Any, bid_cfg: dict[str, Any]) -> None:
+    if trace is None:
+        return
+    try:
+        debug = getattr(result, "payload_debug", None) or {}
+        status = getattr(getattr(result, "status", None), "value", getattr(result, "status", ""))
+        trace.step(
+            "result",
+            status=status,
+            stage=debug.get("stage"),
+            request_sent=debug.get("request_sent"),
+            confirmation=debug.get("confirmation"),
+        )
+        log.info(
+            "[BID][TRACE] source=%s id=%s status=%s stage=%s | %s",
+            trace.source,
+            trace.project_id,
+            status,
+            debug.get("stage"),
+            trace.summary(),
+        )
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source": trace.source,
+            "project_id": trace.project_id,
+            "status": str(status),
+            "message": str(getattr(result, "message", ""))[:300],
+            "stage": debug.get("stage"),
+            "steps": trace.steps,
+            "page_state": debug.get("page_state"),
+            "cta_discovery": debug.get("cta_discovery"),
+            "navigation": debug.get("navigation"),
+        }
+        target = Path(str(bid_cfg.get("trace_dir") or "data/logs"))
+        target.mkdir(parents=True, exist_ok=True)
+        trace_file = target / "bid_trace.jsonl"
+        if trace_file.exists() and trace_file.stat().st_size > 5_000_000:
+            trace_file.replace(target / "bid_trace.1.jsonl")
+        with trace_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001 - tracing must never break a bid
+        log.info("[BID][TRACE] write failed error_type=%s", type(exc).__name__)
 
 
 def _failure(
@@ -259,6 +1114,7 @@ def _failure(
         javascript_required=pause_source,
         payload_debug=debug or {},
     )
+
 
 
 async def _submit_once(
@@ -280,8 +1136,11 @@ async def _submit_once(
     delivery_days: int | None,
     bid_cfg: dict[str, Any],
     auth_cfg: dict[str, Any],
+    trace: _Trace | None = None,
 ) -> SubmissionResult:
     """Open the project in Chromium and click the form's actual submit button."""
+    if trace is None:
+        trace = _Trace(source_name, project_id)
     page_parts = urlsplit(page_url)
     endpoint_parts = urlsplit(endpoint_url)
     safe_debug = {
@@ -290,6 +1149,10 @@ async def _submit_once(
         "submitter_id": submitter_id,
         "endpoint_path": endpoint_parts.path,
         "request_sent": False,
+        "response_received": False,
+        "site_confirmed": False,
+        "confirmation": "not_submitted",
+        "stage": "preflight",
     }
 
     if not page_parts.scheme or _origin(page_url) != _origin(base_url):
@@ -304,6 +1167,13 @@ async def _submit_once(
         )
     if not endpoint_parts.path.strip("/"):
         return _failure("مسیر ارسال فرم خالی است؛ هیچ درخواستی فرستاده نشد.", debug=safe_debug)
+    if source_name.casefold() == "parscoders":
+        page_match = re.fullmatch(r"/project/(\d+)(?:/[^/]+)?/?", page_parts.path)
+        if not str(project_id).isdigit() or not page_match or page_match.group(1) != str(project_id):
+            return _failure(
+                "آدرس مرورگر، شناسه پروژه و مقصد ارسال با هم تطابق ندارند؛ هیچ درخواستی انجام نشد.",
+                debug=safe_debug,
+            )
     if source_name.casefold() == "parscoders":
         expected_path = f"/conversation/ajax/bid-send/{project_id}"
         if endpoint_parts.path.rstrip("/") != expected_path:
@@ -331,6 +1201,10 @@ async def _submit_once(
     browser = None
     context = None
     action_clicked = False
+    stage = "launch"
+    safe_debug["stage"] = stage
+    page = None
+    form_ref = None
     try:
         async with async_playwright() as playwright:
             try:
@@ -379,466 +1253,899 @@ async def _submit_once(
             cookie_specs = _browser_cookies(cookies, base_url)
             if cookie_specs:
                 await context.add_cookies(cookie_specs)
+            pending = _PendingRequests()
+            safe_debug["skipped_third_party"] = pending.skipped  # filled live by the route handler
+            if bid_cfg.get("browser_block_noise", True):
+                await _block_page_noise(
+                    context,
+                    base_url,
+                    pending,
+                    int(bid_cfg.get("third_party_budget_ms") or 5_000),
+                )
             page = await context.new_page()
             page.set_default_timeout(12_000)
-            navigation = await page.goto(page_url, wait_until="domcontentloaded", timeout=25_000)
-            if navigation is not None and navigation.status >= 400:
-                return _failure(
-                    f"مرورگر نتوانست صفحه پروژه را باز کند (HTTP {navigation.status}).",
-                    status=navigation.status,
-                    debug=safe_debug,
-                )
+            page.on("request", pending.started)
+            page.on("requestfinished", pending.done)
+            page.on("requestfailed", pending.done)
 
-            current_url = str(page.url)
-            if _origin(current_url) != _origin(base_url):
-                return _failure(
-                    "صفحه پروژه پس از بازشدن به دامنه دیگری هدایت شد؛ برای محافظت از کوکی و پیشنهاد متوقف شد.",
-                    debug=safe_debug,
-                )
-            current_path = urlsplit(current_url).path.casefold()
-            if re.search(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", current_path):
-                return _failure(
-                    "نشست مرورگر به صفحه ورود هدایت شد؛ کوکی را از طریق /market تازه کن و /test را اجرا کن.",
-                    debug=safe_debug,
-                )
-
-            body_text = await page.locator("body").inner_text(timeout=12_000)
-            lowered = body_text.casefold()
-            logged_markers = [
-                str(item).casefold() for item in (auth_cfg.get("logged_in_markers") or []) if item
-            ]
-            login_markers = [str(item).casefold() for item in (auth_cfg.get("login_markers") or []) if item]
-            if (
-                logged_markers
-                and not any(marker in lowered for marker in logged_markers)
-                and any(marker in lowered for marker in login_markers)
-            ):
-                return _failure(
-                    "ورود در نشست مرورگر تأیید نشد؛ هیچ پیشنهاد ارسالی انجام نشد. کوکی را در /market تازه کن.",
-                    debug=safe_debug,
-                )
-            challenge_words = ("captcha", "cloudflare", "access denied", "تأیید کنید ربات نیستید")
-            if any(word in lowered for word in challenge_words):
-                return _failure(
-                    "سایت کپچا یا صفحه محدودیت نمایش داده است؛ گردش خودکار متوقف شد و این کنترل دور زده نمی‌شود.",
-                    pause_source=True,
-                    debug=safe_debug,
-                )
-
-            if form_id:
-                form_selector = f"form{_attr_selector('id', form_id)}"
-            elif form_name:
-                form_selector = f"form{_attr_selector('name', form_name)}"
-            else:
-                amount_selector = _attr_selector("name", field_mapping["amount"])
-                text_selector = _attr_selector("name", field_mapping["description"])
-                form_selector = f"form:has({amount_selector}):has({text_selector})"
-            form = page.locator(form_selector).first
-            if await form.count() != 1:
-                guest_markers = ("ورود با گوگل", "ثبت‌نام رایگان", "ثبت نام رایگان")
-                if any(marker in body_text for marker in guest_markers):
-                    return _failure(
-                        "مرورگر صفحه را به‌صورت مهمان (وارد‌نشده) دید و دکمه «ارسال پیشنهاد» وجود نداشت؛ "
-                        "نشست منقضی شده است. کوکی را در /market تازه کن و /test را اجرا کن.",
-                        debug=safe_debug,
-                    )
-                await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-missing")
-                return _failure(
-                    "فرم مورد انتظار در صفحه مرورگر پیدا نشد؛ هیچ پیشنهادی ارسال نشد.",
-                    debug=safe_debug,
-                )
-
-            # Parscoders keeps the proposal form inside a hidden off-canvas.
-            # Open it via the visible site's own CTA before filling it.
-            # The exact trigger markup has changed a few times (button vs a,
-            # class bid-send--button vs generic), so try several selectors.
-            if not await form.is_visible():
-                cta_candidates = [
-                    "button.bid-send--button"
-                    + _attr_selector("data-project-id", str(project_id))
-                    + ":visible",
-                    "button.bid-send--button:visible",
-                    "a.bid-send--button:visible",
-                    "[data-project-id=" + json.dumps(str(project_id)) + "]:visible",
-                    "button:has-text('ارسال پیشنهاد'):visible",
-                    "a:has-text('ارسال پیشنهاد'):visible",
-                    "[data-href*='/conversation/ajax/bid-send/']:visible",
-                    "button[data-href]:visible",
-                ]
-                cta = None
-                for sel in cta_candidates:
-                    try:
-                        cand = page.locator(sel).first
-                        if await cand.count() and await cand.is_visible():
-                            cta = cand
-                            log.info(
-                                "[BID][BROWSER-CTA] source=%s id=%s cta_selector=%r",
-                                source_name,
-                                project_id,
-                                sel,
-                            )
-                            break
-                    except Exception:
-                        continue
-                if cta is None:
-                    return _failure(
-                        "فرم پنهان است اما دکمه اصلی «ارسال پیشنهاد» برای بازکردنش پیدا نشد؛ "
-                        "هیچ پیشنهادی ارسال نشد.",
-                        debug=safe_debug,
-                    )
-                await cta.click()
-                # Off-canvas animation takes ~400ms; wait for form to be visible and stable
-                try:
-                    await form.wait_for(state="visible", timeout=12_000)
-                except Exception:
-                    # Fallback: wait a bit and re-check
-                    try:
-                        await page.wait_for_timeout(800)
-                    except Exception:
-                        pass
-                try:
-                    await page.wait_for_timeout(600)
-                except Exception:
-                    pass
-            else:
-                try:
-                    await page.wait_for_timeout(400)
-                except Exception:
-                    pass
-
-            async def fill_field(logical_name: str, value: str) -> None:
-                field_name = field_mapping.get(logical_name)
-                if not field_name:
-                    return
-                control = form.locator(_attr_selector("name", field_name))
-                count = await control.count()
-                if count != 1:
-                    raise ValueError(f"mapped field missing or ambiguous: {logical_name} (count={count})")
-                properties = await control.evaluate(
-                    "(el) => ({tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), "
-                    "disabled: Boolean(el.disabled), readOnly: Boolean(el.readOnly)})"
-                )
-                if properties["disabled"] or properties["readOnly"] or properties["type"] == "hidden":
-                    raise ValueError(f"mapped field is not editable: {logical_name}")
-                if properties["tag"] == "select":
-                    await control.select_option(value=value, timeout=_STEP_TIMEOUT_MS)
-                    await control.dispatch_event("change")
-                    method = "select"
-                elif logical_name == "description":
-                    method = await _human_fill_message(page, form, control, value)
-                else:
-                    method = await _human_fill_input(page, control, logical_name, value)
-                log.info(
-                    "[BID][BROWSER-FIELD] source=%s id=%s field=%s method=%s",
+            def _on_page_error(error: Exception) -> None:
+                log.warning(
+                    "[BID][BROWSER-PAGE-ERROR] source=%s id=%s error_type=%s detail=%r",
                     source_name,
                     project_id,
-                    logical_name,
-                    method,
+                    type(error).__name__,
+                    str(error).splitlines()[0][:180] if str(error) else "",
                 )
 
-            # «مدت اعتبار پیشنهاد» (validDays) is empty by default and keeps the
-            # site's submit button disabled until filled: use config, else 7 days.
-            valid_days_value: str | None = None
-            try:
-                vd_field = form.locator(_attr_selector("name", "validDays"))
-                if (
-                    await vd_field.count() == 1
-                    and not str(await vd_field.evaluate("el => el.value || ''")).strip()
+            def _on_request_failed(request: Any) -> None:
+                if request.resource_type in _NOISE_RESOURCE_TYPES or any(
+                    host in request.url for host in _TRACKER_HOSTS
                 ):
-                    cfg_valid = str(bid_cfg.get("valid_days") or bid_cfg.get("validDays") or "7").strip()
-                    valid_days_value = cfg_valid if cfg_valid.isdigit() and 1 <= int(cfg_valid) <= 90 else "7"
-            except Exception:  # noqa: BLE001
-                valid_days_value = None
+                    return
+                log.warning(
+                    "[BID][BROWSER-REQUEST-FAILED] source=%s id=%s method=%s resource=%s path=%s failure=%r",
+                    source_name,
+                    project_id,
+                    request.method,
+                    request.resource_type,
+                    urlsplit(request.url).path,
+                    str(request.failure or "")[:160],
+                )
 
-            current_field = "amount"
+            page.on("pageerror", _on_page_error)
+            page.on("requestfailed", _on_request_failed)
             try:
-                await fill_field("amount", str(int(amount)))
-                if delivery_days is not None:
-                    current_field = "days"
-                    await fill_field("days", str(int(delivery_days)))
-                current_field = "description"
-                await fill_field("description", proposal_text)
-                if valid_days_value is not None:
-                    current_field = "validDays"
-                    field_mapping["_validDays"] = "validDays"
+                stage = "page_load"
+                safe_debug["stage"] = stage
+                load_timeout_ms = int(float(bid_cfg.get("page_load_timeout_seconds") or 30) * 1000)
+                # "commit" = the server answered; do not wait for every sub-resource. A slow
+                # third-party file must not turn a usable page into a 25 s timeout.
+                navigation_started = time.monotonic()
+                navigation = await page.goto(page_url, wait_until="commit", timeout=load_timeout_ms)
+                # The old 4 s wait often expired while the page was still "loading"
+                # (no forms/CSS yet), so the opener button was looked up on a half-built
+                # DOM. Wait for the parser to finish, then give styles/scripts a short
+                # best-effort window; a stalled tracker may still not block us forever.
+                dom_ready = False
+                load_ready = False
+                dcl_timeout = max(1_000, int(bid_cfg.get("dom_ready_timeout_ms") or 20_000))
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=dcl_timeout)
+                    dom_ready = True
+                except PlaywrightTimeoutError:
+                    pass  # inspect the live DOM even if a third-party resource stalls
+                if dom_ready:
                     try:
-                        await fill_field("_validDays", valid_days_value)
-                    finally:
-                        field_mapping.pop("_validDays", None)
-                await page.wait_for_timeout(300)  # let the site's validator enable the button
-            except Exception as exc:
-                log.warning(
-                    "[BID][BROWSER-FORM] source=%s id=%s outcome=field_fill_failed error_type=%s field=%s detail=%r",
+                        await page.wait_for_load_state(
+                            "load", timeout=max(500, int(bid_cfg.get("load_ready_timeout_ms") or 6_000))
+                        )
+                        load_ready = True
+                    except PlaywrightTimeoutError:
+                        pass
+                page_state = await page.evaluate(
+                    """() => ({
+                      ready_state: document.readyState,
+                      body_present: Boolean(document.body),
+                      forms: document.forms.length
+                    })"""
+                )
+                safe_debug["navigation"] = {
+                    "http_status": navigation.status if navigation is not None else None,
+                    "dom_content_loaded": dom_ready,
+                    "load_event": load_ready,
+                    **page_state,
+                    "elapsed_ms": int((time.monotonic() - navigation_started) * 1000),
+                }
+                log.info(
+                    "[BID][BROWSER-NAVIGATION] source=%s id=%s status=%s dom_ready=%s load=%s "
+                    "ready_state=%s forms=%s elapsed_ms=%s",
                     source_name,
                     project_id,
-                    type(exc).__name__,
-                    current_field,
-                    str(exc)[:240],
+                    navigation.status if navigation is not None else "unknown",
+                    dom_ready,
+                    load_ready,
+                    page_state.get("ready_state"),
+                    page_state.get("forms"),
+                    safe_debug["navigation"]["elapsed_ms"],
                 )
-                await _dump_debug(page, form, bid_cfg, source_name, project_id, f"fill-{current_field}")
-                safe_debug["failed_field"] = current_field
-                return _failure(
-                    f"مرورگر نتوانست فیلد «{current_field}» را تکمیل کند؛ "
-                    "هیچ کلیکی برای ثبت پیشنهاد انجام نشد. اسکرین‌شات در data/browser_debug ذخیره شد.",
-                    debug=safe_debug,
-                )
-
-            form_valid = await form.evaluate("(el) => el.checkValidity()")
-            if not form_valid:
-                try:
-                    invalid_detail = await form.evaluate(
-                        """(el) => {
-                            const inv = el.querySelector(':invalid');
-                            if (!inv) return '';
-                            return (inv.outerHTML || '').slice(0,300) + ' name=' + (inv.name||'') + ' validity=' + JSON.stringify(inv.validity);
-                        }"""
-                    )
+                if not dom_ready:
+                    safe_debug["pending_requests"] = pending.snapshot()
                     log.warning(
-                        "[BID][BROWSER-FORM-INVALID] source=%s id=%s invalid=%r",
+                        "[BID][PENDING] source=%s id=%s ready_state=%s waiting_on=%s skipped_third_party=%s",
                         source_name,
                         project_id,
-                        invalid_detail,
+                        page_state.get("ready_state"),
+                        safe_debug["pending_requests"],
+                        pending.skipped,
                     )
-                    safe_debug["invalid_field"] = invalid_detail[:300]
-                except Exception:
-                    pass
-                await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-invalid")
-                return _failure(
-                    "فرم مرورگر پس از تکمیل فیلدها معتبر نیست؛ برای جلوگیری از ارسال ناقص متوقف شد.",
-                    debug=safe_debug,
+                trace.step(
+                    "navigation",
+                    http=navigation.status if navigation is not None else None,
+                    dom_ready=dom_ready,
+                    load=load_ready,
+                    ready_state=page_state.get("ready_state"),
+                    forms=page_state.get("forms"),
                 )
+                if navigation is not None and navigation.status >= 400:
+                    return _failure(
+                        f"مرورگر نتوانست صفحه پروژه را باز کند (HTTP {navigation.status}).",
+                        status=navigation.status,
+                        debug=safe_debug,
+                    )
 
-            if submitter_id:
-                submitter = form.locator(_attr_selector("id", submitter_id)).first
-            else:
-                submitter = form.locator(
-                    _attr_selector(endpoint_attribute, urlsplit(endpoint_url).path)
-                ).first
-            # In some Parscoders offcanvas layouts the submit button is below the fold;
-            # scroll it into view and give the JS validator a moment to enable it.
-            try:
-                if await submitter.count():
-                    await submitter.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(400)
-            except Exception:
-                pass
-            if await submitter.count() == 0 or not await submitter.is_visible():
-                return _failure(
-                    "دکمه اصلی ارسال در فرم مرورگر پیدا یا قابل‌مشاهده نیست؛ هیچ پیشنهادی ارسال نشد.",
-                    debug=safe_debug,
-                )
-            # Wait briefly for the button to become enabled after the last field change
-            for _ in range(6):
-                try:
-                    if await submitter.is_enabled():
-                        break
-                    await page.wait_for_timeout(500)
-                except Exception:
-                    break
-            if not await submitter.is_enabled():
-                # Log why it is still disabled
-                try:
-                    btn_outer = await submitter.evaluate("el => el.outerHTML.slice(0,400)")
-                    log.warning(
-                        "[BID][BROWSER-SUBMIT-DISABLED] source=%s id=%s button=%r",
-                        source_name,
-                        project_id,
-                        btn_outer,
+                current_url = str(page.url)
+                if _origin(current_url) != _origin(base_url):
+                    return _failure(
+                        "صفحه پروژه پس از بازشدن به دامنه دیگری هدایت شد؛ برای محافظت از کوکی و پیشنهاد متوقف شد.",
+                        debug=safe_debug,
                     )
-                except Exception:
-                    pass
-                await _dump_debug(page, form, bid_cfg, source_name, project_id, "submit-disabled")
-                return _failure(
-                    "دکمه ارسال سایت غیرفعال است؛ هیچ پیشنهادی ارسال نشد.",
-                    debug=safe_debug,
-                )
+                current_path = urlsplit(current_url).path.casefold()
+                if re.search(r"/(?:login|signin|sign-in|auth/login)(?:/|$)", current_path):
+                    return _failure(
+                        "نشست مرورگر به صفحه ورود هدایت شد؛ کوکی را از طریق /market تازه کن و /test را اجرا کن.",
+                        debug=safe_debug,
+                    )
 
-            live_action = str(await submitter.get_attribute(endpoint_attribute) or "").strip()
-            live_endpoint = urljoin(current_url, live_action)
-            if (
-                not live_action
-                or _origin(live_endpoint) != _origin(base_url)
-                or urlsplit(live_endpoint).path.rstrip("/") != endpoint_parts.path.rstrip("/")
-            ):
-                return _failure(
-                    "مسیر دکمه در مرورگر با مسیر تأییدشده صفحه یکی نیست؛ هیچ درخواستی نفرستادیم.",
-                    debug=safe_debug,
-                )
+                stage = "page_check"
+                safe_debug["stage"] = stage
+                body_text = await page.locator("body").inner_text(timeout=12_000)
+                lowered = body_text.casefold()
+                logged_markers = [
+                    str(item).casefold() for item in (auth_cfg.get("logged_in_markers") or []) if item
+                ]
+                login_markers = [str(item).casefold() for item in (auth_cfg.get("login_markers") or []) if item]
+                if (
+                    logged_markers
+                    and not any(marker in lowered for marker in logged_markers)
+                    and any(marker in lowered for marker in login_markers)
+                ):
+                    return _failure(
+                        "ورود در نشست مرورگر تأیید نشد؛ هیچ پیشنهاد ارسالی انجام نشد. کوکی را در /market تازه کن.",
+                        debug=safe_debug,
+                    )
+                challenge_words = ("captcha", "cloudflare", "access denied", "تأیید کنید ربات نیستید")
+                if any(word in lowered for word in challenge_words):
+                    return _failure(
+                        "سایت کپچا یا صفحه محدودیت نمایش داده است؛ گردش خودکار متوقف شد و این کنترل دور زده نمی‌شود.",
+                        pause_source=True,
+                        debug=safe_debug,
+                    )
 
-            initial_status_locator = page.locator("#bid_status_custom").first
-            initial_bid_status = (
-                (await initial_status_locator.inner_text()).strip()
-                if await initial_status_locator.count()
-                else ""
-            )
-            expected_path = endpoint_parts.path.rstrip("/")
-            try:
-                # Listen first, then perform one real click. Never replay the
-                # endpoint directly if the site does not issue the request.
-                async with page.expect_response(
-                    lambda response: (
-                        response.request.method.upper() == "POST"
-                        and _origin(response.url) == _origin(base_url)
-                        and urlsplit(response.url).path.rstrip("/") == expected_path
-                    ),
-                    timeout=30_000,
-                ) as response_info:
-                    # From this point a timeout may be ambiguous: even if the
-                    # click call raises, avoid claiming that no submit happened.
-                    action_clicked = True
-                    await submitter.click()
-                response = await response_info.value
-            except PlaywrightTimeoutError:
-                safe_debug["request_sent"] = "unknown"
-                # Ambiguous network timeout — not a JS interstitial. The site often
-                # still records the bid and only the XHR response is lost (seen for
-                # 621342/621322). Check the page's own success indicator before
-                # declaring failure; if it flipped to "پیشنهاد ثبت شد" we treat
-                # the bid as confirmed.
-                log.warning(
-                    "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_no_response clicked=true",
-                    source_name,
-                    project_id,
-                )
+                if form_id:
+                    form_selector = f"form{_attr_selector('id', form_id)}"
+                elif form_name:
+                    form_selector = f"form{_attr_selector('name', form_name)}"
+                else:
+                    amount_selector = _attr_selector("name", field_mapping["amount"])
+                    text_selector = _attr_selector("name", field_mapping["description"])
+                    form_selector = f"form:has({amount_selector}):has({text_selector})"
+                stage = "find_form"
+                safe_debug["stage"] = stage
+                bid_cfg["_debug_form_id"] = form_id
+                form = page.locator(form_selector).first
+                form_ref = form
+                # The form can be injected a moment after "commit"; wait for it instead
+                # of judging a half-built DOM.
                 try:
-                    await page.wait_for_function(
-                        "(initial) => { const el = document.querySelector('#bid_status_custom'); "
-                        "const txt = (el?.textContent || '').trim(); "
-                        "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(txt) && txt !== initial; }",
-                        arg=initial_bid_status,
-                        timeout=4_000,
+                    await form.wait_for(
+                        state="attached",
+                        timeout=max(500, int(bid_cfg.get("form_attach_timeout_ms") or 10_000)),
                     )
-                    status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
-                    log.info(
-                        "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout_but_ui_confirmed status_text=%r",
-                        source_name,
-                        project_id,
-                        status_text,
-                    )
-                    return SubmissionResult(
-                        status=SubmissionStatus.SUBMITTED,
-                        message=f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد (پس از تایم‌اوت): {status_text}",
-                        http_status=200,
-                        payload_debug=safe_debug,
-                    )
-                except Exception:
-                    pass
-                return SubmissionResult(
-                    status=SubmissionStatus.FAILED,
-                    message=(
-                        "سایت پس از کلیک پاسخی نفرستاد (تایم‌اوت شبکه). ممکن است پیشنهاد ثبت شده باشد — "
-                        "صفحهٔ پروژه را دستی باز کن و اگر «پیشنهاد ثبت شد» دیدی، دوباره ارسال نکن. "
-                        "این چرخه به‌عنوان خطای موقتی ثبت شد و دور بعد خودکار دوباره وضعیت را می‌سنجد."
-                    ),
-                    payload_debug=safe_debug,
-                    javascript_required=False,
-                )
-
-            safe_debug["request_sent"] = True
-            response_text = await response.text()
-            ok, message = html_parser.detect_success(response.status, response_text, bid_cfg)
-            if not ok and response.status < 400:
-                # The captured ParsCoders page uses jQuery's .done() callback to
-                # show a success modal and mutate #bid_status_custom only after
-                # the server response. Wait for that UI evidence instead of
-                # treating an arbitrary HTTP 200 as a submitted proposal.
-                try:
-                    await page.wait_for_function(
-                        "(initial) => { const text = (document.querySelector('#bid_status_custom')?.textContent || '').trim(); "
-                        "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(text) && text !== initial; }",
-                        arg=initial_bid_status,
-                        timeout=3_000,
-                    )
-                    status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
-                    ok = True
-                    message = f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد: {status_text}"
                 except PlaywrightTimeoutError:
                     pass
+                form_count = await form.count()
+                trace.step("form_lookup", count=form_count)
+                if form_count != 1:
+                    guest_markers = ("ورود با گوگل", "ثبت‌نام رایگان", "ثبت نام رایگان")
+                    if any(marker in body_text for marker in guest_markers):
+                        return _failure(
+                            "مرورگر صفحه را به‌صورت مهمان (وارد‌نشده) دید و دکمه «ارسال پیشنهاد» وجود نداشت؛ "
+                            "نشست منقضی شده است. کوکی را در /market تازه کن و /test را اجرا کن.",
+                            debug=safe_debug,
+                        )
+                    safe_debug["page_state"] = await _page_state(page, form_id)
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-missing")
+                    return _failure(
+                        "فرم مورد انتظار در صفحه مرورگر پیدا نشد؛ هیچ پیشنهادی ارسال نشد.",
+                        debug=safe_debug,
+                    )
 
-            if not ok:
-                # Subscription / daily-limit outranks everything
-                if html_parser.requires_subscription(response_text):
-                    sub_snippet = html_parser.subscription_limit_snippet(response_text)
-                    daily = html_parser.is_daily_limit_error(response_text)
-                    if daily:
-                        msg = (
-                            f"⛔ سقف ارسال روزانه پر شده است ({sub_snippet[:120]}). "
-                            "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
-                            "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
+                # The form may live in a hidden off-canvas. Open it only via
+                # a CTA tied to this project's numeric ID, then require visibility.
+                stage = "open_form"
+                safe_debug["stage"] = stage
+                if not await form.is_visible():
+                    cta_diagnostics: dict[str, Any] = {}
+                    cta = None
+                    # The opener may be rendered by page scripts a little after the form
+                    # exists, so poll instead of giving up on the first (single) look.
+                    cta_deadline = time.monotonic() + max(
+                        0.5, int(bid_cfg.get("cta_discovery_timeout_ms") or 12_000) / 1000
+                    )
+                    cta_attempt = 0
+                    while True:
+                        cta_attempt += 1
+                        last_attempt = time.monotonic() >= cta_deadline
+                        cta = await _find_open_form_cta(
+                            page,
+                            source_name,
+                            str(project_id),
+                            current_url,
+                            form_id=form_id,
+                            diagnostics=cta_diagnostics,
+                            quiet=not last_attempt,
                         )
+                        trace.step(
+                            "cta_attempt",
+                            n=cta_attempt,
+                            found=cta is not None,
+                            nodes=cta_diagnostics.get("total_nodes"),
+                            visible=cta_diagnostics.get("visible_actionables"),
+                            strong=cta_diagnostics.get("strong_matches"),
+                            weak=cta_diagnostics.get("weak_matches"),
+                        )
+                        if cta is not None or last_attempt:
+                            break
+                        await page.wait_for_timeout(1_000)
+                        if await form.is_visible():  # the page opened it by itself
+                            break
+                    safe_debug["cta_discovery"] = cta_diagnostics
+                    if cta is None and not await form.is_visible():
+                        state = await _page_state(page, form_id)
+                        safe_debug["page_state"] = state
+                        log.error(
+                            "[BID][CTA-NOT-FOUND] source=%s id=%s page_path=%s form_id=%s attempts=%s "
+                            "diagnostics=%s",
+                            source_name,
+                            project_id,
+                            urlsplit(current_url).path,
+                            form_id,
+                            cta_attempt,
+                            {
+                                key: cta_diagnostics.get(key)
+                                for key in (
+                                    "total_nodes",
+                                    "visible_actionables",
+                                    "strong_matches",
+                                    "weak_matches",
+                                    "label_hits",
+                                    "reason",
+                                )
+                            },
+                        )
+                        log.error(
+                            "[BID][PAGE-STATE] source=%s id=%s state=%s",
+                            source_name,
+                            project_id,
+                            json.dumps(state, ensure_ascii=False, default=str)[:3_500],
+                        )
+                        await _dump_debug(page, form, bid_cfg, source_name, project_id, "project-cta-not-found")
+                        return _failure(
+                            "دکمه بازکردن فرم برای همین پروژه پیدا نشد؛ لینک‌های پروژه‌های مرتبط نادیده گرفته شدند.",
+                            debug=safe_debug,
+                        )
+                    if cta is not None and not await form.is_visible():
+                        # Clicking an opener before the site's own scripts ran does nothing (no
+                        # handler is bound yet), and indexes shift while the page is still being
+                        # parsed. So: wait for scripts, re-discover, click, and repeat until a
+                        # time budget runs out. A click is harmless until the form is visible.
+                        open_timeout = max(250, min(30_000, int(bid_cfg.get("form_open_timeout_ms") or 12_000)))
+                        open_budget = max(
+                            open_timeout, int(bid_cfg.get("form_open_budget_ms") or 60_000)
+                        ) / 1000
+                        open_deadline = time.monotonic() + open_budget
+                        opened = False
+                        open_round = 0
+                        click_errors: list[str] = []
+                        while not opened and time.monotonic() < open_deadline:
+                            open_round += 1
+                            remaining_s = max(0.0, open_deadline - time.monotonic())
+                            scripts_ready = await _wait_scripts_ready(page, min(remaining_s, 10.0))
+                            if await form.is_visible():
+                                opened = True
+                                break
+                            if open_round > 1 or cta is None:
+                                cta = await _find_open_form_cta(
+                                    page,
+                                    source_name,
+                                    str(project_id),
+                                    current_url,
+                                    form_id=form_id,
+                                    diagnostics=cta_diagnostics,
+                                    quiet=True,
+                                )
+                            selector = str(cta_diagnostics.get("selector") or "")
+                            order = [
+                                int(index)
+                                for index in (cta_diagnostics.get("ordered_indexes") or [])
+                                if str(index).lstrip("-").isdigit()
+                            ]
+                            if selector and order:
+                                openers = [(index, page.locator(selector).nth(index)) for index in order[:3]]
+                            elif cta is not None:  # sources with a single, exact opener locator
+                                openers = [(0, cta)]
+                            else:
+                                await page.wait_for_timeout(1_000)
+                                continue
+                            attempts = openers
+                            for position, (index, opener) in enumerate(attempts, start=1):
+                                if time.monotonic() >= open_deadline:
+                                    break
+                                wait_ms = open_timeout if scripts_ready else min(open_timeout, 3_000)
+                                wait_ms = int(max(250, min(wait_ms, (open_deadline - time.monotonic()) * 1000)))
+                                try:
+                                    await opener.scroll_into_view_if_needed(timeout=3_000)
+                                    await opener.click(timeout=6_000)
+                                    await form.wait_for(state="visible", timeout=wait_ms)
+                                    opened = True
+                                except Exception as click_error:  # noqa: BLE001
+                                    kind = type(click_error).__name__
+                                    click_errors.append(kind)
+                                    trace.step(
+                                        "cta_click",
+                                        round=open_round,
+                                        index=index,
+                                        position=position,
+                                        scripts_ready=scripts_ready,
+                                        opened=False,
+                                        error_type=kind,
+                                    )
+                                    log.warning(
+                                        "[BID][CTA-CLICK] source=%s id=%s round=%s index=%s try=%s/%s "
+                                        "scripts_ready=%s opened=False error_type=%s",
+                                        source_name,
+                                        project_id,
+                                        open_round,
+                                        index,
+                                        position,
+                                        len(attempts),
+                                        scripts_ready,
+                                        kind,
+                                    )
+                                    continue
+                                trace.step(
+                                    "cta_click",
+                                    round=open_round,
+                                    index=index,
+                                    position=position,
+                                    scripts_ready=scripts_ready,
+                                    opened=True,
+                                )
+                                log.info(
+                                    "[BID][CTA-CLICK] source=%s id=%s round=%s index=%s try=%s/%s "
+                                    "scripts_ready=%s opened=True",
+                                    source_name,
+                                    project_id,
+                                    open_round,
+                                    index,
+                                    position,
+                                    len(attempts),
+                                    scripts_ready,
+                                )
+                                break
+                        if not opened:
+                            safe_debug["form_open_timeout_ms"] = open_timeout
+                            safe_debug["form_open_budget_s"] = round(open_budget, 1)
+                            safe_debug["open_rounds"] = open_round
+                            safe_debug["click_errors"] = click_errors[-6:]
+                            safe_debug["pending_requests"] = pending.snapshot()
+                            safe_debug["page_state"] = await _page_state(page, form_id)
+                            log.error(
+                                "[BID][FORM-NOT-OPENED] source=%s id=%s rounds=%s budget_s=%s ready_state=%s "
+                                "waiting_on=%s skipped_third_party=%s",
+                                source_name,
+                                project_id,
+                                open_round,
+                                round(open_budget, 1),
+                                (safe_debug["page_state"] or {}).get("ready_state"),
+                                safe_debug["pending_requests"],
+                                pending.skipped,
+                            )
+                            await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-did-not-open")
+                            return _failure(
+                                "پس از کلیک روی دکمه مخصوص پروژه، پنل ارسال واقعاً باز نشد؛ "
+                                "هیچ فیلدی تغییر نکرد و پیشنهادی ارسال نشد.",
+                                debug=safe_debug,
+                            )
+                    await page.wait_for_timeout(500)
+                if not await form.is_visible():
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-still-hidden")
+                    return _failure(
+                        "پنل ارسال هنوز مخفی است؛ برای جلوگیری از تغییر فرم نامرئی، ارسال متوقف شد.",
+                        debug=safe_debug,
+                    )
+                try:
+                    await form.scroll_into_view_if_needed(timeout=3_000)
+                except Exception:
+                    pass
+
+                if not await form.is_visible():
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-hidden-before-fill")
+                    return _failure(
+                        "فرم پیشنهاد پیش از تکمیل دوباره مخفی شد؛ هیچ فیلدی تغییر نکرد.",
+                        debug=safe_debug,
+                    )
+
+                trace.step("form_ready")
+
+                async def fill_field(logical_name: str, value: str) -> None:
+                    field_name = field_mapping.get(logical_name)
+                    if not field_name:
+                        return
+                    control = form.locator(_attr_selector("name", field_name))
+                    count = await control.count()
+                    if count != 1:
+                        raise ValueError(f"mapped field missing or ambiguous: {logical_name} (count={count})")
+                    properties = await control.evaluate(
+                        "(el) => ({tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), "
+                        "disabled: Boolean(el.disabled), readOnly: Boolean(el.readOnly)})"
+                    )
+                    if properties["disabled"] or properties["readOnly"] or properties["type"] == "hidden":
+                        raise ValueError(f"mapped field is not editable: {logical_name}")
+                    if properties["tag"] == "select":
+                        await control.select_option(value=value, timeout=_STEP_TIMEOUT_MS)
+                        await control.dispatch_event("change")
+                        method = "select"
+                    elif logical_name == "description":
+                        method = await _human_fill_message(page, form, control, value)
                     else:
-                        msg = (
-                            f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_snippet[:120]}). "
-                            "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
-                        )
-                    log.warning(
-                        "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=subscription_required daily=%s snippet=%r",
+                        method = await _human_fill_input(page, control, logical_name, value)
+                    log.info(
+                        "[BID][BROWSER-FIELD] source=%s id=%s field=%s method=%s",
                         source_name,
                         project_id,
-                        response.status,
-                        daily,
-                        sub_snippet,
+                        logical_name,
+                        method,
+                    )
+
+                # «مدت اعتبار پیشنهاد» (validDays) is empty by default and keeps the
+                # site's submit button disabled until filled: use config, else 7 days.
+                valid_days_value: str | None = None
+                try:
+                    vd_field = form.locator(_attr_selector("name", "validDays"))
+                    if (
+                        await vd_field.count() == 1
+                        and not str(await vd_field.evaluate("el => el.value || ''")).strip()
+                    ):
+                        cfg_valid = str(bid_cfg.get("valid_days") or bid_cfg.get("validDays") or "7").strip()
+                        valid_days_value = cfg_valid if cfg_valid.isdigit() and 1 <= int(cfg_valid) <= 90 else "7"
+                except Exception:  # noqa: BLE001
+                    valid_days_value = None
+
+                stage = "fill"
+                safe_debug["stage"] = stage
+                current_field = "amount"
+                try:
+                    await fill_field("amount", str(int(amount)))
+                    if delivery_days is not None:
+                        current_field = "days"
+                        await fill_field("days", str(int(delivery_days)))
+                    current_field = "description"
+                    await fill_field("description", proposal_text)
+                    if valid_days_value is not None:
+                        current_field = "validDays"
+                        field_mapping["_validDays"] = "validDays"
+                        try:
+                            await fill_field("_validDays", valid_days_value)
+                        finally:
+                            field_mapping.pop("_validDays", None)
+                    await page.wait_for_timeout(300)  # let the site's validator enable the button
+                except Exception as exc:
+                    log.warning(
+                        "[BID][BROWSER-FORM] source=%s id=%s outcome=field_fill_failed error_type=%s field=%s detail=%r",
+                        source_name,
+                        project_id,
+                        type(exc).__name__,
+                        current_field,
+                        str(exc)[:240],
+                    )
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, f"fill-{current_field}")
+                    safe_debug["failed_field"] = current_field
+                    return _failure(
+                        f"مرورگر نتوانست فیلد «{current_field}» را تکمیل کند؛ "
+                        "هیچ کلیکی برای ثبت پیشنهاد انجام نشد. اسکرین‌شات در data/browser_debug ذخیره شد.",
+                        debug=safe_debug,
+                    )
+
+                stage = "validate"
+                safe_debug["stage"] = stage
+                form_valid = await form.evaluate("(el) => el.checkValidity()")
+                if not form_valid:
+                    try:
+                        invalid_detail = await form.evaluate(
+                            """(el) => {
+                                const inv = el.querySelector(':invalid');
+                                if (!inv) return '';
+                                return (inv.outerHTML || '').slice(0,300) + ' name=' + (inv.name||'') + ' validity=' + JSON.stringify(inv.validity);
+                            }"""
+                        )
+                        log.warning(
+                            "[BID][BROWSER-FORM-INVALID] source=%s id=%s invalid=%r",
+                            source_name,
+                            project_id,
+                            invalid_detail,
+                        )
+                        safe_debug["invalid_field"] = invalid_detail[:300]
+                    except Exception:
+                        pass
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-invalid")
+                    return _failure(
+                        "فرم مرورگر پس از تکمیل فیلدها معتبر نیست؛ برای جلوگیری از ارسال ناقص متوقف شد.",
+                        debug=safe_debug,
+                    )
+
+                submitter, submit_diag = await _find_submitter(
+                    page, form, submitter_id, endpoint_attribute, endpoint_url
+                )
+                if submitter is None:
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT-NOT-FOUND] source=%s id=%s diag=%s",
+                        source_name,
+                        project_id,
+                        submit_diag,
+                    )
+                    safe_debug["submit_button"] = submit_diag
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "submit-not-found")
+                    return _failure(
+                        "دکمهٔ «ارسال پیشنهاد» بعد از پر شدن فرم دیده نشد "
+                        f"({submit_diag}). هیچ پیشنهادی ارسال نشد؛ احتمالاً چیدمان صفحهٔ سایت عوض شده یا "
+                        "صفحه کامل بارگذاری نشده. اسکرین‌شات در data/browser_debug ذخیره شد.",
+                        debug=safe_debug,
+                    )
+                # Wait briefly for the button to become enabled after the last field change
+                for _ in range(6):
+                    try:
+                        if await submitter.is_enabled():
+                            break
+                        await page.wait_for_timeout(500)
+                    except Exception:
+                        break
+                if not await submitter.is_enabled():
+                    # Log why it is still disabled
+                    try:
+                        btn_outer = await submitter.evaluate("el => el.outerHTML.slice(0,400)")
+                        log.warning(
+                            "[BID][BROWSER-SUBMIT-DISABLED] source=%s id=%s button=%r",
+                            source_name,
+                            project_id,
+                            btn_outer,
+                        )
+                    except Exception:
+                        pass
+                    await _dump_debug(page, form, bid_cfg, source_name, project_id, "submit-disabled")
+                    return _failure(
+                        "دکمه ارسال سایت غیرفعال است؛ هیچ پیشنهادی ارسال نشد.",
+                        debug=safe_debug,
+                    )
+
+                live_action = str(await submitter.get_attribute(endpoint_attribute) or "").strip()
+                live_endpoint = urljoin(current_url, live_action)
+                if (
+                    not live_action
+                    or _origin(live_endpoint) != _origin(base_url)
+                    or urlsplit(live_endpoint).path.rstrip("/") != endpoint_parts.path.rstrip("/")
+                ):
+                    return _failure(
+                        "مسیر دکمه در مرورگر با مسیر تأییدشده صفحه یکی نیست؛ هیچ درخواستی نفرستادیم.",
+                        debug=safe_debug,
+                    )
+
+                initial_status_locator = page.locator("#bid_status_custom").first
+                initial_bid_status = (
+                    (await initial_status_locator.inner_text()).strip()
+                    if await initial_status_locator.count()
+                    else ""
+                )
+                expected_path = endpoint_parts.path.rstrip("/")
+
+                def _is_bid_request(url: str, method: str) -> bool:
+                    return (
+                        method.upper() == "POST"
+                        and _origin(url) == _origin(base_url)
+                        and urlsplit(url).path.rstrip("/") == expected_path
+                    )
+
+                loop = asyncio.get_running_loop()
+                response_future: asyncio.Future = loop.create_future()
+                request_seen = {"value": False}
+
+                def on_request(request: Any) -> None:
+                    if _is_bid_request(request.url, request.method):
+                        request_seen["value"] = True
+                        safe_debug["request_sent"] = True
+
+                def on_response(resp: Any) -> None:
+                    if not response_future.done() and _is_bid_request(resp.url, resp.request.method):
+                        response_future.set_result(resp)
+
+                stage = "submit"
+                safe_debug["stage"] = stage
+                try:
+                    editor_check = await control_message_state(form, field_mapping.get("description", ""))
+                except Exception:  # noqa: BLE001
+                    editor_check = "unknown"
+                log.info(
+                    "[BID][BROWSER-PRECLICK] source=%s id=%s message_state=%s",
+                    source_name,
+                    project_id,
+                    editor_check,
+                )
+                baseline_notices = set(await _visible_notices(page))
+                response_timeout = float(bid_cfg.get("response_timeout_seconds") or 20)
+                page.on("request", on_request)
+                page.on("response", on_response)
+                new_notices: list[str] = []
+                try:
+                    # Exactly one real click. Never replay the endpoint directly if
+                    # the site does not issue the request.
+                    action_clicked = True
+                    safe_debug["request_sent"] = "unknown"
+                    await submitter.click()
+                    clicked_at = time.monotonic()
+                    while not response_future.done():
+                        elapsed = time.monotonic() - clicked_at
+                        if elapsed >= response_timeout:
+                            break
+                        if elapsed >= 2.5 and not request_seen["value"]:
+                            # Nothing left the browser: the page itself is telling us why.
+                            new_notices = [n for n in await _visible_notices(page) if n not in baseline_notices]
+                            if new_notices:
+                                break
+                        await asyncio.sleep(0.35)
+                finally:
+                    page.remove_listener("request", on_request)
+                    page.remove_listener("response", on_response)
+
+                if not response_future.done():
+                    if not new_notices:
+                        new_notices = [n for n in await _visible_notices(page) if n not in baseline_notices]
+                    # The UI may already show the success state even if we missed the XHR.
+                    try:
+                        await page.wait_for_function(
+                            "(initial) => { const el = document.querySelector('#bid_status_custom'); "
+                            "const txt = (el?.textContent || '').trim(); "
+                            "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(txt) && txt !== initial; }",
+                            arg=initial_bid_status,
+                            timeout=2_000,
+                        )
+                        status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
+                        safe_debug["request_sent"] = True if request_seen["value"] else "unknown"
+                        safe_debug["site_confirmed"] = True
+                        safe_debug["confirmation"] = "site_ui_state"
+                        log.info(
+                            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=ui_confirmed_without_response status_text=%r",
+                            source_name,
+                            project_id,
+                            status_text,
+                        )
+                        return SubmissionResult(
+                            status=SubmissionStatus.SUBMITTED,
+                            message=f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد: {status_text}",
+                            http_status=200,
+                            payload_debug=safe_debug,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                    joined = " | ".join(new_notices)[:400]
+                    if not request_seen["value"]:
+                        # Definite: no request left the browser, so nothing was registered.
+                        safe_debug["request_sent"] = False
+                        safe_debug["response_received"] = False
+                        safe_debug["site_confirmed"] = False
+                        safe_debug["confirmation"] = "browser_did_not_send_request"
+                        try:
+                            invalid = await form.evaluate(
+                                "(el) => [...el.querySelectorAll(':invalid, .is-invalid')]"
+                                ".map(e => e.name || e.id || e.className).slice(0, 6)"
+                            )
+                        except Exception:  # noqa: BLE001
+                            invalid = []
+                        await _dump_debug(page, form, bid_cfg, source_name, project_id, "click-no-request")
+                        log.warning(
+                            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=click_sent_no_request notices=%r invalid=%r",
+                            source_name,
+                            project_id,
+                            new_notices,
+                            invalid,
+                        )
+                        if new_notices and html_parser.requires_subscription(f"<div>{joined}</div>"):
+                            daily = html_parser.is_daily_limit_error(f"<div>{joined}</div>")
+                            return SubmissionResult(
+                                status=SubmissionStatus.FAILED,
+                                message=(
+                                    f"⛔ سقف ارسال روزانه پر شده است ({joined[:120]}). حساب رایگان روزی ۱ پیشنهاد اجازه می‌دهد. "
+                                    if daily
+                                    else f"⛔ اشتراک حساب به پایان رسیده یا محدود شده ({joined[:120]}). "
+                                )
+                                + "برای ادامه اشتراک تهیه کنید. جست‌وجو متوقف شد.",
+                                subscription_required=True,
+                                payload_debug=safe_debug,
+                            )
+                        reason = (
+                            f"سایت پس از کلیک پیام داد: «{joined}»."
+                            if joined
+                            else "پس از کلیک هیچ درخواستی به سایت فرستاده نشد و پیامی هم نمایش داده نشد "
+                            + (f"(فیلدهای نامعتبر: {', '.join(map(str, invalid))})" if invalid else "")
+                            + "؛ اعتبارسنجی سمت مرورگر فرم را رد کرده است."
+                        )
+                        return SubmissionResult(
+                            status=SubmissionStatus.FAILED,
+                            message=(
+                                f"پیشنهاد ثبت نشد. {reason} اسکرین‌شات و فرم در data/browser_debug ذخیره شد؛ "
+                                "همین پروژه چند بار پشت‌سرهم تلاش نمی‌شود."
+                            ),
+                            payload_debug=safe_debug,
+                        )
+
+                    # A request left the browser but no answer came back: genuinely ambiguous.
+                    safe_debug["request_sent"] = "unknown"
+                    safe_debug["response_received"] = False
+                    safe_debug["site_confirmed"] = False
+                    safe_debug["confirmation"] = "request_sent_response_missing"
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=request_sent_no_response waited=%.0fs",
+                        source_name,
+                        project_id,
+                        response_timeout,
                     )
                     return SubmissionResult(
                         status=SubmissionStatus.FAILED,
-                        message=msg,
-                        http_status=response.status,
-                        subscription_required=True,
+                        message=(
+                            "درخواست ثبت پیشنهاد فرستاده شد ولی سایت پاسخی نداد (تایم‌اوت شبکه). ممکن است پیشنهاد ثبت شده "
+                            "باشد؛ دور بعد وضعیت از روی صفحهٔ پروژه سنجیده می‌شود و ارسال تکراری انجام نمی‌شود."
+                        ),
                         payload_debug=safe_debug,
                     )
-                pause = html_parser.requires_javascript(response_text)
-                log.warning(
-                    "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s "
-                    "outcome=not_confirmed clicked=%s response_chars=%s",
+                response = response_future.result()
+
+                safe_debug["request_sent"] = True
+                safe_debug["response_received"] = True
+                response_text = await response.text()
+                ok, message = html_parser.detect_success(response.status, response_text, bid_cfg)
+                if not ok and response.status < 400:
+                    # The captured ParsCoders page uses jQuery's .done() callback to
+                    # show a success modal and mutate #bid_status_custom only after
+                    # the server response. Wait for that UI evidence instead of
+                    # treating an arbitrary HTTP 200 as a submitted proposal.
+                    try:
+                        await page.wait_for_function(
+                            "(initial) => { const text = (document.querySelector('#bid_status_custom')?.textContent || '').trim(); "
+                            "return ['پیشنهاد ثبت شد', 'پیشنهاد ویرایش شد'].includes(text) && text !== initial; }",
+                            arg=initial_bid_status,
+                            timeout=3_000,
+                        )
+                        status_text = (await page.locator("#bid_status_custom").first.inner_text()).strip()
+                        ok = True
+                        message = f"ثبت پیشنهاد با تغییر وضعیت در رابط سایت تأیید شد: {status_text}"
+                    except PlaywrightTimeoutError:
+                        pass
+
+                if not ok:
+                    safe_debug["site_confirmed"] = False
+                    safe_debug["confirmation"] = "server_response_not_successful"
+                    # Subscription / daily-limit outranks everything
+                    if html_parser.requires_subscription(response_text):
+                        sub_snippet = html_parser.subscription_limit_snippet(response_text)
+                        daily = html_parser.is_daily_limit_error(response_text)
+                        if daily:
+                            msg = (
+                                f"⛔ سقف ارسال روزانه پر شده است ({sub_snippet[:120]}). "
+                                "حساب رایگان پارس‌کدرز روزی ۱ پیشنهاد اجازه می‌دهد. "
+                                "برای ادامه، اشتراک تهیه کنید. جست‌وجو متوقف شد."
+                            )
+                        else:
+                            msg = (
+                                f"⛔ اشتراک حساب پارس‌کدرز به پایان رسیده ({sub_snippet[:120]}). "
+                                "برای ارسال پیشنهاد بیشتر باید اشتراک را تمدید کنید. جست‌وجو متوقف شد."
+                            )
+                        log.warning(
+                            "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s outcome=subscription_required daily=%s snippet=%r",
+                            source_name,
+                            project_id,
+                            response.status,
+                            daily,
+                            sub_snippet,
+                        )
+                        return SubmissionResult(
+                            status=SubmissionStatus.FAILED,
+                            message=msg,
+                            http_status=response.status,
+                            subscription_required=True,
+                            payload_debug=safe_debug,
+                        )
+                    pause = html_parser.requires_javascript(response_text)
+                    log.warning(
+                        "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s "
+                        "outcome=not_confirmed clicked=%s response_chars=%s",
+                        source_name,
+                        project_id,
+                        response.status,
+                        expected_path,
+                        action_clicked,
+                        len(response_text or ""),
+                    )
+                    return SubmissionResult(
+                        status=SubmissionStatus.FAILED,
+                        message=(
+                            f"مرورگر دکمه ارسال را کلیک کرد و پاسخ HTTP {response.status} گرفت، "
+                            f"اما سایت ثبت پیشنهاد را صریحاً تأیید نکرد: {message} "
+                            "وضعیت پروژه را در سایت بررسی کن."
+                        ),
+                        http_status=response.status,
+                        javascript_required=pause,
+                        payload_debug=safe_debug,
+                    )
+
+                safe_debug["site_confirmed"] = True
+                safe_debug["confirmation"] = "server_response_success"
+                log.info(
+                    "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s outcome=confirmed_success",
                     source_name,
                     project_id,
                     response.status,
                     expected_path,
-                    action_clicked,
-                    len(response_text or ""),
                 )
                 return SubmissionResult(
-                    status=SubmissionStatus.FAILED,
-                    message=(
-                        f"مرورگر دکمه ارسال را کلیک کرد و پاسخ HTTP {response.status} گرفت، "
-                        f"اما سایت ثبت پیشنهاد را صریحاً تأیید نکرد: {message} "
-                        "وضعیت پروژه را در سایت بررسی کن."
-                    ),
+                    status=SubmissionStatus.SUBMITTED,
+                    message=message,
                     http_status=response.status,
-                    javascript_required=pause,
                     payload_debug=safe_debug,
                 )
-
-            log.info(
-                "[BID][BROWSER-SUBMIT] source=%s id=%s status=%s endpoint_path=%s outcome=confirmed_success",
-                source_name,
-                project_id,
-                response.status,
-                expected_path,
-            )
-            return SubmissionResult(
-                status=SubmissionStatus.SUBMITTED,
-                message=message,
-                http_status=response.status,
-                payload_debug=safe_debug,
-            )
+            except PlaywrightTimeoutError:
+                if not action_clicked and page is not None:
+                    await _dump_debug(page, form_ref, bid_cfg, source_name, project_id, f"timeout-{stage}")
+                raise
     except PlaywrightTimeoutError:
+        safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
+        safe_debug["response_received"] = False
+        safe_debug["site_confirmed"] = False
+        safe_debug["confirmation"] = "unknown_after_click" if action_clicked else "not_submitted"
+        retryable = (not action_clicked) and stage in _RETRYABLE_STAGES
+        safe_debug["retryable"] = retryable
+        if retryable:
+            safe_debug["retry_reason"] = f"timeout_before_submit:{stage}"
+        log.warning(
+            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=timeout stage=%s clicked=%s will_retry=%s",
+            source_name,
+            project_id,
+            stage,
+            action_clicked,
+            retryable,
+        )
+        where = _STAGE_FA.get(stage, stage)
         return _failure(
-            "مرورگر برای بازکردن فرم یا تکمیل گردش کار زمان کافی نداشت؛ "
-            "هیچ تلاش خودکار دیگری انجام نمی‌شود تا وضعیت روشن شود.",
+            f"مرورگر در مرحلهٔ «{where}» زمان کافی نداشت (شبکه کند یا سایت دیر پاسخ می‌دهد)؛ "
+            + (
+                "هنوز هیچ کلیک یا درخواستی برای ثبت پیشنهاد انجام نشده و یک‌بار با مرورگر تازه دوباره تلاش می‌شود."
+                if retryable
+                else (
+                    "کلیک ارسال انجام شده و نتیجه قطعی نیست؛ وضعیت پروژه را از صفحهٔ سایت بررسی کن."
+                    if action_clicked
+                    else "هیچ کلیکی برای ثبت پیشنهاد انجام نشد و هیچ درخواست ارسالی در کار نیست."
+                )
+            ),
             pause_source=action_clicked,
             debug=safe_debug,
         )
     except Exception as exc:
+        safe_debug["stage"] = stage
         safe_debug["request_sent"] = "unknown" if action_clicked else False
         # A browser/page that died before any click is safe to retry once on a fresh browser.
+        safe_debug["response_received"] = False
+        safe_debug["site_confirmed"] = False
+        safe_debug["confirmation"] = "unknown_after_click" if action_clicked else "not_submitted"
         safe_debug["retryable"] = (not action_clicked) and type(exc).__name__ == "TargetClosedError"
+        if safe_debug["retryable"]:
+            safe_debug["retry_reason"] = f"browser_closed_before_submit:{stage}"
         log.warning(
-            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=browser_error error_type=%s clicked=%s",
+            "[BID][BROWSER-SUBMIT] source=%s id=%s outcome=browser_error stage=%s error_type=%s detail=%r clicked=%s",
             source_name,
             project_id,
+            stage,
             type(exc).__name__,
+            str(exc).splitlines()[0][:180] if str(exc) else "",
             action_clicked,
         )
         return _failure(
@@ -857,17 +2164,22 @@ async def submit_js_managed_form(**kwargs: Any) -> SubmissionResult:
     """Run the browser workflow serially; retry once only if Chromium died before any click."""
     global _browser_lock
     if _browser_lock is None:
-        _browser_lock = asyncio.Lock()
-    async with _browser_lock:
-        result = await _submit_once(**kwargs)
+        _browser_lock = PriorityLock()
+    # paid plans are served first when several users/sites wait for the one browser
+    async with _browser_lock.hold(submit_priority.get()):
+        trace = _Trace(str(kwargs.get("source_name")), str(kwargs.get("project_id")))
+        result = await _submit_once(trace=trace, **kwargs)
         if (result.payload_debug or {}).get("retryable"):
             log.warning(
-                "[BID][BROWSER-RETRY] source=%s id=%s reason=browser_closed_before_click",
+                "[BID][BROWSER-RETRY] source=%s id=%s reason=%s",
                 kwargs.get("source_name"),
                 kwargs.get("project_id"),
+                (result.payload_debug or {}).get("retry_reason", "safe_pre_submit_retry"),
             )
+            trace.step("retry", reason=(result.payload_debug or {}).get("retry_reason", "safe_pre_submit_retry"))
             await asyncio.sleep(1.0)
-            result = await _submit_once(**kwargs)
+            result = await _submit_once(trace=trace, **kwargs)
         if result.payload_debug:
             result.payload_debug.pop("retryable", None)
+        _flush_trace(trace, result, kwargs.get("bid_cfg") or {})
         return result

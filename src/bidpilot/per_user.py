@@ -12,11 +12,29 @@ Also tracks onboarding progress so the dashboard can be blocked until Steps
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
 # Context var for per-user credential lookup during source creation
 current_chat_id: ContextVar[str | None] = ContextVar("current_chat_id", default=None)
+
+
+@contextmanager
+def user_scope(chat_id: str | int | None) -> Iterator[None]:
+    """Make ``chat_id`` the ambient user for the block, then restore the previous one.
+
+    The ambient chat decides whose marketplace account a source is built with. It
+    used to be *set and never reset*: the bot handles every Telegram update in one
+    long-lived task, so after user A pressed /run the next update from user B still
+    ran as A (and could have used A's cookie).
+    """
+    token = current_chat_id.set(str(chat_id) if chat_id is not None else None)
+    try:
+        yield
+    finally:
+        current_chat_id.reset(token)
 
 from .llm_providers import DEFAULT_PROVIDER, PRESETS, get_preset
 from .settings_store import SettingsStore
@@ -232,6 +250,7 @@ __all__ = [
     "apply_per_user_config",
     "user_status_text",
     "current_chat_id",
+    "user_scope",
     "is_llm_onboarding_done",
     "is_profile_onboarding_done",
     "is_marketplace_onboarding_done",
@@ -239,15 +258,16 @@ __all__ = [
     "onboarding_progress",
 ]
 
-def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets=None):
-    """Inject per-user LLM, pricing, profile into cfg/secrets (mutates cfg, returns secrets)."""
+def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets=None, *, sites: list[str] | None = None):
+    """Inject per-user LLM, pricing, profile into cfg/secrets (mutates cfg, returns secrets).
+
+    ``sites`` is the (already plan-limited) list of marketplaces to run; without it
+    the user's single ``marketplace.name`` is used like before. Callers that go on
+    to build sources must do so inside :func:`user_scope` — this function no longer
+    leaks the ambient chat to unrelated later work.
+    """
     from .llm_providers import DEFAULT_PROVIDER
     from .config import Secrets, secrets_from_store
-    # Set context for per-user credential lookup during source creation
-    try:
-        current_chat_id.set(str(chat_id))
-    except Exception:
-        pass
 
     # LLM
     provider = build_user_llm_provider(store, chat_id)
@@ -279,7 +299,14 @@ def apply_per_user_config(store: SettingsStore, chat_id: str | int, cfg, secrets
                     pass
         # marketplace per-user: override sources
         mname = get_user(store, chat_id, "marketplace.name")
-        if mname:
+        if sites:
+            from .config import SourceConfig
+            # one source per selected marketplace; keep the YAML settings of each
+            cfg.sources = [
+                SourceConfig(type=str(name), enabled=True, settings=dict((cfg.source(str(name)).settings if cfg.source(str(name)) else {}) or {}))
+                for name in sites
+            ]
+        elif mname:
             from .config import SourceConfig
             # replace sources with user's chosen site
             cfg.sources = [SourceConfig(type=str(mname), enabled=True, settings={})]

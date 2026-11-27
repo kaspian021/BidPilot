@@ -1238,6 +1238,20 @@ def apply_answer(store: SettingsStore, question: Question, value: Any) -> None:
             store.set(f"{prefix}.llm.verified", False)
     else:
         store.set(key, value)
+    # changing any login material invalidates its previous live-login proof:
+    # the new password/cookie is only kept as *verified* after a fresh test
+    if ".credentials." in key and key.rsplit(".", 1)[-1] in {"method", "username", "password", "cookie"}:
+        prefix = key.rsplit(".", 1)[0]
+        try:
+            store.update(
+                {
+                    f"{prefix}.verified": None,
+                    f"{prefix}.verified_at": None,
+                    f"{prefix}.verified_method": None,
+                }
+            )
+        except Exception:
+            pass
     reset_secret_cache()
 
 
@@ -1268,26 +1282,39 @@ def switch_site(store: SettingsStore, site: str) -> str:
     return name
 
 
-def sites_overview(store: SettingsStore) -> list[dict[str, Any]]:
-    """One row per registered marketplace, for /sites and /status."""
+def sites_overview(store: SettingsStore, chat_id: str | int | None = None) -> list[dict[str, Any]]:
+    """One row per registered marketplace, for /sites and /status.
+
+    With ``chat_id`` the rows describe *that user's* selection and accounts
+    (``active`` = selected to run, in the user's priority order).
+    """
     from .credentials import site_credentials
     from .sources import available_sources
 
+    selected: list[str] = []
+    if chat_id is not None:
+        from .user_sites import user_sites
+
+        selected = user_sites(store, chat_id)
     active = _current_marketplace(store)
     rows: list[dict[str, Any]] = []
     for name in available_sources():
-        creds = site_credentials(name, store)
+        creds = site_credentials(name, store, chat_id=chat_id) if chat_id is not None else site_credentials(name, store)
         rows.append(
             {
                 "site": name,
                 "label": site_label(name),
-                "active": name == active,
+                "active": (name in selected) if chat_id is not None else name == active,
                 "ready": name == "mock" or creds.ready,
                 "method": creds.method,
                 "summary": "بدون نیاز به ورود" if name == "mock" else creds.summary,
             }
         )
-    rows.sort(key=lambda row: (not row["active"], row["site"]))
+    if chat_id is not None:
+        order = {name: i for i, name in enumerate(selected)}
+        rows.sort(key=lambda row: (order.get(row["site"], 99), row["site"]))
+    else:
+        rows.sort(key=lambda row: (not row["active"], row["site"]))
     return rows
 
 

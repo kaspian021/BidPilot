@@ -124,6 +124,49 @@ def test_extract_external_id_and_fallback():
     assert parser.fallback_id("a", "b").startswith("h")
 
 
+def test_parscoders_project_id_rejects_bookmark_and_action_routes():
+    assert parser.parscoders_project_id("https://parscoders.com/project/98765/slug") == "98765"
+    assert parser.parscoders_project_id("/project/98765") == "98765"
+    assert parser.parscoders_project_id("/project/project/toggle/bookmark/623966") is None
+    assert parser.parscoders_project_id("/project/search/filters") is None
+
+
+def test_parscoders_card_ignores_bookmark_link_and_skips_action_only_cards():
+    html = """
+    <html><body>
+      <div class="project-list-item">
+        <a class="bookmark" href="/project/project/toggle/bookmark/623966">نشان کردن</a>
+        <h2><a href="/project/623966/build-telegram-bot">ساخت ربات تلگرام</a></h2>
+        <div class="meta">بودجه: ۵۰۰٬۰۰۰ تومان</div>
+      </div>
+      <div class="project-list-item">
+        <a href="/project/project/toggle/bookmark/623967">نشان کردن</a>
+        <span>کارت بدون لینک واقعی پروژه</span>
+      </div>
+    </body></html>
+    """
+    settings = {
+        "card_selectors": [".project-list-item"],
+        "id_regex": r"/project/(\d+)",
+        "fields": {"title": [".missing-title"], "link": [".missing-link"]},
+    }
+    projects = parser.parse_list_page(html, settings, "parscoders", "https://parscoders.com")
+    assert len(projects) == 1
+    assert projects[0].external_id == "623966"
+    assert projects[0].title == "ساخت ربات تلگرام"
+    assert projects[0].url.endswith("/project/623966/build-telegram-bot")
+
+
+def test_proposal_cta_must_match_the_current_project_id():
+    html = """
+    <a href="/project/623915">ارسال پیشنهاد</a>
+    <a href="/project/623948">ارسال پیشنهاد</a>
+    """
+    page_url = "https://parscoders.com/project/623948/mt5-indicator"
+    assert parser.find_proposal_cta_url(html, page_url, "623948") == "https://parscoders.com/project/623948"
+    assert parser.find_proposal_cta_url(html, page_url, "h96920438e18d00da") is None
+
+
 def test_budget_is_read_from_the_card_text_when_the_selector_is_empty():
     html = """
     <html><body>

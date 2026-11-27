@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
 import re
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 from ..config import AppConfig, LLMConfig, Profile, ProposalConfig
+from ..identity import canonical_signature, enforce_identity, identity_issues
 from ..llm_providers import LLMProvider, build_client, resolve_chain
 from ..models import Project, Proposal
 from ..pricing.budget import format_toman
@@ -100,6 +103,23 @@ def looks_like_refusal(text: str) -> bool:
     return any(marker.casefold().replace("‌", " ") in folded for marker in REFUSAL_MARKERS)
 
 
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def sanitize_llm_text(text: str) -> str:
+    """Remove model artefacts that are never part of a proposal (saves a slow repair round-trip).
+
+    Reasoning models sometimes leak ``<think>`` blocks and nearly all chat models
+    sprinkle markdown (**bold**, # headings, `code`) that the bid form shows literally.
+    """
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("**", "").replace("`", "")
+    cleaned = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]*", "", cleaned)
+    return cleaned.strip()
+
+
 def validate_proposal(
     text: str,
     config: ProposalConfig,
@@ -107,6 +127,7 @@ def validate_proposal(
     *,
     strict_length: bool = True,
     hide_price: bool = False,
+    profile: Profile | None = None,
 ) -> ValidationReport:
     issues: list[str] = []
     stripped = (text or "").strip()
@@ -117,6 +138,9 @@ def validate_proposal(
         return ValidationReport(["خروجی مدل ردّ همکاری (refusal) است، نه متن پیشنهاد؛ نباید ارسال شود."])
     if not stripped.startswith(_SALAM):
         issues.append("متن باید با سلام/وقت بخیر شروع شود.")
+    if profile is not None:
+        # identity lock: the name must be the stored one, character for character
+        issues.extend(identity_issues(stripped, profile))
     if strict_length and len(stripped) < config.min_chars:
         issues.append(f"متن خیلی کوتاه است ({len(stripped)} < {config.min_chars}).")
     if len(stripped) > config.max_chars:
@@ -160,6 +184,9 @@ class ProposalGenerator:
         self._llm_api_key = llm_api_key
         self._llm_keys = dict(llm_keys or {})
         self._clients: dict[str, LLMClient] = {}
+        #: several marketplaces share one user's key: cap the simultaneous model calls
+        #: (the provider's requests-per-minute limit is per key, not per site)
+        self._llm_gate = asyncio.Semaphore(max(1, int(getattr(config.llm, "max_concurrency", 2) or 2)))
         #: why the last LLM attempt failed (empty when it worked or was not used)
         self.last_llm_error: str = ""
         self._env = Environment(
@@ -169,6 +196,14 @@ class ProposalGenerator:
             trim_blocks=True,
             lstrip_blocks=True,
         )
+
+    def fork(self) -> ProposalGenerator:
+        """A view for one marketplace run: shares clients and the concurrency gate,
+        but has its own ``last_llm_error`` so simultaneous sites cannot overwrite
+        each other's diagnostics."""
+        clone = copy.copy(self)
+        clone.last_llm_error = ""
+        return clone
 
     # ------------------------------------------------------------------ llm
     @property
@@ -257,7 +292,10 @@ class ProposalGenerator:
                 failures.append(f"{provider.id}: {exc}")
                 continue
 
-            text = response.text.strip()
+            text = sanitize_llm_text(response.text)
+            # The name is never the model's to write: force the introduction
+            # and signature to the exact stored name before judging the text.
+            text = enforce_identity(text, self.profile)
             if looks_like_refusal(text):
                 # A refusal means the model refused the *project* itself
                 # (e.g. game cheats). Never repair it — a repaired refusal
@@ -273,23 +311,67 @@ class ProposalGenerator:
                 )
             # Auto-trim if only problem is length (saves a repair-pass roundtrip and TPM)
             if len(text.strip()) > self.settings.max_chars:
+                # Do not truncate the prefix yet: first separate the protected
+                # price paragraph and signature, then trim only the body.
                 trimmed = text.strip()
                 limit = int(self.settings.max_chars)
-                if len(trimmed) > limit:
-                    cut = trimmed[:limit]
+                if len(trimmed) > limit and len(trimmed) >= self.settings.min_chars:
+                    # Reserve the deterministic signature before cutting the
+                    # body; a naive prefix slice removed the price/signature
+                    # block and made otherwise usable model output fail.
+                    signature = canonical_signature(self.profile).strip()
+                    signature_suffix = (
+                        f"\n\n{signature}" if signature and trimmed.endswith(signature) else ""
+                    )
+                    body = trimmed[: -len(signature_suffix)].rstrip() if signature_suffix else trimmed
+
+                    # Preserve the final price/currency paragraph together
+                    # with the signature. Otherwise a length trim can keep
+                    # the greeting but cut the actual amount from the bid.
+                    closing_suffix = ""
+                    if not hide_price and amount is not None:
+                        paragraphs = body.split("\n\n")
+                        for closing_index in range(len(paragraphs) - 1, -1, -1):
+                            candidate = "\n\n".join(paragraphs[closing_index:]).strip()
+                            if mentions_amount(candidate, amount) and mentions_currency(candidate):
+                                closing_suffix = f"\n\n{candidate}"
+                                body = "\n\n".join(paragraphs[:closing_index]).rstrip()
+                                break
+
+                    protected_suffix = closing_suffix + signature_suffix
+                    body_limit = max(0, limit - len(protected_suffix))
+                    cut = body[:body_limit]
                     for sep in ("\n\n", "\n", "۔", ".", "!", "؟", "?"):
                         idx = cut.rfind(sep)
-                        if idx > limit * 0.6:
-                            trimmed = cut[: idx + len(sep)].strip()
+                        if idx > body_limit * 0.6:
+                            cut = cut[: idx + len(sep)].rstrip()
                             break
-                    else:
-                        trimmed = cut.rstrip()
-                    if len(trimmed) >= self.settings.min_chars:
-                        text = trimmed
-                        report_trimmed = validate_proposal(text, self.settings, amount)
-                        if not any("خیلی بلند" in i for i in report_trimmed.issues):
-                            pass
-            report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
+                    text = (
+                        f"{cut}{protected_suffix}"
+                        if protected_suffix
+                        else enforce_identity(cut.rstrip(), self.profile)
+                    )
+                    report_trimmed = validate_proposal(
+                        text,
+                        self.settings,
+                        amount,
+                        hide_price=hide_price,
+                        profile=self.profile,
+                    )
+                    if report_trimmed.issues:
+                        log.info(
+                            "[PROPOSAL][POST-TRIM-VALIDATION] provider=%s chars=%s issues=%s",
+                            provider.id,
+                            len(text),
+                            report_trimmed.issues,
+                        )
+            report = validate_proposal(text, self.settings, amount, hide_price=hide_price, profile=self.profile)
+            if not report.ok and len(text) < 60:
+                # Garbage (a stray word, leaked reasoning): a repair call on a slow free model
+                # costs a minute and rarely works. Go straight to the next provider.
+                log.info("Provider %s returned an unusable %d-char answer; trying the next one", provider.id, len(text))
+                failures.append(f"{provider.id}: پاسخ نامعتبر/خیلی کوتاه ({len(text)} نویسه)")
+                continue
             if not report.ok:
                 log.info(
                     "Proposal validation issues from %s: %s — asking for a repair pass",
@@ -299,13 +381,14 @@ class ProposalGenerator:
                 try:
                     repair = REPAIR_PROMPT.format(issues="؛ ".join(report.issues), text=text)
                     fixed = await self._complete_proposal(client, system, repair)
-                    if validate_proposal(fixed.text.strip(), self.settings, amount, hide_price=hide_price).ok:
-                        text = fixed.text.strip()
+                    fixed_text = enforce_identity(sanitize_llm_text(fixed.text), self.profile)
+                    if validate_proposal(fixed_text, self.settings, amount, hide_price=hide_price, profile=self.profile).ok:
+                        text = fixed_text
                         response = fixed
                 except LLMError as exc:
                     log.warning("Repair pass failed (%s): %s", provider.id, exc)
 
-            final_report = validate_proposal(text, self.settings, amount, hide_price=hide_price)
+            final_report = validate_proposal(text, self.settings, amount, hide_price=hide_price, profile=self.profile)
             if final_report.ok:
                 return Proposal(
                     text=text,
@@ -333,12 +416,12 @@ class ProposalGenerator:
             response = await self._call(client, system, user, min(budget * 2, 2_200))
         return response
 
-    @staticmethod
-    async def _call(client: LLMClient, system: str, user: str, budget: int) -> LLMResponse:
-        try:
-            return await client.complete(system, user, max_tokens=budget)
-        except TypeError:  # a minimal client (tests, older wrappers) has no such kwarg
-            return await client.complete(system, user)
+    async def _call(self, client: LLMClient, system: str, user: str, budget: int) -> LLMResponse:
+        async with self._llm_gate:
+            try:
+                return await client.complete(system, user, max_tokens=budget)
+            except TypeError:  # a minimal client (tests, older wrappers) has no such kwarg
+                return await client.complete(system, user)
 
     def generate_from_template(self, project: Project, amount: int, delivery_days: int | None, hide_price: bool = False) -> Proposal:
         """Render the longest template that fits ``proposal.max_chars``.
@@ -385,9 +468,7 @@ class ProposalGenerator:
             "amount_fa": to_persian_digits(f"{amount:,}"),
             "delivery_fa": to_persian_digits(f"{delivery_days} روز") if delivery_days else "توافقی",
             "budget_fa": to_persian_digits(project.budget.as_text()) if project.budget else "توافقی",
-            "signature": self.profile.signature
-            or f"با احترام، {self.profile.full_name}"
-            + (f"\n{self.profile.portfolio_url}" if self.profile.portfolio_url else ""),
+            "signature": canonical_signature(self.profile),
         }
 
         limit = int(self.settings.max_chars)
@@ -399,10 +480,10 @@ class ProposalGenerator:
         for candidate in (full_text, *self._bullet_trimmed(full_text, limit), compact_text):
             if not candidate or len(candidate) > limit:
                 continue
-            if validate_proposal(candidate, self.settings, amount, strict_length=False, hide_price=hide_price).ok:
+            if validate_proposal(candidate, self.settings, amount, strict_length=False, hide_price=hide_price, profile=self.profile).ok:
                 return Proposal(text=candidate, generated_by="template", latency_ms=0)
 
-        report = validate_proposal(compact_text, self.settings, amount, strict_length=False, hide_price=hide_price)
+        report = validate_proposal(compact_text, self.settings, amount, strict_length=False, hide_price=hide_price, profile=self.profile)
         if not report.ok:
             raise ProposalError("قالب پیشنهاد معتبر نیست: " + "؛ ".join(report.issues))
         raise ProposalError(
@@ -436,4 +517,4 @@ class ProposalGenerator:
                 versions.append(candidate)
 
 
-__all__ = ["ProposalGenerator", "ProposalError", "validate_proposal", "format_toman"]
+__all__ = ["ProposalGenerator", "ProposalError", "sanitize_llm_text", "validate_proposal", "format_toman"]

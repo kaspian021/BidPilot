@@ -147,11 +147,32 @@ class Repository:
             stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
         return int((await self.session.execute(stmt)).scalar_one())
 
-    async def last_bid_at(self, user_chat_id: str | None = None) -> datetime | None:
+    async def last_bid_at(self, user_chat_id: str | None = None, source: str | None = None) -> datetime | None:
         stmt = select(func.max(BidRow.created_at)).where(BidRow.status == SubmissionStatus.SUBMITTED.value)
         if user_chat_id is not None:
             stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
+        if source is not None:
+            stmt = stmt.where(BidRow.source == source)
         return _aware((await self.session.execute(stmt)).scalar_one_or_none())
+
+    async def oldest_bid_since(self, since: datetime, *, user_chat_id: str | None = None) -> datetime | None:
+        """When the oldest counted bid inside the window was sent (tells when a cap frees up)."""
+        stmt = select(func.min(BidRow.created_at)).where(
+            BidRow.created_at >= since, BidRow.status == SubmissionStatus.SUBMITTED.value
+        )
+        if user_chat_id is not None:
+            stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
+        return _aware((await self.session.execute(stmt)).scalar_one_or_none())
+
+    async def bids_by_source_since(self, since: datetime, *, user_chat_id: str | None = None) -> dict[str, int]:
+        stmt = (
+            select(BidRow.source, func.count())
+            .where(BidRow.created_at >= since, BidRow.status == SubmissionStatus.SUBMITTED.value)
+            .group_by(BidRow.source)
+        )
+        if user_chat_id is not None:
+            stmt = stmt.where(BidRow.user_chat_id == str(user_chat_id))
+        return {str(source): int(count) for source, count in await self.session.execute(stmt)}
 
     async def recent_bids(self, limit: int = 20, *, user_chat_id: str | None = None) -> list[BidRow]:
         stmt = select(BidRow).order_by(BidRow.id.desc()).limit(limit)

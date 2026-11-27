@@ -278,6 +278,39 @@ async def test_a_truncated_answer_is_retried_with_more_room():
     assert client.budgets[0] is not None and client.budgets[1] > client.budgets[0]
 
 
+class LongProposalClient(LLMClient):
+    async def complete(self, system, user, *, max_tokens=None, response_format=None):
+        body = VALID_LLM_TEXT.rsplit(chr(10) * 2, 1)[0]
+        intro, price = body.split("قیمت پیشنهادی من", 1)
+        extra = chr(10).join(
+            "برای اجرای دقیق این بخش، ابتدا نیازها را بررسی می‌کنم و سپس خروجی را مرحله‌ای تحویل می‌دهم."
+            for _ in range(24)
+        )
+        long_body = chr(10) * 2 + extra + chr(10) * 2 + "قیمت پیشنهادی من" + price
+        signature = chr(10) * 2 + "با احترام،" + chr(10) + "محمد رضایی"
+        return LLMResponse(text=intro + long_body + signature, finish_reason="stop")
+
+
+async def test_auto_trim_preserves_the_exact_name_and_closing_price_block():
+    config = make_config(max_chars=1_500)
+    client = LongProposalClient("https://llm.test/v1", "k", "m")
+    generator = ProposalGenerator(config, llm=client)
+
+    proposal = await generator.generate(make_project(), 1_000_000, 14)
+
+    assert proposal.generated_by.startswith("llm:")
+    assert len(proposal.text) <= config.proposal.max_chars
+    assert "محمد رضایی" in proposal.text
+    assert "۱,۰۰۰,۰۰۰" in proposal.text
+    assert "تومان" in proposal.text
+    assert validate_proposal(
+        proposal.text,
+        config.proposal,
+        1_000_000,
+        profile=config.profile,
+    ).ok
+
+
 def test_project_instructions_are_untrusted_and_prompt_length_uses_config():
     from bidpilot.proposals.prompts import build_prompts
 
@@ -328,3 +361,12 @@ def test_template_does_not_invent_matching_past_experience():
     assert "همان روز کار را استارت بزنم" not in proposal.text
     assert "همین روز شروع کنم" not in proposal.text
     assert "راهکار را بر اساس نیازها و محدودیت‌های اعلام‌شده‌ی همین پروژه تنظیم می‌کنم" in proposal.text
+
+
+def test_sanitize_llm_text_strips_markdown_and_leaked_reasoning():
+    from bidpilot.proposals.generator import sanitize_llm_text
+
+    raw = "<think>باید فکر کنم</think>\n## سلام\nمن **پایتون** کار می‌کنم و `کد` می‌نویسم."
+    cleaned = sanitize_llm_text(raw)
+    assert "think" not in cleaned and "**" not in cleaned and "`" not in cleaned and "#" not in cleaned
+    assert cleaned.startswith("سلام")

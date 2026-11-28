@@ -250,7 +250,9 @@ async def test_run_pending_import_reads_the_resume_and_clears_the_queue(store):
     assert store.get("profile.source") == "resume"
     assert store.get("profile.imported_at")
     assert pi.pending_import(store) is None  # queue cleared: never runs twice
-    assert Path(store.get("profile.resume_path")).exists()
+    # privacy policy: the PDF itself is never kept on the server, only its file name
+    assert store.get("profile.resume_path") is None
+    assert store.get("profile.resume_filename") == path.name
 
 
 async def test_run_pending_import_without_a_queue_is_a_no_op(store):
@@ -258,7 +260,7 @@ async def test_run_pending_import_without_a_queue_is_a_no_op(store):
 
 
 async def test_pending_import_covers_urls(store, monkeypatch):
-    async def fake_url(url, *, store, kind=None):  # noqa: ANN001
+    async def fake_url(url, *, store, kind=None, chat_id=None):  # noqa: ANN001
         return pi.ImportedProfile(
             kind="github",
             fields={"full_name": "Ali Eghbali", "stack": ["C#"]},
@@ -321,7 +323,7 @@ async def test_a_successful_import_clears_an_old_error(store, monkeypatch):
     store.set("profile.import_error", "pypdf نصب نیست")
     store.set("profile.import_pending", {"type": "url", "value": "https://github.com/x"})
 
-    async def fake_url(url, *, store, kind=None):  # noqa: ANN001
+    async def fake_url(url, *, store, kind=None, chat_id=None):  # noqa: ANN001
         return pi.ImportedProfile(kind="github", fields={"full_name": "Ali"})
 
     monkeypatch.setattr(pi, "import_from_url", fake_url)

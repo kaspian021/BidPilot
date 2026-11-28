@@ -136,9 +136,16 @@ class _Spend:
 _BUDGETS: dict[str, deque[_Spend]] = {}
 
 
+#: model -> max_tokens that finally produced text after an "empty, ran out of tokens" answer.
+#: A reasoning model does that on every call, so the next call starts there instead of paying
+#: for a wasted first attempt (~9 s each time on free tiers).
+_NEEDS_ROOM: dict[str, int] = {}
+
+
 def reset_token_budgets() -> None:
     """Forget the rolling windows (tests, or after switching the API key)."""
     _BUDGETS.clear()
+    _NEEDS_ROOM.clear()
 
 
 class LLMClient:
@@ -255,7 +262,7 @@ class LLMClient:
         max_tokens: int | None = None,
         response_format: dict | None = None,
     ) -> LLMResponse:
-        wants = int(max_tokens or self.max_tokens)
+        wants = max(int(max_tokens or self.max_tokens), _NEEDS_ROOM.get(self._budget_key, 0))
         payload = {
             "model": self.model,
             "temperature": self.temperature,
@@ -334,6 +341,8 @@ class LLMClient:
                     finish_reason=finish,
                 )
                 self._settle(spend, result, reserved)
+                if escalated:
+                    _NEEDS_ROOM[self._budget_key] = wants
                 return result
             except (httpx.HTTPError, LLMError, ValueError) as exc:
                 last_error = exc

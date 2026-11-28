@@ -354,3 +354,27 @@ async def test_truncated_reasoning_is_not_retried_on_the_same_model(sleeps):
     assert calls["n"] == 2
     assert sleeps == []
     await client.aclose()
+
+
+async def test_model_that_needed_more_room_starts_there_next_time():
+    """A reasoning model that burned its budget once must not pay the wasted first attempt again."""
+    import json as _json
+
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        wants = _json.loads(request.content)["max_tokens"]
+        seen.append(wants)
+        if wants < 1_800:
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "", "reasoning": "…"}, "finish_reason": "length"}]}
+            )
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "سلام"}, "finish_reason": "stop"}]}
+        )
+
+    client = make_client(handler, max_tokens=900)
+    assert (await client.complete("s", "u")).text == "سلام"
+    assert (await client.complete("s", "u")).text == "سلام"
+    assert seen == [900, 1_800, 1_800]
+    await client.aclose()

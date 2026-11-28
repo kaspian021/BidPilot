@@ -1263,7 +1263,7 @@ async def _submit_once(
                     int(bid_cfg.get("third_party_budget_ms") or 5_000),
                 )
             page = await context.new_page()
-            page.set_default_timeout(12_000)
+            page.set_default_timeout(20_000)  # slow Iranian links: 12 s was too tight for fill/click
             page.on("request", pending.started)
             page.on("requestfinished", pending.done)
             page.on("requestfailed", pending.done)
@@ -1531,7 +1531,7 @@ async def _submit_once(
                         # time budget runs out. A click is harmless until the form is visible.
                         open_timeout = max(250, min(30_000, int(bid_cfg.get("form_open_timeout_ms") or 12_000)))
                         open_budget = max(
-                            open_timeout, int(bid_cfg.get("form_open_budget_ms") or 60_000)
+                            open_timeout, int(bid_cfg.get("form_open_budget_ms") or 45_000)
                         ) / 1000
                         open_deadline = time.monotonic() + open_budget
                         opened = False
@@ -1642,9 +1642,16 @@ async def _submit_once(
                                 pending.skipped,
                             )
                             await _dump_debug(page, form, bid_cfg, source_name, project_id, "form-did-not-open")
+                            still_loading = (safe_debug["page_state"] or {}).get("ready_state") == "loading"
+                            hosts = sorted({row["host"] for row in safe_debug["pending_requests"] if row.get("host")})
+                            hint = (
+                                f" صفحه تا آخر هنوز در حال بارگذاری بود و منتظر این منابع ماند: {', '.join(hosts[:4])}."
+                                if still_loading and hosts
+                                else (" صفحه تا آخر کامل بارگذاری نشد (شبکه کند)." if still_loading else "")
+                            )
                             return _failure(
                                 "پس از کلیک روی دکمه مخصوص پروژه، پنل ارسال واقعاً باز نشد؛ "
-                                "هیچ فیلدی تغییر نکرد و پیشنهادی ارسال نشد.",
+                                "هیچ فیلدی تغییر نکرد و پیشنهادی ارسال نشد." + hint,
                                 debug=safe_debug,
                             )
                     await page.wait_for_timeout(500)
@@ -1871,7 +1878,7 @@ async def _submit_once(
                     editor_check,
                 )
                 baseline_notices = set(await _visible_notices(page))
-                response_timeout = float(bid_cfg.get("response_timeout_seconds") or 20)
+                response_timeout = float(bid_cfg.get("response_timeout_seconds") or 35)
                 page.on("request", on_request)
                 page.on("response", on_response)
                 new_notices: list[str] = []
